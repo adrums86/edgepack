@@ -1,0 +1,240 @@
+use crate::error::Result;
+use crate::manifest::types::{ManifestPhase, ManifestState, TrackMediaType};
+
+/// Render a DASH MPD manifest from the current state.
+///
+/// - During `Live` phase: `type="dynamic"` with `minimumUpdatePeriod`
+/// - During `Complete` phase: `type="static"` with `mediaPresentationDuration`
+pub fn render(state: &ManifestState) -> Result<String> {
+    let mut mpd = String::new();
+
+    mpd.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+
+    // MPD element
+    let mpd_type = match state.phase {
+        ManifestPhase::Complete => "static",
+        ManifestPhase::Live => "dynamic",
+        ManifestPhase::AwaitingFirstSegment => return Ok(mpd),
+    };
+
+    let total_duration = state.segments.iter().map(|s| s.duration).sum::<f64>();
+    let duration_str = format_iso8601_duration(total_duration);
+
+    mpd.push_str(&format!(
+        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" \
+         xmlns:cenc=\"urn:mpeg:cenc:2013\" \
+         xmlns:mspr=\"urn:microsoft:playready\" \
+         type=\"{mpd_type}\" \
+         profiles=\"urn:mpeg:dash:profile:isoff-live:2011,urn:mpeg:dash:profile:cmaf:2019\""
+    ));
+
+    match state.phase {
+        ManifestPhase::Complete => {
+            mpd.push_str(&format!(
+                " mediaPresentationDuration=\"{duration_str}\""
+            ));
+        }
+        ManifestPhase::Live => {
+            mpd.push_str(" minimumUpdatePeriod=\"PT1S\"");
+            mpd.push_str(" availabilityStartTime=\"1970-01-01T00:00:00Z\"");
+        }
+        _ => {}
+    }
+
+    let target_dur = format_iso8601_duration(state.target_duration);
+    mpd.push_str(&format!(
+        " minBufferTime=\"{target_dur}\">\n"
+    ));
+
+    // Period
+    mpd.push_str("  <Period id=\"0\">\n");
+
+    // Content Protection at AdaptationSet level
+    let cp_xml = build_content_protection_xml(state);
+
+    // Group variants by type
+    let video_variants: Vec<_> = state
+        .variants
+        .iter()
+        .filter(|v| v.track_type == TrackMediaType::Video)
+        .collect();
+    let audio_variants: Vec<_> = state
+        .variants
+        .iter()
+        .filter(|v| v.track_type == TrackMediaType::Audio)
+        .collect();
+
+    // Video AdaptationSet
+    if !video_variants.is_empty() || state.variants.is_empty() {
+        mpd.push_str(
+            "    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n",
+        );
+        mpd.push_str(&cp_xml);
+
+        // SegmentTemplate
+        mpd.push_str(&build_segment_template(state));
+
+        if video_variants.is_empty() {
+            // Single representation (no variant info available)
+            mpd.push_str("      <Representation id=\"video\" bandwidth=\"2000000\">\n");
+            mpd.push_str("      </Representation>\n");
+        } else {
+            for variant in &video_variants {
+                mpd.push_str(&format!(
+                    "      <Representation id=\"{}\" bandwidth=\"{}\"",
+                    variant.id, variant.bandwidth
+                ));
+                if !variant.codecs.is_empty() {
+                    mpd.push_str(&format!(" codecs=\"{}\"", variant.codecs));
+                }
+                if let Some((w, h)) = variant.resolution {
+                    mpd.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
+                }
+                if let Some(fps) = variant.frame_rate {
+                    mpd.push_str(&format!(" frameRate=\"{fps}\""));
+                }
+                mpd.push_str(">\n");
+                mpd.push_str("      </Representation>\n");
+            }
+        }
+
+        mpd.push_str("    </AdaptationSet>\n");
+    }
+
+    // Audio AdaptationSet
+    if !audio_variants.is_empty() {
+        mpd.push_str(
+            "    <AdaptationSet contentType=\"audio\" mimeType=\"audio/mp4\" segmentAlignment=\"true\">\n",
+        );
+        mpd.push_str(&cp_xml);
+        mpd.push_str(&build_segment_template(state));
+
+        for variant in &audio_variants {
+            mpd.push_str(&format!(
+                "      <Representation id=\"{}\" bandwidth=\"{}\"",
+                variant.id, variant.bandwidth
+            ));
+            if !variant.codecs.is_empty() {
+                mpd.push_str(&format!(" codecs=\"{}\"", variant.codecs));
+            }
+            mpd.push_str(">\n");
+            mpd.push_str("      </Representation>\n");
+        }
+
+        mpd.push_str("    </AdaptationSet>\n");
+    }
+
+    mpd.push_str("  </Period>\n");
+    mpd.push_str("</MPD>\n");
+
+    Ok(mpd)
+}
+
+/// Build ContentProtection XML elements for DASH.
+fn build_content_protection_xml(state: &ManifestState) -> String {
+    let mut xml = String::new();
+
+    if let Some(ref drm) = state.drm_info {
+        // CENC default_KID
+        xml.push_str(&format!(
+            "      <ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" \
+             value=\"cenc\" cenc:default_KID=\"{}\"/>\n",
+            format_kid_with_hyphens(&drm.default_kid)
+        ));
+
+        // Widevine
+        if let Some(ref pssh) = drm.widevine_pssh {
+            xml.push_str(
+                "      <ContentProtection \
+                 schemeIdUri=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\">\n",
+            );
+            xml.push_str(&format!("        <cenc:pssh>{pssh}</cenc:pssh>\n"));
+            xml.push_str("      </ContentProtection>\n");
+        }
+
+        // PlayReady
+        if drm.playready_pssh.is_some() || drm.playready_pro.is_some() {
+            xml.push_str(
+                "      <ContentProtection \
+                 schemeIdUri=\"urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95\">\n",
+            );
+            if let Some(ref pssh) = drm.playready_pssh {
+                xml.push_str(&format!("        <cenc:pssh>{pssh}</cenc:pssh>\n"));
+            }
+            if let Some(ref pro) = drm.playready_pro {
+                xml.push_str(&format!("        <mspr:pro>{pro}</mspr:pro>\n"));
+            }
+            xml.push_str("      </ContentProtection>\n");
+        }
+    }
+
+    xml
+}
+
+/// Build SegmentTemplate element for DASH.
+fn build_segment_template(state: &ManifestState) -> String {
+    let init_uri = state
+        .init_segment
+        .as_ref()
+        .map(|i| i.uri.as_str())
+        .unwrap_or("init.mp4");
+
+    let timescale = 1000u32; // millisecond timescale
+
+    let mut xml = format!(
+        "      <SegmentTemplate timescale=\"{timescale}\" \
+         initialization=\"{init_uri}\" \
+         media=\"{base}segment_$Number$.cmfv\" \
+         startNumber=\"0\">\n",
+        base = state.base_url
+    );
+
+    xml.push_str("        <SegmentTimeline>\n");
+    for segment in &state.segments {
+        let duration_ms = (segment.duration * timescale as f64) as u64;
+        xml.push_str(&format!(
+            "          <S d=\"{duration_ms}\"/>\n"
+        ));
+    }
+    xml.push_str("        </SegmentTimeline>\n");
+    xml.push_str("      </SegmentTemplate>\n");
+    xml
+}
+
+/// Format a duration in seconds as ISO 8601 duration (e.g., "PT120.500S").
+fn format_iso8601_duration(seconds: f64) -> String {
+    if seconds <= 0.0 {
+        return "PT0S".to_string();
+    }
+
+    let hours = (seconds / 3600.0).floor() as u64;
+    let minutes = ((seconds % 3600.0) / 60.0).floor() as u64;
+    let secs = seconds % 60.0;
+
+    let mut s = "PT".to_string();
+    if hours > 0 {
+        s.push_str(&format!("{hours}H"));
+    }
+    if minutes > 0 {
+        s.push_str(&format!("{minutes}M"));
+    }
+    if secs > 0.0 || (hours == 0 && minutes == 0) {
+        s.push_str(&format!("{secs:.3}S"));
+    }
+    s
+}
+
+/// Format a hex KID string as a UUID with hyphens.
+fn format_kid_with_hyphens(kid_hex: &str) -> String {
+    if kid_hex.len() != 32 {
+        return kid_hex.to_string();
+    }
+    format!(
+        "{}-{}-{}-{}-{}",
+        &kid_hex[0..8],
+        &kid_hex[8..12],
+        &kid_hex[12..16],
+        &kid_hex[16..20],
+        &kid_hex[20..32]
+    )
+}

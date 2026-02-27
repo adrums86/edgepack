@@ -1,0 +1,27 @@
+[package]
+name = "edge-packager"
+version = "0.1.0"
+edition = "2021"
+description = "CDN edge WASM application for repackaging DASH/HLS CMAF media from CBCS to CENC encryption"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aes = "0.8"
+base64 = "0.22"
+cbc = "0.1"
+ctr = "0.9"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+url = { version = "2", features = ["serde"] }
+log = "0.4"
+cipher = "0.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
