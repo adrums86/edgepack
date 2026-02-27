@@ -7,6 +7,7 @@ use crate::error::{EdgePackagerError, Result};
 use crate::manifest::types::{
     ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo, SourceManifest,
 };
+use crate::media::container::ContainerFormat;
 use crate::media::init;
 use crate::media::segment::{self, SegmentRewriteParams};
 use crate::repackager::progressive::ProgressiveOutput;
@@ -75,13 +76,14 @@ impl RepackagePipeline {
         let target_key = source_key.clone(); // Same key, different encryption scheme
 
         // Step 5: Rewrite init segment for target scheme
-        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern)?;
+        let container_format = request.container_format;
+        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern, container_format)?;
 
         // Step 6: Set up progressive output
         let base_url = format!("/repackage/{content_id}/{}/", format_str(format));
         let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid, target_scheme);
         let mut progressive =
-            ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info);
+            ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
 
         // Register init segment
         progressive.set_init_segment(new_init);
@@ -206,6 +208,8 @@ impl RepackagePipeline {
         let source_key = find_key_for_kid(&key_set, &protection_info.tenc.default_kid)?;
         let target_key = source_key.clone();
 
+        let container_format = request.container_format;
+
         let continuation = ContinuationParams {
             source_key: CachedKey {
                 kid: source_key.kid.to_vec(),
@@ -224,6 +228,7 @@ impl RepackagePipeline {
             source_pattern,
             target_pattern,
             constant_iv: protection_info.tenc.default_constant_iv.clone(),
+            container_format,
         };
         let cont_json = serde_json::to_vec(&continuation)
             .map_err(|e| EdgePackagerError::Cache(format!("serialize rewrite params: {e}")))?;
@@ -231,7 +236,7 @@ impl RepackagePipeline {
             .set(&CacheKeys::rewrite_params(content_id, &fmt), &cont_json, ttl)?;
 
         // Step 5: Rewrite init segment for target scheme
-        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern)?;
+        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern, container_format)?;
 
         // Store init segment in Redis
         self.cache
@@ -241,7 +246,7 @@ impl RepackagePipeline {
         let base_url = format!("/repackage/{content_id}/{fmt}/");
         let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid, target_scheme);
         let mut progressive =
-            ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info);
+            ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
         progressive.set_init_segment(new_init);
 
         // Step 7: Process first media segment
@@ -389,7 +394,8 @@ impl RepackagePipeline {
         )?;
 
         // Update manifest state
-        let uri = format!("{}segment_{i}.cmfv", manifest_state.base_url);
+        let ext = continuation.container_format.video_segment_extension();
+        let uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
         let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
 
         manifest_state.segments.push(SegmentInfo {
@@ -673,6 +679,8 @@ struct ContinuationParams {
     source_pattern: (u8, u8),
     target_pattern: (u8, u8),
     constant_iv: Option<Vec<u8>>,
+    #[serde(default)]
+    container_format: ContainerFormat,
 }
 
 impl From<&DrmKeySet> for CachedKeySet {
@@ -734,6 +742,7 @@ mod tests {
     use super::*;
     use crate::cache::CacheBackend;
     use crate::drm::{system_ids, DrmSystemData};
+    use crate::media::container::ContainerFormat;
     use std::sync::{Arc, Mutex};
 
     /// Mock cache backend that records all `delete()` calls for verification.
@@ -980,6 +989,7 @@ mod tests {
             source_pattern: (1, 9),
             target_pattern: (0, 0),
             constant_iv: Some(vec![0xCC; 16]),
+            container_format: ContainerFormat::Fmp4,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -991,6 +1001,22 @@ mod tests {
         assert_eq!(parsed.source_pattern, (1, 9));
         assert_eq!(parsed.target_pattern, (0, 0));
         assert!(parsed.constant_iv.is_some());
+        assert_eq!(parsed.container_format, ContainerFormat::Fmp4);
+    }
+
+    #[test]
+    fn continuation_params_default_container_format() {
+        // When container_format is missing from JSON, should default to Cmaf
+        let json = r#"{
+            "source_key":{"kid":[1],"key":[2],"iv":null},
+            "target_key":{"kid":[1],"key":[2],"iv":null},
+            "source_scheme":"Cbcs","target_scheme":"Cenc",
+            "source_iv_size":8,"target_iv_size":8,
+            "source_pattern":[1,9],"target_pattern":[0,0],
+            "constant_iv":null
+        }"#;
+        let parsed: ContinuationParams = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
     }
 
     #[test]

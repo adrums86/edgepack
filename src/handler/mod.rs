@@ -107,7 +107,7 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
             request::handle_init_segment_request(content_id, output_format, ctx)
         }
 
-        // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.cmfv
+        // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.cmfv or .m4s
         (HttpMethod::Get, ["repackage", content_id, format, segment_file]) => {
             let output_format = parse_format(format)?;
             if let Some(seg_num) = parse_segment_number(segment_file) {
@@ -148,8 +148,10 @@ fn parse_format(s: &str) -> Result<OutputFormat> {
 }
 
 fn parse_segment_number(filename: &str) -> Option<u32> {
-    // segment_0.cmfv, segment_1.cmfv, etc.
-    let name = filename.strip_suffix(".cmfv")?;
+    // segment_0.cmfv, segment_0.m4s, etc.
+    let name = filename
+        .strip_suffix(".cmfv")
+        .or_else(|| filename.strip_suffix(".m4s"))?;
     let num_str = name.strip_prefix("segment_")?;
     num_str.parse().ok()
 }
@@ -242,12 +244,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_segment_number_m4s_valid() {
+        assert_eq!(parse_segment_number("segment_0.m4s"), Some(0));
+        assert_eq!(parse_segment_number("segment_1.m4s"), Some(1));
+        assert_eq!(parse_segment_number("segment_42.m4s"), Some(42));
+        assert_eq!(parse_segment_number("segment_999.m4s"), Some(999));
+    }
+
+    #[test]
     fn parse_segment_number_invalid() {
         assert_eq!(parse_segment_number("segment_abc.cmfv"), None);
         assert_eq!(parse_segment_number("init.mp4"), None);
         assert_eq!(parse_segment_number("segment_0.mp4"), None);
         assert_eq!(parse_segment_number(""), None);
         assert_eq!(parse_segment_number("segment_.cmfv"), None);
+        assert_eq!(parse_segment_number("segment_abc.m4s"), None);
+        assert_eq!(parse_segment_number("segment_.m4s"), None);
     }
 
     #[test]
@@ -353,6 +365,20 @@ mod tests {
             body: None,
         };
         let resp = route(&req, &ctx).unwrap();
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn route_media_segment_m4s_request_not_found() {
+        let ctx = test_context();
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/content-1/hls/segment_3.m4s".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let resp = route(&req, &ctx).unwrap();
+        // Should parse correctly (not "unknown resource") — just no data in cache
         assert_eq!(resp.status, 404);
     }
 

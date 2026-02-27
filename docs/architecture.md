@@ -59,7 +59,7 @@ graph TB
 
 ## 2. Repackaging Data Flow
 
-Shows the complete data transformation pipeline with configurable source and target encryption schemes.
+Shows the complete data transformation pipeline with configurable source/target encryption schemes and output container format.
 
 ```mermaid
 flowchart LR
@@ -73,16 +73,16 @@ flowchart LR
         Parse["Parse Source<br/>Manifest +<br/>detect scheme"]
         FetchKeys["Fetch Keys<br/>via SPEKE 2.0"]
         ParseInit["Parse Init<br/>Protection Info<br/>(confirm scheme)"]
-        RewriteInit["Rewrite Init<br/>schm→target scheme<br/>tenc→target params<br/>PSSH per target<br/>(±FairPlay)"]
+        RewriteInit["Rewrite Init<br/>schm→target scheme<br/>tenc→target params<br/>ftyp→target format<br/>PSSH per target<br/>(±FairPlay)"]
         Decrypt["Decrypt mdat<br/>via create_decryptor()<br/>(CBCS or CENC)"]
         Encrypt["Re-encrypt mdat<br/>via create_encryptor()<br/>(CBCS or CENC)"]
         RewriteSenc["Rewrite senc<br/>new IVs<br/>(8B or 16B)"]
     end
 
-    subgraph Output["OUTPUT (target scheme)"]
-        OutManifest["Output Manifest<br/>(progressive:<br/>live → complete)<br/>scheme-aware DRM"]
-        OutInit["Init Segment<br/>(sinf/schm=target<br/>scheme-filtered PSSHs)"]
-        OutSeg["Media Segments<br/>(target-scheme<br/>encrypted mdat)"]
+    subgraph Output["OUTPUT (target scheme + format)"]
+        OutManifest["Output Manifest<br/>(progressive:<br/>live → complete)<br/>scheme-aware DRM<br/>format-aware profiles"]
+        OutInit["Init Segment<br/>(sinf/schm=target<br/>ftyp=target format<br/>scheme-filtered PSSHs)"]
+        OutSeg["Media Segments<br/>(target-scheme encrypted<br/>.cmfv or .m4s ext)"]
     end
 
     SrcManifest --> Parse
@@ -126,7 +126,7 @@ graph TD
     end
 
     subgraph Core["Core Modules"]
-        Media["media/<br/>ISOBMFF parser<br/>init rewrite<br/>segment rewrite"]
+        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
         DRMMod["drm/<br/>EncryptionScheme<br/>SampleDecryptor/Encryptor<br/>SPEKE client + CPIX XML<br/>CBCS decrypt+encrypt<br/>CENC encrypt+decrypt"]
         Manifest["manifest/<br/>HLS renderer<br/>DASH renderer<br/>HLS input parser<br/>DASH input parser"]
         CacheMod2["cache/<br/>CacheBackend trait<br/>EncryptedCacheBackend<br/>Redis HTTP / TCP<br/>In-memory (sandbox)"]
@@ -186,7 +186,7 @@ sequenceDiagram
     EP->>SPEKE: POST CPIX request
     SPEKE-->>EP: CPIX response (keys + PSSH)
     EP->>Redis: SET keys, rewrite_params, source (encrypted)
-    EP->>EP: Rewrite init segment (source→target scheme)
+    EP->>EP: Rewrite init segment (source→target scheme, target container format)
     EP->>Redis: SET init segment
     EP->>Origin: GET segment_0
     Origin-->>EP: segment_0 (source scheme)
@@ -340,7 +340,7 @@ Shows how different resource types are cached at the CDN layer.
 ```mermaid
 flowchart LR
     subgraph Resources["Resource Types"]
-        Seg["Segments<br/>(init.mp4, segment_N.cmfv)"]
+        Seg["Segments<br/>(init.mp4, segment_N.cmfv/.m4s)"]
         FinalManifest["Finalized Manifest<br/>(VOD / complete)"]
         LiveManifest["Live Manifest<br/>(in-progress)"]
         Health["Health Check<br/>(/health)"]
@@ -404,6 +404,7 @@ flowchart TD
 | Feature | Description |
 |---------|-------------|
 | **Configurable Encryption** | Transforms between CBCS ↔ CENC in any direction; target scheme configurable per request |
+| **Configurable Container Format** | Output as CMAF (`.cmfv`, `cmfc` brand) or fMP4 (`.m4s`); ftyp rewriting, dynamic DASH profiles |
 | **Source Scheme Auto-Detection** | Detects source encryption from init segment `schm` box or manifest DRM signaling |
 | **Trait-Based Crypto Dispatch** | `SampleDecryptor`/`SampleEncryptor` traits with factory functions for scheme-agnostic pipeline |
 | **Progressive Output** | Clients can begin playback as soon as the first segment is ready |
@@ -412,7 +413,7 @@ flowchart TD
 | **Immediate Cleanup** | All sensitive data deleted from cache the moment processing completes |
 | **Aggressive CDN Caching** | Segments and finalized manifests cached for 1 year; live manifests refresh every second |
 | **Multi-DRM** | Widevine + PlayReady for CENC output; FairPlay + Widevine + PlayReady for CBCS output |
-| **Zero External Test Dependencies** | All 495 tests use synthetic CMAF fixtures — no network or media files needed |
+| **Zero External Test Dependencies** | All 526 tests use synthetic CMAF fixtures — no network or media files needed |
 | **WASM-Native** | Entire runtime compiles to `wasm32-wasip2` with no async runtime or system calls |
 
 ## Inputs and Outputs
@@ -423,21 +424,24 @@ flowchart TD
 | **Input** | Source init segment | CMAF (CBCS or CENC sinf/schm/tenc/pssh) | HTTP GET from origin |
 | **Input** | Source media segments | CMAF (source-scheme encrypted mdat) | HTTP GET from origin |
 | **Input** | DRM content keys | CPIX XML (SPEKE 2.0) | HTTP POST to license server |
-| **Output** | Repackaged manifest | HLS `.m3u8` or DASH `.mpd` (target-scheme DRM signaling) | HTTP GET via CDN |
-| **Output** | Repackaged init segment | CMAF (target-scheme schm/tenc/pssh, DRM systems per scheme) | HTTP GET via CDN |
-| **Output** | Repackaged media segments | CMAF (target-scheme encrypted mdat) | HTTP GET via CDN |
+| **Output** | Repackaged manifest | HLS `.m3u8` or DASH `.mpd` (target-scheme DRM signaling, format-aware profiles) | HTTP GET via CDN |
+| **Output** | Repackaged init segment | CMAF or fMP4 (target-scheme schm/tenc/pssh, target-format ftyp brands, DRM systems per scheme) | HTTP GET via CDN |
+| **Output** | Repackaged media segments | CMAF `.cmfv` or fMP4 `.m4s` (target-scheme encrypted mdat) | HTTP GET via CDN |
 | **Output** | Job status | JSON | HTTP GET via CDN |
 
 ---
 
 ## Planned Architecture Extensions
 
-The following phases extend the architecture beyond the current single-scheme repackaging:
+The following phases extend the architecture. Phases 1 (encryption scheme) and 2 (container format) are complete.
 
-### Phase 2: Container Format Flexibility
-- New `ContainerFormat` enum (`Cmaf`, `Fmp4`) in `src/media/container.rs`
-- ftyp brand rewriting for output container format
-- Segment extension and MIME type dispatch per format
+### ~~Phase 2: Container Format Flexibility~~ ✅ Complete
+- `ContainerFormat` enum (`Cmaf`, `Fmp4`) in `src/media/container.rs` with brand, extension, profile helpers
+- ftyp box rewriting in init segments for output container format
+- Dynamic segment extensions (`.cmfv`/`.cmfa` for CMAF, `.m4s` for fMP4)
+- Dynamic DASH profile signaling (`cmaf:2019` for CMAF, `isoff-live:2011` for fMP4)
+- `container_format` threaded through `RepackageRequest` → `ContinuationParams` → `ManifestState` → `ProgressiveOutput`
+- Route handler accepts both `.cmfv` and `.m4s` segment file extensions
 
 ### Phase 3: Dual-Scheme Output
 - Multi-rendition pipeline: loop over target schemes, produce independent segment sets
@@ -455,3 +459,57 @@ The following phases extend the architecture beyond the current single-scheme re
 - `src/media/compat.rs` for target device validation (Chromium 53+ floor)
 - Codec detection from stsd sample entries (avc1, hev1, mp4a)
 - Early pipeline rejection for incompatible configurations
+
+---
+
+## 10. Container Format Comparison
+
+Shows the differences between CMAF and fMP4 output formats and how they flow through the system.
+
+```mermaid
+graph TB
+    subgraph ContainerFormat["ContainerFormat Enum"]
+        CMAF["CMAF<br/>(Common Media Application Format)"]
+        FMP4["fMP4<br/>(Fragmented MP4)"]
+    end
+
+    subgraph CMAF_Props["CMAF Properties"]
+        style CMAF_Props fill:#1E3A5F,stroke:#3B82F6,color:#F9FAFB
+        CMAF_Brands["Compatible Brands:<br/>isom, iso6, cmfc"]
+        CMAF_SegExt["Segment Extension:<br/>.cmfv (video) / .cmfa (audio)"]
+        CMAF_Profile["DASH Profile:<br/>includes urn:mpeg:dash:<br/>profile:cmaf:2019"]
+    end
+
+    subgraph FMP4_Props["fMP4 Properties"]
+        style FMP4_Props fill:#14532D,stroke:#22C55E,color:#BBF7D0
+        FMP4_Brands["Compatible Brands:<br/>isom, iso6"]
+        FMP4_SegExt["Segment Extension:<br/>.m4s"]
+        FMP4_Profile["DASH Profile:<br/>urn:mpeg:dash:profile:<br/>isoff-live:2011 only"]
+    end
+
+    subgraph Shared["Shared (both formats)"]
+        style Shared fill:#374151,stroke:#6B7280,color:#F9FAFB
+        MajorBrand["Major Brand: isom"]
+        InitExt["Init Extension: .mp4"]
+        MIME["MIME: video/mp4 / audio/mp4"]
+    end
+
+    subgraph Pipeline["Pipeline Integration"]
+        Req["RepackageRequest<br/>.container_format"]
+        Init["rewrite_init_segment()<br/>ftyp → build_ftyp(format)"]
+        Prog["ProgressiveOutput<br/>segment URIs use<br/>format.video_segment_extension()"]
+        Dash["DASH Renderer<br/>MPD @profiles =<br/>format.dash_profiles()"]
+        Cont["ContinuationParams<br/>.container_format<br/>(serialized to Redis)"]
+    end
+
+    CMAF --> CMAF_Props
+    FMP4 --> FMP4_Props
+
+    Req --> Init
+    Req --> Cont
+    Cont --> Prog
+    Prog --> Dash
+
+    classDef enum fill:#1F2937,stroke:#F59E0B,color:#F9FAFB
+    class CMAF,FMP4 enum
+```

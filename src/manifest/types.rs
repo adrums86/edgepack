@@ -1,4 +1,5 @@
 use crate::drm::scheme::EncryptionScheme;
+use crate::media::container::ContainerFormat;
 use serde::{Deserialize, Serialize};
 
 /// Output format for the repackaged content.
@@ -109,6 +110,9 @@ pub struct ManifestState {
     pub media_sequence: u32,
     /// Base URL path for segments.
     pub base_url: String,
+    /// Container format (CMAF or fMP4). Defaults to CMAF for backward compatibility.
+    #[serde(default)]
+    pub container_format: ContainerFormat,
 }
 
 /// Lifecycle phase of the manifest.
@@ -123,7 +127,12 @@ pub enum ManifestPhase {
 }
 
 impl ManifestState {
-    pub fn new(content_id: String, format: OutputFormat, base_url: String) -> Self {
+    pub fn new(
+        content_id: String,
+        format: OutputFormat,
+        base_url: String,
+        container_format: ContainerFormat,
+    ) -> Self {
         Self {
             content_id,
             format,
@@ -135,6 +144,7 @@ impl ManifestState {
             drm_info: None,
             media_sequence: 0,
             base_url,
+            container_format,
         }
     }
 
@@ -165,6 +175,7 @@ pub struct SourceManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::container::ContainerFormat;
 
     #[test]
     fn output_format_content_type_hls() {
@@ -308,7 +319,7 @@ mod tests {
 
     #[test]
     fn manifest_state_new_defaults() {
-        let state = ManifestState::new("test-content".into(), OutputFormat::Hls, "/base/".into());
+        let state = ManifestState::new("test-content".into(), OutputFormat::Hls, "/base/".into(), ContainerFormat::default());
         assert_eq!(state.content_id, "test-content");
         assert_eq!(state.format, OutputFormat::Hls);
         assert_eq!(state.phase, ManifestPhase::AwaitingFirstSegment);
@@ -323,7 +334,7 @@ mod tests {
 
     #[test]
     fn manifest_state_is_complete() {
-        let mut state = ManifestState::new("c".into(), OutputFormat::Dash, "/".into());
+        let mut state = ManifestState::new("c".into(), OutputFormat::Dash, "/".into(), ContainerFormat::default());
         assert!(!state.is_complete());
 
         state.phase = ManifestPhase::Live;
@@ -335,7 +346,7 @@ mod tests {
 
     #[test]
     fn manifest_state_serde_roundtrip() {
-        let mut state = ManifestState::new("content-1".into(), OutputFormat::Hls, "/base/".into());
+        let mut state = ManifestState::new("content-1".into(), OutputFormat::Hls, "/base/".into(), ContainerFormat::default());
         state.phase = ManifestPhase::Live;
         state.segments.push(SegmentInfo {
             number: 0,

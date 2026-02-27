@@ -11,6 +11,7 @@ mod common;
 use edge_packager::drm::scheme::EncryptionScheme;
 use edge_packager::drm::{system_ids, ContentKey};
 use edge_packager::media::cmaf::{self, iterate_boxes, parse_pssh, parse_tenc};
+use edge_packager::media::container::ContainerFormat;
 use edge_packager::media::init::{parse_protection_info, rewrite_init_segment};
 use edge_packager::media::segment::{rewrite_segment, SegmentRewriteParams};
 
@@ -65,7 +66,7 @@ fn rewrite_init_segment_cbcs_to_cenc() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default())
         .expect("rewrite should succeed");
 
     // Verify the rewritten segment has correct structure
@@ -83,7 +84,7 @@ fn rewritten_init_segment_has_cenc_pssh_boxes() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default())
         .expect("rewrite should succeed");
 
     // Count PSSH boxes and verify they are for CENC systems (Widevine + PlayReady)
@@ -132,7 +133,7 @@ fn rewritten_init_segment_excludes_fairplay() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set_with_fairplay();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default())
         .expect("rewrite should succeed");
 
     // Verify no FairPlay PSSH boxes
@@ -165,7 +166,7 @@ fn rewritten_init_contains_cenc_scheme() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default())
         .expect("rewrite should succeed");
 
     // Verify 'cenc' scheme appears in the rewritten data
@@ -178,7 +179,7 @@ fn rewritten_init_preserves_ftyp() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default())
         .expect("rewrite should succeed");
 
     // ftyp box should be identical (copied as-is)
@@ -202,7 +203,7 @@ fn rewrite_with_iv_size_16() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 16, (0, 0))
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 16, (0, 0), ContainerFormat::default())
         .expect("rewrite with IV size 16 should succeed");
 
     // Verify the tenc box in the output uses IV size 16

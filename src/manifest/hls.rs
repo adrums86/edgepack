@@ -104,9 +104,10 @@ mod tests {
     use super::*;
     use crate::drm::scheme::EncryptionScheme;
     use crate::manifest::types::*;
+    use crate::media::container::ContainerFormat;
 
     fn make_state(phase: ManifestPhase) -> ManifestState {
-        let mut s = ManifestState::new("test".into(), OutputFormat::Hls, "/base/".into());
+        let mut s = ManifestState::new("test".into(), OutputFormat::Hls, "/base/".into(), ContainerFormat::default());
         s.phase = phase;
         s
     }

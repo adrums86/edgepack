@@ -9,6 +9,7 @@ use edge_packager::manifest::types::{
     InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo,
 };
 use edge_packager::media::cmaf;
+use edge_packager::media::container::ContainerFormat;
 
 // ─── DRM Fixtures ───────────────────────────────────────────────────
 
@@ -366,6 +367,7 @@ pub fn make_hls_manifest_state(segment_count: u32, phase: ManifestPhase) -> Mani
         "integration-test".into(),
         OutputFormat::Hls,
         "/repackage/integration-test/hls/".into(),
+        ContainerFormat::default(),
     );
     state.phase = phase;
     state.init_segment = Some(InitSegmentInfo {
@@ -403,6 +405,7 @@ pub fn make_dash_manifest_state(segment_count: u32, phase: ManifestPhase) -> Man
         "integration-test".into(),
         OutputFormat::Dash,
         "/repackage/integration-test/dash/".into(),
+        ContainerFormat::default(),
     );
     state.phase = phase;
     state.init_segment = Some(InitSegmentInfo {

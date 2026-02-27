@@ -1,4 +1,5 @@
 pub mod cmaf;
+pub mod container;
 pub mod init;
 pub mod segment;
 

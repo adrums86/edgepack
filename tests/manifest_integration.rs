@@ -14,6 +14,7 @@ use edge_packager::manifest::types::{
     ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat,
 };
 use edge_packager::manifest;
+use edge_packager::media::container::ContainerFormat;
 use edge_packager::repackager::progressive::ProgressiveOutput;
 
 // ─── ProgressiveOutput State Machine ────────────────────────────────
@@ -34,6 +35,7 @@ fn progressive_output_hls_full_lifecycle() {
         OutputFormat::Hls,
         "/repackage/lifecycle-test/hls/".into(),
         drm_info,
+        ContainerFormat::default(),
     );
 
     // Phase 1: AwaitingFirstSegment
@@ -117,6 +119,7 @@ fn progressive_output_dash_full_lifecycle() {
         OutputFormat::Dash,
         "/repackage/dash-lifecycle/dash/".into(),
         drm_info,
+        ContainerFormat::default(),
     );
 
     po.set_init_segment(vec![0x00; 512]);

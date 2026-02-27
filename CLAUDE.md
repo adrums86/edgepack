@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edge-packager** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF media between encryption schemes (CBCS ↔ CENC), producing progressive HLS or DASH output. The target encryption scheme is configurable per request, supporting CBCS→CENC, CENC→CBCS, CENC→CENC, and CBCS→CBCS transforms with automatic source scheme detection. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys.
+**edge-packager** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. The target encryption scheme and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys.
 
 ## Build Commands
 
@@ -54,10 +54,11 @@ src/
 │   ├── cpix.rs         CPIX XML request builder + response parser
 │   ├── cbcs.rs         AES-128-CBC pattern decryption + encryption (CBCS scheme)
 │   └── cenc.rs         AES-128-CTR encryption + decryption (CENC scheme)
-├── media/              ISOBMFF/CMAF container handling
+├── media/              ISOBMFF/CMAF/fMP4 container handling
 │   ├── mod.rs          FourCC type, box_type constants, TrackType enum
 │   ├── cmaf.rs         Zero-copy MP4 box parser, builders, iterators
-│   ├── init.rs         Init segment rewriting (sinf/schm/tenc/pssh)
+│   ├── container.rs    ContainerFormat enum (Cmaf/Fmp4) — brands, extensions, profiles
+│   ├── init.rs         Init segment rewriting (sinf/schm/tenc/pssh + ftyp brand rewriting)
 │   └── segment.rs      Media segment rewriting (senc/mdat decrypt+re-encrypt)
 ├── manifest/           Manifest parsing (input) and rendering (output)
 │   ├── mod.rs          render_manifest() dispatcher
@@ -78,7 +79,7 @@ src/
 
 ## Architecture Diagrams
 
-Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md). The file contains 9 diagrams: system context, data flow, module architecture, split execution sequence, progressive output state machine, cache security model, cache key layout, CDN caching strategy, and per-segment encryption transform. All diagrams are Mermaid syntax, portable to Confluence, Jira, and Lucidchart.
+Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md). The file contains 10 diagrams: system context, data flow, module architecture, split execution sequence, progressive output state machine, cache security model, cache key layout, CDN caching strategy, per-segment encryption transform, and container format comparison. All diagrams are Mermaid syntax, portable to Confluence, Jira, and Lucidchart.
 
 ## Key Concepts
 
@@ -96,12 +97,23 @@ The core transform is scheme-configurable on CMAF segments (source and target sc
 4. Rewrite `senc` box with new IVs (size depends on target scheme: 16 bytes for CBCS, 8 bytes for CENC)
 5. Rebuild `moof` + `mdat`
 
-Init segments require rewriting `sinf`/`schm`/`tenc`/`pssh` boxes. The `schm` box type and `tenc` parameters (IV size, pattern) are set based on the target `EncryptionScheme`. PSSH boxes are filtered per target scheme (FairPlay included for CBCS output, excluded for CENC output).
+Init segments require rewriting `sinf`/`schm`/`tenc`/`pssh` boxes and `ftyp` brands. The `schm` box type and `tenc` parameters (IV size, pattern) are set based on the target `EncryptionScheme`. PSSH boxes are filtered per target scheme (FairPlay included for CBCS output, excluded for CENC output). The `ftyp` box is rewritten with compatible brands matching the target `ContainerFormat` (CMAF includes `cmfc`, fMP4 does not).
 
 **Scheme-specific behaviour:**
 - **CBCS**: AES-128-CBC, pattern encryption (1:9 video, 0:0 audio), 16-byte IVs, supports FairPlay
 - **CENC**: AES-128-CTR, full encryption (no pattern), 8-byte IVs, Widevine + PlayReady only
 - Source scheme auto-detected from init segment `schm` box or manifest DRM signaling
+
+### Container Format
+
+The output container format is configurable via `ContainerFormat` enum (`Cmaf` or `Fmp4`):
+- **CMAF** (default): Compatible brands include `cmfc`, segment extensions are `.cmfv`/`.cmfa`, DASH profile includes `cmaf:2019`
+- **fMP4**: No `cmfc` brand, segment extension is `.m4s`, DASH profile is `isoff-live:2011` only
+- Both formats use `.mp4` for init segments and `video/mp4`/`audio/mp4` MIME types
+- The `ftyp` box in init segments is rewritten to match the target format's brands
+- `ContainerFormat` flows through `RepackageRequest` → `ContinuationParams` → `ManifestState` → `ProgressiveOutput`
+- Segment URIs are built dynamically using `container_format.video_segment_extension()`
+- DASH renderer uses `container_format.dash_profiles()` for MPD `@profiles` attribute
 
 ### Progressive Manifest Output
 
@@ -189,29 +201,30 @@ Core crates are chosen for WASM compatibility (no system dependencies, no async 
 
 ## Tests
 
-The project has **495 tests** total: 423 unit tests and 72 integration tests. All run on the native host target.
+The project has **526 tests** total: 452 unit tests and 74 integration tests. All run on the native host target.
 
-### Unit Tests (423)
+### Unit Tests (452)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
-- **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads, encryption schemes, continuation params)
+- **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads, encryption schemes, container formats, continuation params)
 - **Encryption scheme abstraction**: `EncryptionScheme` enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags), `SampleDecryptor`/`SampleEncryptor` trait dispatch via factory functions
+- **Container format abstraction**: `ContainerFormat` enum (extensions, brands, ftyp box building, DASH profile strings, serde roundtrips, display, from_str_value parsing)
 - **Encryption correctness**: CBCS decrypt + encrypt, CENC encrypt + decrypt, scheme-agnostic roundtrips through factory functions
 - **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
-- **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme)
+- **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not)
 - **Segment rewriting**: Scheme-aware decrypt/re-encrypt with configurable source/target scheme and pattern
 - **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering
 - **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements
-- **Progressive output state machine**: Phase transitions, cache-control header generation, segment URI formatting
-- **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion
-- **HTTP routing**: Path parsing, format validation, segment number extraction, all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, invalid scheme rejection, serde roundtrips
+- **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
+- **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion, container format threading through ContinuationParams
+- **HTTP routing**: Path parsing, format validation, segment number extraction (.cmfv and .m4s), all route dispatching
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, container_format parsing, invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgePackagerError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (72)
+### Integration Tests (74)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -220,9 +233,9 @@ tests/
 ├── common/
 │   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
-├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting, PSSH/senc roundtrips
+├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
 ├── manifest_integration.rs   20 tests: progressive output lifecycle, DRM signaling, cache headers
-└── handler_integration.rs    26 tests: HTTP routing, webhook validation, response helpers
+└── handler_integration.rs    28 tests: HTTP routing (incl. .cmfv and .m4s segments), webhook validation, response helpers
 ```
 
 **Key fixtures in `tests/common/mod.rs`:**
@@ -259,7 +272,8 @@ When adding new functionality, follow the existing pattern:
 | GET | `/health` | inline | Health check, returns "ok" |
 | GET | `/repackage/{id}/{format}/manifest` | `request::handle_manifest_request` | Serve repackaged manifest |
 | GET | `/repackage/{id}/{format}/init.mp4` | `request::handle_init_segment_request` | Serve repackaged init segment |
-| GET | `/repackage/{id}/{format}/segment_{n}.cmfv` | `request::handle_media_segment_request` | Serve repackaged media segment |
+| GET | `/repackage/{id}/{format}/segment_{n}.cmfv` | `request::handle_media_segment_request` | Serve repackaged CMAF media segment |
+| GET | `/repackage/{id}/{format}/segment_{n}.m4s` | `request::handle_media_segment_request` | Serve repackaged fMP4 media segment |
 | POST | `/webhook/repackage` | `webhook::handle_repackage_webhook` | Trigger proactive repackaging (returns 200 after first manifest) |
 | POST | `/webhook/repackage/continue` | `webhook::handle_continue` | Internal self-invocation to process remaining segments |
 | GET | `/status/{id}/{format}` | `request::handle_status_request` | Query job progress |
@@ -347,14 +361,14 @@ FairPlay is recognised in both input and output. For CENC target output, FairPla
 
 ## Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phase 1 is complete. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1 and 2 are complete. Remaining phases:
 
-### Phase 2: Container Format Flexibility (CMAF + fMP4)
-- Create `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`)
-- Add ftyp brand rewriting in `src/media/init.rs`
-- Wire `container_format` through `RepackageRequest`, `WebhookPayload`, manifest renderers
-- Update segment URI extensions and MIME types per container format
-- Estimated: ~170 new LOC, ~100 modified LOC, ~25 new tests
+### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
+- Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
+- Added ftyp brand rewriting in `src/media/init.rs` — 3 new tests
+- Wired `container_format` through `RepackageRequest`, `WebhookPayload`, `ManifestState`, `ContinuationParams`, pipeline, progressive output, and manifest renderers
+- Updated segment URI extensions dynamically, DASH profile signaling, and route handling for `.cmfv`/`.m4s`
+- Result: 526 tests total (452 unit + 74 integration), +31 from Phase 1
 
 ### Phase 3: Dual-Scheme Output
 - Multi-rendition: `target_schemes: Vec<EncryptionScheme>` producing separate segment sets per scheme

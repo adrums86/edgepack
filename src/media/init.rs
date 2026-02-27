@@ -2,6 +2,7 @@ use crate::drm::scheme::EncryptionScheme;
 use crate::drm::DrmKeySet;
 use crate::error::Result;
 use crate::media::box_type;
+use crate::media::container::ContainerFormat;
 use crate::media::cmaf::{
     self, BoxHeader, ProtectionSchemeInfo, build_pssh_box, find_child_box, iterate_boxes,
     parse_tenc, read_box_header, PsshBox,
@@ -21,6 +22,7 @@ pub fn rewrite_init_segment(
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
+    container_format: ContainerFormat,
 ) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(init_data.len());
 
@@ -30,11 +32,15 @@ pub fn rewrite_init_segment(
         let box_data = &init_data[header.offset as usize..box_end.min(init_data.len())];
 
         match &header.box_type {
+            t if t == &box_type::FTYP => {
+                // Rewrite ftyp box with container-format-specific brands
+                output.extend_from_slice(&container_format.build_ftyp());
+            }
             t if t == &box_type::MOOV => {
                 output.extend_from_slice(&rewrite_moov(box_data, &header, key_set, target_scheme, target_iv_size, target_pattern)?);
             }
             _ => {
-                // Copy box as-is (ftyp, etc.)
+                // Copy other boxes as-is
                 output.extend_from_slice(box_data);
             }
         }
@@ -519,6 +525,7 @@ mod tests {
     use crate::drm::scheme::EncryptionScheme;
     use crate::drm::{system_ids, ContentKey, DrmSystemData};
     use crate::media::cmaf;
+    use crate::media::container::ContainerFormat;
 
     fn make_key_set() -> DrmKeySet {
         DrmKeySet {
@@ -727,7 +734,7 @@ mod tests {
     #[test]
     fn rewrite_init_segment_empty_data() {
         let key_set = make_key_set();
-        let result = rewrite_init_segment(&[], &key_set, EncryptionScheme::Cenc, 8, (0, 0)).unwrap();
+        let result = rewrite_init_segment(&[], &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default()).unwrap();
         assert!(result.is_empty());
     }
 
@@ -738,9 +745,36 @@ mod tests {
         cmaf::write_box_header(&mut data, 16, b"ftyp");
         data.extend_from_slice(b"isom\x00\x00\x02\x00");
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0)).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf).unwrap();
         assert_eq!(&result[4..8], b"ftyp");
-        assert_eq!(result.len(), data.len());
+        // ftyp is rewritten with container-format-specific brands
+        let ftyp_size = u32::from_be_bytes([result[0], result[1], result[2], result[3]]) as usize;
+        assert!(ftyp_size >= 16); // At least header + major_brand + minor_version
+    }
+
+    #[test]
+    fn rewrite_init_segment_ftyp_cmaf_has_cmfc_brand() {
+        let key_set = make_key_set();
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, 16, b"ftyp");
+        data.extend_from_slice(b"isom\x00\x00\x02\x00");
+
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf).unwrap();
+        // CMAF ftyp should contain cmfc compatible brand
+        assert!(result.windows(4).any(|w| w == b"cmfc"), "CMAF ftyp should contain cmfc brand");
+    }
+
+    #[test]
+    fn rewrite_init_segment_ftyp_fmp4_no_cmfc_brand() {
+        let key_set = make_key_set();
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, 16, b"ftyp");
+        data.extend_from_slice(b"isom\x00\x00\x02\x00");
+
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Fmp4).unwrap();
+        assert_eq!(&result[4..8], b"ftyp");
+        // fMP4 ftyp should NOT contain cmfc brand
+        assert!(!result.windows(4).any(|w| w == b"cmfc"), "fMP4 ftyp should not contain cmfc brand");
     }
 
     #[test]
@@ -756,7 +790,7 @@ mod tests {
         cmaf::write_box_header(&mut data, moov_size, b"moov");
         data.extend_from_slice(&mvhd_data);
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0)).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default()).unwrap();
         assert_eq!(&result[4..8], b"moov");
         let has_pssh = result.windows(4).any(|w| w == b"pssh");
         assert!(has_pssh);
@@ -775,7 +809,7 @@ mod tests {
         cmaf::write_box_header(&mut data, moov_size, b"moov");
         data.extend_from_slice(&mvhd_data);
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cbcs, 16, (1, 9)).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cbcs, 16, (1, 9), ContainerFormat::default()).unwrap();
         assert_eq!(&result[4..8], b"moov");
         let has_pssh = result.windows(4).any(|w| w == b"pssh");
         assert!(has_pssh);
