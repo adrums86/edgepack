@@ -126,9 +126,13 @@ These sections compile but return placeholder errors and need WASI HTTP transpor
 
 All crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements).
 
-## Unit Tests
+## Tests
 
-The project has 287 unit tests inlined as `#[cfg(test)] mod tests` blocks in every source file. Tests cover:
+The project has **359 tests** total: 287 unit tests and 72 integration tests. All run on the native host target.
+
+### Unit Tests (287)
+
+Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 - **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads)
 - **Encryption correctness**: CBCS decrypt and CENC encrypt/decrypt with known-answer tests and roundtrips
@@ -141,7 +145,36 @@ The project has 287 unit tests inlined as `#[cfg(test)] mod tests` blocks in eve
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-When adding new functionality, follow the existing pattern: add `#[cfg(test)] mod tests { ... }` at the bottom of the source file, import `use super::*;`, and create small focused test functions with descriptive names.
+### Integration Tests (72)
+
+Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
+
+```
+tests/
+├── common/
+│   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
+├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
+├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting, PSSH/senc roundtrips
+├── manifest_integration.rs   20 tests: progressive output lifecycle, DRM signaling, cache headers
+└── handler_integration.rs    26 tests: HTTP routing, webhook validation, response helpers
+```
+
+**Key fixtures in `tests/common/mod.rs`:**
+- `build_cbcs_init_segment()` — builds a synthetic CBCS init segment (ftyp + moov with stsd→encv→sinf→frma/schm/schi/tenc + pssh)
+- `build_cbcs_media_segment(sample_count, sample_size)` — builds a CBCS-encrypted moof+mdat with configurable samples; returns `(segment_bytes, plaintext_samples)` for verification
+- `make_drm_key_set()` / `make_drm_key_set_with_fairplay()` — builds DrmKeySet with system-specific PSSH data
+- `make_hls_manifest_state()` / `make_dash_manifest_state()` — builds ManifestState with DRM info and segments
+- Test constants: `TEST_SOURCE_KEY`, `TEST_TARGET_KEY`, `TEST_KID`, `TEST_IV` (all `[u8; 16]`)
+
+To run only integration tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'`
+
+To run a specific suite: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip`
+
+### Test Guidelines
+
+When adding new functionality, follow the existing pattern:
+- **Unit tests**: Add `#[cfg(test)] mod tests { ... }` at the bottom of the source file, import `use super::*;`, and create small focused test functions with descriptive names.
+- **Integration tests**: For cross-module workflows, add tests to the appropriate file in `tests/` or create a new file. Use shared fixtures from `tests/common/mod.rs`. Add `mod common;` at the top of each integration test file.
 
 ## Coding Conventions
 
@@ -150,8 +183,8 @@ When adding new functionality, follow the existing pattern: add `#[cfg(test)] mo
 - **Trait-based abstraction**: `CacheBackend` trait allows swapping Redis implementations without changing business logic.
 - **Explicit state machines**: `ManifestPhase` and `JobState` enums drive control flow rather than implicit boolean flags.
 - **`#[derive(Serialize, Deserialize)]`** on all types that cross the Redis boundary.
-- **No `main.rs`**: This is a library crate (`crate-type = ["cdylib"]`). The WASI runtime calls the exported handler functions.
-- **Inline tests**: All tests live in `#[cfg(test)] mod tests` blocks within each source file, not in a separate `tests/` directory.
+- **No `main.rs`**: This is a library crate (`crate-type = ["cdylib", "rlib"]`). The WASI runtime calls the exported handler functions. The `rlib` target enables integration tests to link against the crate.
+- **Two test locations**: Unit tests live inline in `#[cfg(test)] mod tests` blocks within each source file. Integration tests live in the `tests/` directory with shared fixtures in `tests/common/mod.rs`.
 
 ## HTTP Route Table
 
