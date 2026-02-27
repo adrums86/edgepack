@@ -5,7 +5,7 @@ edition = "2021"
 description = "CDN edge WASM application for repackaging DASH/HLS CMAF media from CBCS to CENC encryption"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 aes = "0.8"
@@ -20,6 +20,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = { version = "2", features = ["serde"] }
 log = "0.4"
 cipher = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasi = "0.14"
 
 [profile.release]
 opt-level = "s"

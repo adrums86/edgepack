@@ -33,6 +33,8 @@ src/
 ├── lib.rs              Module root (re-exports all submodules)
 ├── error.rs            EdgePackagerError enum + Result<T> alias
 ├── config.rs           AppConfig loaded from env vars
+├── http_client.rs      Shared outgoing HTTP client (WASI wasi:http/outgoing-handler)
+├── wasi_handler.rs     WASI incoming handler bridge (wasm32 only)
 ├── cache/              Redis-backed application state store
 │   ├── mod.rs          CacheBackend trait + CacheKeys builder + factory
 │   ├── redis_http.rs   Upstash-compatible HTTP Redis (primary)
@@ -48,19 +50,21 @@ src/
 │   ├── cmaf.rs         Zero-copy MP4 box parser, builders, iterators
 │   ├── init.rs         Init segment rewriting (sinf/schm/tenc/pssh)
 │   └── segment.rs      Media segment rewriting (senc/mdat decrypt+re-encrypt)
-├── manifest/           Output manifest generation
+├── manifest/           Manifest parsing (input) and rendering (output)
 │   ├── mod.rs          render_manifest() dispatcher
-│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, DrmInfo, etc.
+│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, DrmInfo, SourceManifest
 │   ├── hls.rs          HLS M3U8 renderer (media + master playlists)
-│   └── dash.rs         DASH MPD renderer (SegmentTemplate + SegmentTimeline)
+│   ├── dash.rs         DASH MPD renderer (SegmentTemplate + SegmentTimeline)
+│   ├── hls_input.rs    HLS M3U8 input parser (source manifest extraction)
+│   └── dash_input.rs   DASH MPD input parser (source manifest extraction)
 ├── repackager/         Orchestration layer
 │   ├── mod.rs          RepackageRequest, JobStatus, JobState types
-│   ├── pipeline.rs     RepackagePipeline — full fetch→decrypt→re-encrypt→output flow
+│   ├── pipeline.rs     RepackagePipeline — fetch→decrypt→re-encrypt→output flow + continuation
 │   └── progressive.rs  ProgressiveOutput state machine (AwaitingFirstSegment→Live→Complete)
 └── handler/            HTTP request handling
-    ├── mod.rs          Router, HttpRequest/HttpResponse types, route() dispatcher
+    ├── mod.rs          Router, HttpRequest/HttpResponse/HandlerContext, route() dispatcher
     ├── request.rs      On-demand GET handlers (manifest, init, segment, status)
-    └── webhook.rs      POST /webhook/repackage handler
+    └── webhook.rs      POST /webhook/repackage + continue handler
 ```
 
 ## Key Concepts
@@ -96,16 +100,18 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 All modules use `crate::error::Result<T>` which aliases `std::result::Result<T, EdgePackagerError>`. The `EdgePackagerError` enum has specific variants for each subsystem (Cache, Drm, Speke, Cpix, Encryption, MediaParse, SegmentRewrite, Manifest, Http, Config, InvalidInput, NotFound, Io). Use `thiserror` derive macros. Propagation is via `?` operator throughout.
 
-## Unimplemented Areas (marked with TODO)
+## Runtime Implementation
 
-These sections compile but return placeholder errors and need WASI HTTP transport:
+All HTTP transport and request handling is fully implemented:
 
-1. **`cache/redis_http.rs` → `execute_command()`**: Needs `wasi:http/outgoing-handler` to make Upstash REST API calls.
-2. **`drm/speke.rs` → `post_cpix()`**: Needs `wasi:http/outgoing-handler` to POST CPIX XML to license server.
-3. **`repackager/pipeline.rs` → `fetch_source_manifest()` and `fetch_segment()`**: Need `wasi:http/outgoing-handler` to fetch origin content.
-4. **`handler/request.rs`**: All four request handlers need to be wired up to the cache backend and pipeline.
-5. **`handler/webhook.rs`**: Async pipeline kickoff needs WASI task scheduling or self-referential HTTP chaining.
-6. **Source manifest parsing**: The pipeline currently stubs out source manifest fetching. Needs an HLS M3U8 and DASH MPD *input* parser (the `manifest/` module only handles *output* generation).
+1. **`http_client.rs`**: Shared HTTP client using `wasi:http/outgoing-handler` (wasm32) with native stub error (non-wasm32, preserves test builds).
+2. **`wasi_handler.rs`**: WASI incoming handler bridge implementing `wasi:http/incoming-handler::Guest`. Converts WASI types ↔ library types and maps errors to HTTP status codes.
+3. **`cache/redis_http.rs` → `execute_command()`**: Uses `http_client::get()` to make Upstash REST API calls. Parses JSON responses via extracted `parse_upstash_response()`.
+4. **`drm/speke.rs` → `post_cpix()`**: Uses `http_client::post()` to POST CPIX XML to license server with auth headers.
+5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. Pipeline split into `execute_first()` (through first segment + live manifest) and `execute_remaining()` (one segment per invocation with self-invocation chaining).
+6. **`manifest/hls_input.rs` + `dash_input.rs`**: Source manifest input parsers extracting segment URLs, durations, init segment references, and live/VOD detection.
+7. **`handler/request.rs`**: All four GET handlers query Redis for cached segment data and manifest state via `HandlerContext`.
+8. **`handler/webhook.rs`**: Creates pipeline, calls `execute_first()`, fires self-invocation to `/webhook/repackage/continue`, returns 200 after first manifest publishes. Continue handler chains remaining segment processing.
 
 ## Dependencies
 
@@ -123,12 +129,13 @@ These sections compile but return placeholder errors and need WASI HTTP transpor
 | `url` | 2 | URL parsing for SPEKE endpoint, source URLs |
 | `thiserror` | 2 | Derive macro for error types |
 | `log` | 0.4 | Logging facade |
+| `wasi` | 0.14 | WASI Preview 2 bindings (wasm32 target only) |
 
 All crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements).
 
 ## Unit Tests
 
-The project has 287 unit tests inlined as `#[cfg(test)] mod tests` blocks in every source file. Tests cover:
+The project has 342 unit tests inlined as `#[cfg(test)] mod tests` blocks in every source file. Tests cover:
 
 - **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads)
 - **Encryption correctness**: CBCS decrypt and CENC encrypt/decrypt with known-answer tests and roundtrips
@@ -150,7 +157,8 @@ When adding new functionality, follow the existing pattern: add `#[cfg(test)] mo
 - **Trait-based abstraction**: `CacheBackend` trait allows swapping Redis implementations without changing business logic.
 - **Explicit state machines**: `ManifestPhase` and `JobState` enums drive control flow rather than implicit boolean flags.
 - **`#[derive(Serialize, Deserialize)]`** on all types that cross the Redis boundary.
-- **No `main.rs`**: This is a library crate (`crate-type = ["cdylib"]`). The WASI runtime calls the exported handler functions.
+- **No `main.rs`**: This is a library crate (`crate-type = ["cdylib", "rlib"]`). The WASI runtime calls the exported handler functions. The `rlib` target enables native test builds.
+- **`#[cfg(target_arch = "wasm32")]`**: WASI-specific modules (`wasi_handler.rs`, WASI HTTP transport in `http_client.rs`) are gated behind this cfg to preserve native test builds.
 - **Inline tests**: All tests live in `#[cfg(test)] mod tests` blocks within each source file, not in a separate `tests/` directory.
 
 ## HTTP Route Table
@@ -161,7 +169,8 @@ When adding new functionality, follow the existing pattern: add `#[cfg(test)] mo
 | GET | `/repackage/{id}/{format}/manifest` | `request::handle_manifest_request` | Serve repackaged manifest |
 | GET | `/repackage/{id}/{format}/init.mp4` | `request::handle_init_segment_request` | Serve repackaged init segment |
 | GET | `/repackage/{id}/{format}/segment_{n}.cmfv` | `request::handle_media_segment_request` | Serve repackaged media segment |
-| POST | `/webhook/repackage` | `webhook::handle_repackage_webhook` | Trigger proactive repackaging |
+| POST | `/webhook/repackage` | `webhook::handle_repackage_webhook` | Trigger proactive repackaging (returns 200 after first manifest) |
+| POST | `/webhook/repackage/continue` | `webhook::handle_continue` | Internal self-invocation to process remaining segments |
 | GET | `/status/{id}/{format}` | `request::handle_status_request` | Query job progress |
 
 `{format}` is `hls` or `dash`.
@@ -187,6 +196,10 @@ When adding new functionality, follow the existing pattern: add `#[cfg(test)] mo
 | `ep:{content_id}:keys` | 24h | Serialized DRM content keys (JSON) |
 | `ep:{content_id}:{format}:state` | 48h | JobStatus JSON (state, progress) |
 | `ep:{content_id}:{format}:manifest_state` | 48h | ManifestState JSON (segments, phase) |
+| `ep:{content_id}:{format}:init` | 48h | Rewritten init segment binary data |
+| `ep:{content_id}:{format}:seg:{n}` | 48h | Rewritten media segment binary data |
+| `ep:{content_id}:{format}:source` | 48h | Source manifest metadata (segment URLs, durations, is_live) |
+| `ep:{content_id}:{format}:rewrite_params` | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
 | `ep:{content_id}:speke` | 24h | Cached SPEKE response (avoids duplicate calls) |
 
 ## ISOBMFF Box Types

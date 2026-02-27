@@ -1,5 +1,7 @@
 pub mod dash;
+pub mod dash_input;
 pub mod hls;
+pub mod hls_input;
 pub mod types;
 
 use crate::error::Result;
