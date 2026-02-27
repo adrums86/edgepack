@@ -21,9 +21,11 @@ use edge_packager::repackager::progressive::ProgressiveOutput;
 #[test]
 fn progressive_output_hls_full_lifecycle() {
     let drm_info = ManifestDrmInfo {
+        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgIARIQ".into()),
         playready_pssh: Some("AAAARHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAE=".into()),
         playready_pro: None,
+        fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
     };
 
@@ -102,9 +104,11 @@ fn progressive_output_hls_full_lifecycle() {
 #[test]
 fn progressive_output_dash_full_lifecycle() {
     let drm_info = ManifestDrmInfo {
+        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("WVPSSH".into()),
         playready_pssh: Some("PRPSSH".into()),
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
+        fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
     };
 

@@ -39,12 +39,26 @@ pub fn render(state: &ManifestState) -> Result<String> {
     // Independent segments (CMAF guarantees this)
     m3u8.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
-    // DRM signaling — CENC (Widevine + PlayReady)
+    // DRM signaling — dynamic method based on encryption scheme
     if let Some(ref drm) = state.drm_info {
+        let method = drm.encryption_scheme.hls_method_string();
+
+        // FairPlay (CBCS only)
+        if let Some(ref key_uri) = drm.fairplay_key_uri {
+            m3u8.push_str(&format!(
+                "#EXT-X-KEY:METHOD={method},\
+                 URI=\"{key_uri}\",\
+                 KEYID=0x{},\
+                 KEYFORMAT=\"com.apple.streamingkeydelivery\",\
+                 KEYFORMATVERSIONS=\"1\"\n",
+                drm.default_kid
+            ));
+        }
+
         // Widevine
         if let Some(ref pssh) = drm.widevine_pssh {
             m3u8.push_str(&format!(
-                "#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,\
+                "#EXT-X-KEY:METHOD={method},\
                  URI=\"data:text/plain;base64,{pssh}\",\
                  KEYID=0x{},\
                  KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\",\
@@ -56,7 +70,7 @@ pub fn render(state: &ManifestState) -> Result<String> {
         // PlayReady
         if let Some(ref pssh) = drm.playready_pssh {
             m3u8.push_str(&format!(
-                "#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,\
+                "#EXT-X-KEY:METHOD={method},\
                  URI=\"data:text/plain;base64,{pssh}\",\
                  KEYID=0x{},\
                  KEYFORMAT=\"urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95\",\
@@ -88,6 +102,7 @@ pub fn render(state: &ManifestState) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drm::scheme::EncryptionScheme;
     use crate::manifest::types::*;
 
     fn make_state(phase: ManifestPhase) -> ManifestState {
@@ -165,9 +180,11 @@ mod tests {
     fn render_with_drm_widevine() {
         let mut state = make_live_state_with_segments(1);
         state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
             widevine_pssh: Some("AAAA".into()),
             playready_pssh: None,
             playready_pro: None,
+            fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".into(),
         });
         let m3u8 = render(&state).unwrap();
@@ -177,12 +194,30 @@ mod tests {
     }
 
     #[test]
+    fn render_with_drm_cbcs_uses_sample_aes() {
+        let mut state = make_live_state_with_segments(1);
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cbcs,
+            widevine_pssh: Some("AAAA".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("METHOD=SAMPLE-AES"));
+        assert!(!m3u8.contains("METHOD=SAMPLE-AES-CTR"));
+    }
+
+    #[test]
     fn render_with_drm_playready() {
         let mut state = make_live_state_with_segments(1);
         state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
             widevine_pssh: None,
             playready_pssh: Some("BBBB".into()),
             playready_pro: None,
+            fairplay_key_uri: None,
             default_kid: "abcdef01234567890123456789abcdef".into(),
         });
         let m3u8 = render(&state).unwrap();
@@ -193,14 +228,33 @@ mod tests {
     fn render_with_both_drm_systems() {
         let mut state = make_live_state_with_segments(1);
         state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
             widevine_pssh: Some("WV".into()),
             playready_pssh: Some("PR".into()),
             playready_pro: None,
+            fairplay_key_uri: None,
             default_kid: "00000000000000000000000000000001".into(),
         });
         let m3u8 = render(&state).unwrap();
         let key_count = m3u8.matches("#EXT-X-KEY:").count();
         assert_eq!(key_count, 2);
+    }
+
+    #[test]
+    fn render_with_fairplay() {
+        let mut state = make_live_state_with_segments(1);
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cbcs,
+            widevine_pssh: None,
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: Some("skd://key-server/key-id".into()),
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("METHOD=SAMPLE-AES"));
+        assert!(m3u8.contains("KEYFORMAT=\"com.apple.streamingkeydelivery\""));
+        assert!(m3u8.contains("skd://key-server/key-id"));
     }
 
     #[test]
@@ -259,9 +313,11 @@ mod tests {
     fn render_master_with_session_key() {
         let mut state = make_state(ManifestPhase::Live);
         state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
             widevine_pssh: Some("WVPSSH".into()),
             playready_pssh: None,
             playready_pro: None,
+            fairplay_key_uri: None,
             default_kid: "00000000000000000000000000000001".into(),
         });
         state.variants.push(VariantInfo {
@@ -303,9 +359,10 @@ pub fn render_master(state: &ManifestState, variant_playlist_uris: &[String]) ->
 
     // Content protection at master level
     if let Some(ref drm) = state.drm_info {
+        let method = drm.encryption_scheme.hls_method_string();
         if let Some(ref pssh) = drm.widevine_pssh {
             m3u8.push_str(&format!(
-                "#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES-CTR,\
+                "#EXT-X-SESSION-KEY:METHOD={method},\
                  URI=\"data:text/plain;base64,{pssh}\",\
                  KEYID=0x{},\
                  KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\",\

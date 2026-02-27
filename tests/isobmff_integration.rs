@@ -8,6 +8,7 @@
 
 mod common;
 
+use edge_packager::drm::scheme::EncryptionScheme;
 use edge_packager::drm::{system_ids, ContentKey};
 use edge_packager::media::cmaf::{self, iterate_boxes, parse_pssh, parse_tenc};
 use edge_packager::media::init::{parse_protection_info, rewrite_init_segment};
@@ -64,7 +65,7 @@ fn rewrite_init_segment_cbcs_to_cenc() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, 8)
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
         .expect("rewrite should succeed");
 
     // Verify the rewritten segment has correct structure
@@ -82,7 +83,7 @@ fn rewritten_init_segment_has_cenc_pssh_boxes() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, 8)
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
         .expect("rewrite should succeed");
 
     // Count PSSH boxes and verify they are for CENC systems (Widevine + PlayReady)
@@ -131,7 +132,7 @@ fn rewritten_init_segment_excludes_fairplay() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set_with_fairplay();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, 8)
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
         .expect("rewrite should succeed");
 
     // Verify no FairPlay PSSH boxes
@@ -164,7 +165,7 @@ fn rewritten_init_contains_cenc_scheme() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, 8)
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
         .expect("rewrite should succeed");
 
     // Verify 'cenc' scheme appears in the rewritten data
@@ -177,7 +178,7 @@ fn rewritten_init_preserves_ftyp() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, 8)
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 8, (0, 0))
         .expect("rewrite should succeed");
 
     // ftyp box should be identical (copied as-is)
@@ -201,7 +202,7 @@ fn rewrite_with_iv_size_16() {
     let init_data = common::build_cbcs_init_segment();
     let key_set = common::make_drm_key_set();
 
-    let rewritten = rewrite_init_segment(&init_data, &key_set, 16)
+    let rewritten = rewrite_init_segment(&init_data, &key_set, EncryptionScheme::Cenc, 16, (0, 0))
         .expect("rewrite with IV size 16 should succeed");
 
     // Verify the tenc box in the output uses IV size 16
@@ -252,10 +253,12 @@ fn rewrite_media_segment_basic_roundtrip() {
             key: common::TEST_TARGET_KEY.to_vec(),
             iv: None,
         },
+        source_scheme: EncryptionScheme::Cbcs,
+        target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
         target_iv_size: 8,
-        crypt_byte_block: 0, // Full encryption (matching our fixture)
-        skip_byte_block: 0,
+        source_pattern: (0, 0),
+        target_pattern: (0, 0),
         constant_iv: None,
         segment_number: 0,
     };
@@ -300,10 +303,12 @@ fn rewrite_media_segment_mdat_is_encrypted() {
             key: common::TEST_TARGET_KEY.to_vec(),
             iv: None,
         },
+        source_scheme: EncryptionScheme::Cbcs,
+        target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
         target_iv_size: 8,
-        crypt_byte_block: 0,
-        skip_byte_block: 0,
+        source_pattern: (0, 0),
+        target_pattern: (0, 0),
         constant_iv: None,
         segment_number: 0,
     };
@@ -348,10 +353,12 @@ fn rewrite_segment_multiple_samples() {
             key: common::TEST_TARGET_KEY.to_vec(),
             iv: None,
         },
+        source_scheme: EncryptionScheme::Cbcs,
+        target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
         target_iv_size: 8,
-        crypt_byte_block: 0,
-        skip_byte_block: 0,
+        source_pattern: (0, 0),
+        target_pattern: (0, 0),
         constant_iv: None,
         segment_number: 0,
     };
@@ -390,10 +397,12 @@ fn rewrite_segment_error_on_missing_moof() {
             key: vec![0; 16],
             iv: None,
         },
+        source_scheme: EncryptionScheme::Cbcs,
+        target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
         target_iv_size: 8,
-        crypt_byte_block: 0,
-        skip_byte_block: 0,
+        source_pattern: (0, 0),
+        target_pattern: (0, 0),
         constant_iv: None,
         segment_number: 0,
     };
@@ -422,10 +431,12 @@ fn rewrite_segment_error_on_missing_mdat() {
             key: vec![0; 16],
             iv: None,
         },
+        source_scheme: EncryptionScheme::Cbcs,
+        target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
         target_iv_size: 8,
-        crypt_byte_block: 0,
-        skip_byte_block: 0,
+        source_pattern: (0, 0),
+        target_pattern: (0, 0),
         constant_iv: None,
         segment_number: 0,
     };

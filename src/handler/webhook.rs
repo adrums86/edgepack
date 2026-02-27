@@ -1,4 +1,5 @@
 use crate::cache::CacheKeys;
+use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgePackagerError, Result};
 use crate::handler::{format_str, HandlerContext, HttpRequest, HttpResponse};
 use crate::manifest::types::OutputFormat;
@@ -15,9 +16,16 @@ pub struct WebhookPayload {
     pub source_url: String,
     /// Output format: "hls" or "dash".
     pub format: String,
+    /// Target encryption scheme: "cenc" or "cbcs" (default: "cenc").
+    #[serde(default = "default_target_scheme_str")]
+    pub target_scheme: String,
     /// Optional key IDs to request (hex strings).
     #[serde(default)]
     pub key_ids: Vec<String>,
+}
+
+fn default_target_scheme_str() -> String {
+    "cenc".to_string()
 }
 
 /// Webhook response returned after first manifest publishes.
@@ -69,10 +77,22 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         ));
     }
 
+    // Parse target encryption scheme
+    let target_scheme = match payload.target_scheme.as_str() {
+        "cenc" => EncryptionScheme::Cenc,
+        "cbcs" => EncryptionScheme::Cbcs,
+        other => {
+            return Err(EdgePackagerError::InvalidInput(format!(
+                "invalid target_scheme: {other} (expected 'cenc' or 'cbcs')"
+            )));
+        }
+    };
+
     let request = RepackageRequest {
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
         output_format,
+        target_scheme,
         key_ids: payload.key_ids,
     };
 
@@ -356,19 +376,44 @@ mod tests {
             content_id: "c1".into(),
             source_url: "https://example.com".into(),
             format: "hls".into(),
+            target_scheme: "cenc".into(),
             key_ids: vec!["aabb".into()],
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, "c1");
+        assert_eq!(parsed.target_scheme, "cenc");
         assert_eq!(parsed.key_ids.len(), 1);
     }
 
     #[test]
-    fn webhook_payload_default_key_ids() {
+    fn webhook_payload_default_key_ids_and_scheme() {
         let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
         assert!(parsed.key_ids.is_empty());
+        assert_eq!(parsed.target_scheme, "cenc");
+    }
+
+    #[test]
+    fn webhook_payload_cbcs_target_scheme() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","target_scheme":"cbcs"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.target_scheme, "cbcs");
+    }
+
+    #[test]
+    fn webhook_invalid_target_scheme() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "target_scheme": "aes256"
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid target_scheme"));
     }
 
     #[test]

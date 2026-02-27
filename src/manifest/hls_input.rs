@@ -4,6 +4,7 @@
 //! durations, and live/VOD status. This is the *input* side — the output renderers
 //! are in `hls.rs`.
 
+use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgePackagerError, Result};
 use crate::manifest::types::SourceManifest;
 use url::Url;
@@ -37,6 +38,7 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
     let mut segment_durations = Vec::new();
     let mut is_live = true; // live unless #EXT-X-ENDLIST is found
     let mut pending_duration: Option<f64> = None;
+    let mut source_scheme: Option<EncryptionScheme> = None;
 
     for line in manifest_text.lines() {
         let line = line.trim();
@@ -44,6 +46,15 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         if line.starts_with("#EXT-X-MAP:") {
             if let Some(uri) = extract_attribute(line, "URI") {
                 init_segment_url = Some(resolve_url(&base_url, &uri)?);
+            }
+        } else if line.starts_with("#EXT-X-KEY:") {
+            // Parse DRM signaling to detect source encryption scheme
+            if let Some(method) = extract_attribute_unquoted(line, "METHOD") {
+                match method.as_str() {
+                    "SAMPLE-AES-CTR" => source_scheme = Some(EncryptionScheme::Cenc),
+                    "SAMPLE-AES" => source_scheme = Some(EncryptionScheme::Cbcs),
+                    _ => {} // AES-128, NONE, etc. — not CENC/CBCS
+                }
             }
         } else if line.starts_with("#EXTINF:") {
             let duration_str = line.strip_prefix("#EXTINF:").unwrap_or("");
@@ -71,6 +82,7 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         segment_urls,
         segment_durations,
         is_live,
+        source_scheme,
     })
 }
 
@@ -91,6 +103,23 @@ fn extract_attribute(line: &str, attr: &str) -> Option<String> {
     let start = line.find(&search)? + search.len();
     let rest = &line[start..];
     let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Extract an unquoted attribute value from an HLS tag line.
+/// e.g., extract_attribute_unquoted(`#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="..."`, "METHOD")
+/// returns Some("SAMPLE-AES-CTR")
+fn extract_attribute_unquoted(line: &str, attr: &str) -> Option<String> {
+    let search = format!("{attr}=");
+    let start = line.find(&search)? + search.len();
+    let rest = &line[start..];
+    // If value starts with a quote, delegate to quoted extraction
+    if rest.starts_with('"') {
+        let end = rest[1..].find('"')?;
+        return Some(rest[1..1 + end].to_string());
+    }
+    // Unquoted value ends at comma or end of line
+    let end = rest.find(',').unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
 
@@ -246,6 +275,76 @@ mod tests {
             result.segment_urls[0],
             "https://cdn.example.com/content/video/segment_0.cmfv"
         );
+    }
+
+    #[test]
+    fn parse_detects_cenc_from_ext_x_key() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-TARGETDURATION:7\n\
+             #EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI=\"skd://key-id\",KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\",KEYFORMATVERSIONS=\"1\"\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6.006,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, Some(EncryptionScheme::Cenc));
+    }
+
+    #[test]
+    fn parse_detects_cbcs_from_ext_x_key() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-TARGETDURATION:7\n\
+             #EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://key-id\",KEYFORMAT=\"com.apple.streamingkeydelivery\"\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6.006,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, Some(EncryptionScheme::Cbcs));
+    }
+
+    #[test]
+    fn parse_no_ext_x_key_source_scheme_is_none() {
+        let result = parse_hls_manifest(minimal_vod_manifest(), BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, None);
+    }
+
+    #[test]
+    fn parse_ignores_aes128_method() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"https://example.com/key\"\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6.006,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, None);
+    }
+
+    #[test]
+    fn extract_attribute_unquoted_basic() {
+        let line = r#"#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="skd://key""#;
+        assert_eq!(
+            extract_attribute_unquoted(line, "METHOD"),
+            Some("SAMPLE-AES-CTR".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_attribute_unquoted_at_end() {
+        let line = r#"#EXT-X-KEY:URI="skd://key",METHOD=SAMPLE-AES"#;
+        assert_eq!(
+            extract_attribute_unquoted(line, "METHOD"),
+            Some("SAMPLE-AES".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_attribute_unquoted_missing() {
+        let line = r#"#EXT-X-KEY:METHOD=SAMPLE-AES"#;
+        assert_eq!(extract_attribute_unquoted(line, "URI"), None);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::drm::scheme::EncryptionScheme;
 use crate::drm::DrmKeySet;
 use crate::error::Result;
 use crate::media::box_type;
@@ -6,18 +7,20 @@ use crate::media::cmaf::{
     parse_tenc, read_box_header, PsshBox,
 };
 
-/// Rewrite an init segment from CBCS to CENC encryption.
+/// Rewrite an init segment to the target encryption scheme.
 ///
 /// This modifies:
-/// - `schm` box: cbcs → cenc
-/// - `tenc` box: update pattern encryption fields for CENC (no pattern)
-/// - `pssh` boxes: remove FairPlay, add/update Widevine + PlayReady PSSH data
+/// - `schm` box: set scheme type to target (cbcs/cenc)
+/// - `tenc` box: update pattern encryption fields for target scheme
+/// - `pssh` boxes: filter/add PSSH boxes appropriate for the target scheme
 ///
 /// Returns the rewritten init segment data.
 pub fn rewrite_init_segment(
     init_data: &[u8],
     key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(init_data.len());
 
@@ -28,7 +31,7 @@ pub fn rewrite_init_segment(
 
         match &header.box_type {
             t if t == &box_type::MOOV => {
-                output.extend_from_slice(&rewrite_moov(box_data, &header, key_set, target_iv_size)?);
+                output.extend_from_slice(&rewrite_moov(box_data, &header, key_set, target_scheme, target_iv_size, target_pattern)?);
             }
             _ => {
                 // Copy box as-is (ftyp, etc.)
@@ -45,7 +48,9 @@ fn rewrite_moov(
     moov_data: &[u8],
     moov_header: &BoxHeader,
     key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     let payload = &moov_data[moov_header.header_size as usize..];
     let mut children = Vec::new();
@@ -60,15 +65,15 @@ fn rewrite_moov(
 
         match &header.box_type {
             t if t == &box_type::TRAK => {
-                children.extend_from_slice(&rewrite_trak(box_data, &header, key_set, target_iv_size)?);
+                children.extend_from_slice(&rewrite_trak(box_data, &header, key_set, target_scheme, target_iv_size, target_pattern)?);
             }
             t if t == &box_type::PSSH => {
                 // Replace all PSSH boxes with our new ones
                 if !wrote_new_pssh {
-                    children.extend_from_slice(&build_cenc_pssh_boxes(key_set)?);
+                    children.extend_from_slice(&build_pssh_boxes(key_set, target_scheme)?);
                     wrote_new_pssh = true;
                 }
-                // Skip original PSSH (including FairPlay)
+                // Skip original PSSH (including FairPlay for CENC output)
             }
             _ => {
                 children.extend_from_slice(box_data);
@@ -78,7 +83,7 @@ fn rewrite_moov(
 
     // If there were no PSSH boxes in the original, add them
     if !wrote_new_pssh {
-        children.extend_from_slice(&build_cenc_pssh_boxes(key_set)?);
+        children.extend_from_slice(&build_pssh_boxes(key_set, target_scheme)?);
     }
 
     let total_size = 8 + children.len() as u32;
@@ -93,7 +98,9 @@ fn rewrite_trak(
     trak_data: &[u8],
     trak_header: &BoxHeader,
     key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     let payload = &trak_data[trak_header.header_size as usize..];
     let mut children = Vec::new();
@@ -110,7 +117,9 @@ fn rewrite_trak(
                     &header,
                     &box_type::MDIA,
                     key_set,
+                    target_scheme,
                     target_iv_size,
+                    target_pattern,
                 )?);
             }
             _ => {
@@ -132,7 +141,9 @@ fn rewrite_container_box(
     header: &BoxHeader,
     box_type_code: &[u8; 4],
     key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     let payload = &box_data[header.header_size as usize..];
     let mut children = Vec::new();
@@ -149,11 +160,13 @@ fn rewrite_container_box(
                     &child,
                     &child.box_type,
                     key_set,
+                    target_scheme,
                     target_iv_size,
+                    target_pattern,
                 )?);
             }
             t if t == &box_type::STSD => {
-                children.extend_from_slice(&rewrite_stsd(child_data, &child, key_set, target_iv_size)?);
+                children.extend_from_slice(&rewrite_stsd(child_data, &child, key_set, target_scheme, target_iv_size, target_pattern)?);
             }
             _ => {
                 children.extend_from_slice(child_data);
@@ -173,7 +186,9 @@ fn rewrite_stsd(
     stsd_data: &[u8],
     stsd_header: &BoxHeader,
     key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     // stsd is a full box: version(1) + flags(3) + entry_count(4) + entries
     let payload = &stsd_data[stsd_header.header_size as usize..];
@@ -197,7 +212,7 @@ fn rewrite_stsd(
         let entry_data = &payload[offset..entry_end.min(payload.len())];
 
         // Look for sinf inside this sample entry and rewrite it
-        entries_output.extend_from_slice(&rewrite_sample_entry(entry_data, &entry_header, key_set, target_iv_size)?);
+        entries_output.extend_from_slice(&rewrite_sample_entry(entry_data, &entry_header, key_set, target_scheme, target_iv_size, target_pattern)?);
         offset = entry_end;
     }
 
@@ -216,7 +231,9 @@ fn rewrite_sample_entry(
     entry_data: &[u8],
     entry_header: &BoxHeader,
     key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     // Sample entry format varies (video vs audio), but sinf is always a child box.
     // We scan for sinf and rewrite it; everything else is copied as-is.
@@ -246,7 +263,7 @@ fn rewrite_sample_entry(
             if sinf_size > 0 && pos + sinf_size <= payload.len() {
                 let sinf_data = &payload[pos..pos + sinf_size];
                 let sinf_header = read_box_header(sinf_data, 0)?;
-                output_payload.extend_from_slice(&rewrite_sinf(sinf_data, &sinf_header, key_set, target_iv_size)?);
+                output_payload.extend_from_slice(&rewrite_sinf(sinf_data, &sinf_header, key_set, target_scheme, target_iv_size, target_pattern)?);
                 _found_sinf = true;
                 pos += sinf_size;
                 continue;
@@ -272,12 +289,14 @@ fn rewrite_sample_entry(
     Ok(output)
 }
 
-/// Rewrite a sinf box from CBCS to CENC.
+/// Rewrite a sinf box to the target encryption scheme.
 fn rewrite_sinf(
     sinf_data: &[u8],
     sinf_header: &BoxHeader,
     key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     let payload = &sinf_data[sinf_header.header_size as usize..];
     let mut children = Vec::new();
@@ -289,12 +308,12 @@ fn rewrite_sinf(
 
         match &header.box_type {
             t if t == &box_type::SCHM => {
-                // Rewrite scheme type from cbcs to cenc
-                children.extend_from_slice(&build_schm_cenc());
+                // Rewrite scheme type to target scheme
+                children.extend_from_slice(&build_schm(target_scheme));
             }
             t if t == &box_type::SCHI => {
                 // Rewrite schi container (contains tenc)
-                children.extend_from_slice(&rewrite_schi(box_data, &header, key_set, target_iv_size)?);
+                children.extend_from_slice(&rewrite_schi(box_data, &header, key_set, target_iv_size, target_pattern)?);
             }
             _ => {
                 // Copy frma and other boxes as-is
@@ -316,6 +335,7 @@ fn rewrite_schi(
     schi_header: &BoxHeader,
     key_set: &DrmKeySet,
     target_iv_size: u8,
+    target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     let payload = &schi_data[schi_header.header_size as usize..];
     let mut children = Vec::new();
@@ -327,13 +347,13 @@ fn rewrite_schi(
 
         match &header.box_type {
             t if t == &box_type::TENC => {
-                // Rewrite tenc for CENC
+                // Rewrite tenc for target scheme
                 let kid = if let Some(key) = key_set.keys.first() {
                     key.kid
                 } else {
                     [0u8; 16]
                 };
-                children.extend_from_slice(&build_tenc_cenc(&kid, target_iv_size));
+                children.extend_from_slice(&build_tenc(&kid, target_iv_size, target_pattern));
             }
             _ => {
                 children.extend_from_slice(box_data);
@@ -348,23 +368,24 @@ fn rewrite_schi(
     Ok(output)
 }
 
-/// Build a schm box with scheme_type = "cenc".
-fn build_schm_cenc() -> Vec<u8> {
+/// Build a schm box with the given encryption scheme type.
+fn build_schm(scheme: EncryptionScheme) -> Vec<u8> {
     // schm is a full box: version(1) + flags(3) + scheme_type(4) + scheme_version(4)
     let size: u32 = 8 + 4 + 4 + 4; // header + version/flags + scheme_type + version
     let mut output = Vec::with_capacity(size as usize);
     cmaf::write_box_header(&mut output, size, &box_type::SCHM);
     output.extend_from_slice(&[0u8; 4]); // version 0 + flags 0
-    output.extend_from_slice(b"cenc");    // scheme_type
+    output.extend_from_slice(&scheme.scheme_type_bytes()); // scheme_type
     output.extend_from_slice(&0x00010000u32.to_be_bytes()); // scheme_version = 1.0
     output
 }
 
-/// Build a tenc box configured for CENC (CTR mode, no pattern).
-fn build_tenc_cenc(kid: &[u8; 16], iv_size: u8) -> Vec<u8> {
-    // tenc: version(1) + flags(3) + reserved(1) + default_isProtected(1)
-    //       + default_Per_Sample_IV_Size(1) + default_KID(16)
-    let _size: u32 = 8 + 4 + 2 + 1 + 16;
+/// Build a tenc box configured for the target encryption scheme.
+///
+/// * `kid` — 16-byte key ID
+/// * `iv_size` — per-sample IV size (8 or 16)
+/// * `pattern` — (crypt_byte_block, skip_byte_block); (0, 0) for CENC, (1, 9) for CBCS video
+fn build_tenc(kid: &[u8; 16], iv_size: u8, pattern: (u8, u8)) -> Vec<u8> {
     // Full box: header(8) + version(1) + flags(3) + reserved/crypt_skip(1)
     //         + isProtected(1) + ivSize(1) + KID(16) = 31
     let total: u32 = 8 + 1 + 3 + 1 + 1 + 1 + 16;
@@ -372,20 +393,27 @@ fn build_tenc_cenc(kid: &[u8; 16], iv_size: u8) -> Vec<u8> {
     cmaf::write_box_header(&mut output, total, &box_type::TENC);
     output.push(0); // version
     output.extend_from_slice(&[0u8; 3]); // flags
-    output.push(0); // reserved (crypt_byte_block=0, skip_byte_block=0 — no pattern for CENC)
+    // reserved byte encodes crypt_byte_block (upper nibble) + skip_byte_block (lower nibble)
+    let crypt_skip = (pattern.0 << 4) | (pattern.1 & 0x0F);
+    output.push(crypt_skip);
     output.push(1); // default_isProtected = 1
     output.push(iv_size); // default_Per_Sample_IV_Size (8 or 16)
     output.extend_from_slice(kid);
     output
 }
 
-/// Build PSSH boxes for CENC (Widevine + PlayReady) from the DRM key set.
-fn build_cenc_pssh_boxes(key_set: &DrmKeySet) -> Result<Vec<u8>> {
+/// Build PSSH boxes for the target encryption scheme from the DRM key set.
+///
+/// For CENC output: includes Widevine + PlayReady, skips FairPlay.
+/// For CBCS output: includes all DRM systems (FairPlay, Widevine, PlayReady).
+fn build_pssh_boxes(key_set: &DrmKeySet, target_scheme: EncryptionScheme) -> Result<Vec<u8>> {
     let mut output = Vec::new();
 
     for drm_data in &key_set.drm_systems {
-        // Skip FairPlay — not used for CENC output
-        if drm_data.system_id == crate::drm::system_ids::FAIRPLAY {
+        // For CENC output, skip FairPlay (FairPlay only supports CBCS)
+        if target_scheme == EncryptionScheme::Cenc
+            && drm_data.system_id == crate::drm::system_ids::FAIRPLAY
+        {
             continue;
         }
 
@@ -488,6 +516,7 @@ pub fn parse_protection_info(init_data: &[u8]) -> Result<Option<ProtectionScheme
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drm::scheme::EncryptionScheme;
     use crate::drm::{system_ids, ContentKey, DrmSystemData};
     use crate::media::cmaf;
 
@@ -517,43 +546,58 @@ mod tests {
 
     #[test]
     fn build_schm_cenc_produces_valid_box() {
-        let schm = build_schm_cenc();
-        // Size(4) + type(4) + version/flags(4) + scheme_type(4) + scheme_version(4) = 20
+        let schm = build_schm(EncryptionScheme::Cenc);
         assert_eq!(schm.len(), 20);
-        // Check box type
         assert_eq!(&schm[4..8], b"schm");
-        // Check scheme type is "cenc"
         assert_eq!(&schm[12..16], b"cenc");
-        // Check scheme version (1.0 = 0x00010000)
+        assert_eq!(&schm[16..20], &0x00010000u32.to_be_bytes());
+    }
+
+    #[test]
+    fn build_schm_cbcs_produces_valid_box() {
+        let schm = build_schm(EncryptionScheme::Cbcs);
+        assert_eq!(schm.len(), 20);
+        assert_eq!(&schm[4..8], b"schm");
+        assert_eq!(&schm[12..16], b"cbcs");
         assert_eq!(&schm[16..20], &0x00010000u32.to_be_bytes());
     }
 
     #[test]
     fn build_tenc_cenc_produces_valid_box() {
         let kid = [0x01; 16];
-        let tenc = build_tenc_cenc(&kid, 8);
-        // Check box type
+        let tenc = build_tenc(&kid, 8, (0, 0));
         assert_eq!(&tenc[4..8], b"tenc");
-        // Check isProtected = 1
         let version_flags_reserved_len = 4 + 1; // version(1)+flags(3)+reserved(1)
         let is_protected_offset = 8 + version_flags_reserved_len;
         assert_eq!(tenc[is_protected_offset], 1);
-        // Check IV size = 8
         assert_eq!(tenc[is_protected_offset + 1], 8);
-        // Check KID
         assert_eq!(&tenc[is_protected_offset + 2..is_protected_offset + 18], &[0x01; 16]);
+        // Check pattern byte is 0 for CENC
+        assert_eq!(tenc[8 + 4], 0x00);
+    }
+
+    #[test]
+    fn build_tenc_cbcs_produces_valid_box() {
+        let kid = [0x03; 16];
+        let tenc = build_tenc(&kid, 16, (1, 9));
+        assert_eq!(&tenc[4..8], b"tenc");
+        // Check pattern byte: crypt=1 (upper nibble), skip=9 (lower nibble) = 0x19
+        assert_eq!(tenc[8 + 4], 0x19);
+        let is_protected_offset = 8 + 5;
+        assert_eq!(tenc[is_protected_offset], 1); // isProtected
+        assert_eq!(tenc[is_protected_offset + 1], 16); // IV size
     }
 
     #[test]
     fn build_tenc_cenc_iv_size_16() {
         let kid = [0x02; 16];
-        let tenc = build_tenc_cenc(&kid, 16);
+        let tenc = build_tenc(&kid, 16, (0, 0));
         let is_protected_offset = 8 + 5;
         assert_eq!(tenc[is_protected_offset + 1], 16);
     }
 
     #[test]
-    fn build_cenc_pssh_boxes_skips_fairplay() {
+    fn build_pssh_boxes_cenc_skips_fairplay() {
         let mut key_set = make_key_set();
         key_set.drm_systems.push(DrmSystemData {
             system_id: system_ids::FAIRPLAY,
@@ -561,9 +605,7 @@ mod tests {
             pssh_data: vec![0xFF],
             content_protection_data: None,
         });
-        let pssh_data = build_cenc_pssh_boxes(&key_set).unwrap();
-        // Should contain Widevine and PlayReady but not FairPlay
-        // Count PSSH boxes by scanning for "pssh" box type
+        let pssh_data = build_pssh_boxes(&key_set, EncryptionScheme::Cenc).unwrap();
         let mut pssh_count = 0;
         let mut pos = 0;
         while pos + 8 <= pssh_data.len() {
@@ -581,11 +623,36 @@ mod tests {
     }
 
     #[test]
-    fn build_cenc_pssh_boxes_includes_key_ids() {
+    fn build_pssh_boxes_cbcs_includes_fairplay() {
+        let mut key_set = make_key_set();
+        key_set.drm_systems.push(DrmSystemData {
+            system_id: system_ids::FAIRPLAY,
+            kid: [0x01; 16],
+            pssh_data: vec![0xFF],
+            content_protection_data: None,
+        });
+        let pssh_data = build_pssh_boxes(&key_set, EncryptionScheme::Cbcs).unwrap();
+        let mut pssh_count = 0;
+        let mut pos = 0;
+        while pos + 8 <= pssh_data.len() {
+            if &pssh_data[pos + 4..pos + 8] == b"pssh" {
+                pssh_count += 1;
+                let size = u32::from_be_bytes([
+                    pssh_data[pos], pssh_data[pos + 1], pssh_data[pos + 2], pssh_data[pos + 3],
+                ]) as usize;
+                pos += size;
+            } else {
+                pos += 1;
+            }
+        }
+        assert_eq!(pssh_count, 3); // Widevine + PlayReady + FairPlay
+    }
+
+    #[test]
+    fn build_pssh_boxes_includes_key_ids() {
         let key_set = make_key_set();
-        let pssh_data = build_cenc_pssh_boxes(&key_set).unwrap();
+        let pssh_data = build_pssh_boxes(&key_set, EncryptionScheme::Cenc).unwrap();
         assert!(!pssh_data.is_empty());
-        // Verify it starts with a valid box
         assert_eq!(&pssh_data[4..8], b"pssh");
     }
 
@@ -660,8 +727,7 @@ mod tests {
     #[test]
     fn rewrite_init_segment_empty_data() {
         let key_set = make_key_set();
-        // Empty data should produce empty output
-        let result = rewrite_init_segment(&[], &key_set, 8).unwrap();
+        let result = rewrite_init_segment(&[], &key_set, EncryptionScheme::Cenc, 8, (0, 0)).unwrap();
         assert!(result.is_empty());
     }
 
@@ -672,8 +738,7 @@ mod tests {
         cmaf::write_box_header(&mut data, 16, b"ftyp");
         data.extend_from_slice(b"isom\x00\x00\x02\x00");
 
-        let result = rewrite_init_segment(&data, &key_set, 8).unwrap();
-        // ftyp should be copied as-is
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0)).unwrap();
         assert_eq!(&result[4..8], b"ftyp");
         assert_eq!(result.len(), data.len());
     }
@@ -682,7 +747,6 @@ mod tests {
     fn rewrite_init_segment_moov_adds_pssh() {
         let key_set = make_key_set();
 
-        // Build minimal moov with mvhd child
         let mut mvhd_data = Vec::new();
         cmaf::write_box_header(&mut mvhd_data, 16, b"mvhd");
         mvhd_data.extend_from_slice(&[0u8; 8]);
@@ -692,10 +756,27 @@ mod tests {
         cmaf::write_box_header(&mut data, moov_size, b"moov");
         data.extend_from_slice(&mvhd_data);
 
-        let result = rewrite_init_segment(&data, &key_set, 8).unwrap();
-        // Result should contain moov with PSSH boxes added
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0)).unwrap();
         assert_eq!(&result[4..8], b"moov");
-        // Should contain at least one pssh box
+        let has_pssh = result.windows(4).any(|w| w == b"pssh");
+        assert!(has_pssh);
+    }
+
+    #[test]
+    fn rewrite_init_segment_cbcs_target() {
+        let key_set = make_key_set();
+
+        let mut mvhd_data = Vec::new();
+        cmaf::write_box_header(&mut mvhd_data, 16, b"mvhd");
+        mvhd_data.extend_from_slice(&[0u8; 8]);
+
+        let moov_size = 8 + mvhd_data.len() as u32;
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, moov_size, b"moov");
+        data.extend_from_slice(&mvhd_data);
+
+        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cbcs, 16, (1, 9)).unwrap();
+        assert_eq!(&result[4..8], b"moov");
         let has_pssh = result.windows(4).any(|w| w == b"pssh");
         assert!(has_pssh);
     }

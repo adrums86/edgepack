@@ -373,9 +373,11 @@ pub fn make_hls_manifest_state(segment_count: u32, phase: ManifestPhase) -> Mani
         byte_size: 1024,
     });
     state.drm_info = Some(ManifestDrmInfo {
+        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgIARIQ".into()),
         playready_pssh: Some("AAAARHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAE=".into()),
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
+        fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
     });
 
@@ -408,9 +410,11 @@ pub fn make_dash_manifest_state(segment_count: u32, phase: ManifestPhase) -> Man
         byte_size: 1024,
     });
     state.drm_info = Some(ManifestDrmInfo {
+        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgIARIQ".into()),
         playready_pssh: Some("AAAARHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAE=".into()),
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
+        fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
     });
 

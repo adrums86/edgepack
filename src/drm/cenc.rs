@@ -92,6 +92,72 @@ pub fn generate_sample_iv(segment_number: u32, sample_index: u32) -> [u8; 8] {
     iv
 }
 
+/// CENC (Common Encryption - CTR mode) decryptor.
+///
+/// Since AES-CTR is symmetric (XOR-based), decryption is identical to encryption.
+/// This type exists for API clarity and to implement the `SampleDecryptor` trait.
+///
+/// Reference: ISO/IEC 23001-7 (CENC) Section 10.1
+pub struct CencDecryptor {
+    key: [u8; 16],
+}
+
+impl CencDecryptor {
+    pub fn new(key: [u8; 16]) -> Self {
+        Self { key }
+    }
+
+    /// Decrypt a single sample in place using AES-128-CTR.
+    ///
+    /// Since CTR mode is symmetric, this is identical to encryption.
+    pub fn decrypt_sample(
+        &self,
+        data: &mut [u8],
+        iv: &[u8],
+        subsamples: Option<&[(u32, u32)]>,
+    ) -> Result<()> {
+        let counter = build_counter_block(iv)?;
+
+        match subsamples {
+            Some(subs) => self.decrypt_with_subsamples(data, &counter, subs),
+            None => self.decrypt_full(data, &counter),
+        }
+    }
+
+    fn decrypt_full(&self, data: &mut [u8], counter: &[u8; 16]) -> Result<()> {
+        let mut cipher = Aes128Ctr::new(&self.key.into(), counter.into());
+        cipher.apply_keystream(data);
+        Ok(())
+    }
+
+    fn decrypt_with_subsamples(
+        &self,
+        data: &mut [u8],
+        counter: &[u8; 16],
+        subsamples: &[(u32, u32)],
+    ) -> Result<()> {
+        let mut cipher = Aes128Ctr::new(&self.key.into(), counter.into());
+        let mut offset = 0usize;
+
+        for &(clear_bytes, encrypted_bytes) in subsamples {
+            offset += clear_bytes as usize;
+
+            if encrypted_bytes > 0 {
+                let end = offset + encrypted_bytes as usize;
+                if end > data.len() {
+                    return Err(EdgePackagerError::Encryption(
+                        "subsample extends beyond sample data".into(),
+                    ));
+                }
+                cipher.apply_keystream(&mut data[offset..end]);
+                offset = end;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Build a 16-byte counter block from an 8-byte or 16-byte IV.
 ///
 /// For 8-byte IVs: upper 8 bytes = IV, lower 8 bytes = 0 (block counter).
@@ -268,5 +334,49 @@ mod tests {
         CencEncryptor::new(key).encrypt_sample(&mut enc2, &[0x01; 8], None).unwrap();
 
         assert_ne!(enc1, enc2);
+    }
+
+    // === CencDecryptor tests ===
+
+    #[test]
+    fn decryptor_roundtrip_full_sample() {
+        let key = [0x42u8; 16];
+        let iv = [0x00u8; 8];
+        let plaintext = vec![0xDE; 64];
+
+        let mut data = plaintext.clone();
+        let enc = CencEncryptor::new(key);
+        enc.encrypt_sample(&mut data, &iv, None).unwrap();
+        assert_ne!(data, plaintext);
+
+        let dec = CencDecryptor::new(key);
+        dec.decrypt_sample(&mut data, &iv, None).unwrap();
+        assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn decryptor_roundtrip_with_subsamples() {
+        let key = [0x42u8; 16];
+        let iv = [0x00u8; 8];
+        let plaintext = vec![0xBB; 47];
+        let subsamples = [(10u32, 32u32), (5u32, 0u32)];
+
+        let mut data = plaintext.clone();
+        CencEncryptor::new(key)
+            .encrypt_sample(&mut data, &iv, Some(&subsamples))
+            .unwrap();
+
+        CencDecryptor::new(key)
+            .decrypt_sample(&mut data, &iv, Some(&subsamples))
+            .unwrap();
+        assert_eq!(data, plaintext);
+    }
+
+    #[test]
+    fn decryptor_rejects_invalid_iv() {
+        let dec = CencDecryptor::new([0u8; 16]);
+        let mut data = [0u8; 16];
+        let result = dec.decrypt_sample(&mut data, &[0u8; 5], None);
+        assert!(result.is_err());
     }
 }

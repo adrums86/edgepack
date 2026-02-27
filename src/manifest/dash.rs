@@ -135,10 +135,11 @@ fn build_content_protection_xml(state: &ManifestState) -> String {
     let mut xml = String::new();
 
     if let Some(ref drm) = state.drm_info {
-        // CENC default_KID
+        // mp4protection with scheme-specific value
+        let scheme_value = drm.encryption_scheme.scheme_type_str();
         xml.push_str(&format!(
             "      <ContentProtection schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\" \
-             value=\"cenc\" cenc:default_KID=\"{}\"/>\n",
+             value=\"{scheme_value}\" cenc:default_KID=\"{}\"/>\n",
             format_kid_with_hyphens(&drm.default_kid)
         ));
 
@@ -242,6 +243,7 @@ fn format_kid_with_hyphens(kid_hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drm::scheme::EncryptionScheme;
     use crate::manifest::types::*;
 
     fn make_state(phase: ManifestPhase) -> ManifestState {
@@ -352,12 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn render_with_drm_content_protection() {
+    fn render_with_drm_content_protection_cenc() {
         let mut state = make_live_state_with_segments(1);
         state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
             widevine_pssh: Some("WVDATA".into()),
             playready_pssh: Some("PRDATA".into()),
             playready_pro: Some("<pro>data</pro>".into()),
+            fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".into(),
         });
         let mpd = render(&state).unwrap();
@@ -369,6 +373,21 @@ mod tests {
         assert!(mpd.contains("urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95"));
         assert!(mpd.contains("<cenc:pssh>PRDATA</cenc:pssh>"));
         assert!(mpd.contains("<mspr:pro><pro>data</pro></mspr:pro>"));
+    }
+
+    #[test]
+    fn render_with_drm_content_protection_cbcs() {
+        let mut state = make_live_state_with_segments(1);
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cbcs,
+            widevine_pssh: Some("WVDATA".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("value=\"cbcs\""));
     }
 
     #[test]

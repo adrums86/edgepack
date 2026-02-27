@@ -26,7 +26,7 @@ graph TB
         end
     end
 
-    Origin["Origin Server<br/>CBCS-encrypted<br/>CMAF content"]
+    Origin["Origin Server<br/>CBCS/CENC-encrypted<br/>CMAF content"]
     LicenseServer["DRM License Server<br/>SPEKE 2.0 endpoint"]
     Redis["Redis<br/>(Upstash HTTP or TCP)"]
 
@@ -41,8 +41,8 @@ graph TB
     DRM -- "POST CPIX XML" --> LicenseServer
     LicenseServer -- "content keys +<br/>PSSH data" --> DRM
     MediaEngine -- "GET init/segments" --> Origin
-    Origin -- "CBCS segments" --> MediaEngine
-    Cache -- "CENC segments +<br/>manifest" --> Player
+    Origin -- "CBCS/CENC segments" --> MediaEngine
+    Cache -- "repackaged segments +<br/>manifest" --> Player
 
     classDef external fill:#374151,stroke:#6B7280,color:#F9FAFB
     classDef cdn fill:#1E3A5F,stroke:#3B82F6,color:#F9FAFB
@@ -59,30 +59,30 @@ graph TB
 
 ## 2. Repackaging Data Flow
 
-Shows the complete data transformation pipeline from CBCS input to CENC output.
+Shows the complete data transformation pipeline with configurable source and target encryption schemes.
 
 ```mermaid
 flowchart LR
-    subgraph Input["INPUT (CBCS)"]
-        SrcManifest["Source Manifest<br/>.m3u8 / .mpd"]
-        SrcInit["Init Segment<br/>(sinf/schm=cbcs/tenc<br/>+ FairPlay PSSH)"]
-        SrcSeg["Media Segments<br/>(AES-128-CBC<br/>pattern encrypted)"]
+    subgraph Input["INPUT (CBCS or CENC)"]
+        SrcManifest["Source Manifest<br/>.m3u8 / .mpd<br/>(scheme auto-detected)"]
+        SrcInit["Init Segment<br/>(sinf/schm/tenc<br/>+ DRM system PSSHs)"]
+        SrcSeg["Media Segments<br/>(source-scheme<br/>encrypted mdat)"]
     end
 
     subgraph Transform["TRANSFORM"]
-        Parse["Parse Source<br/>Manifest"]
+        Parse["Parse Source<br/>Manifest +<br/>detect scheme"]
         FetchKeys["Fetch Keys<br/>via SPEKE 2.0"]
-        ParseInit["Parse Init<br/>Protection Info"]
-        RewriteInit["Rewrite Init<br/>schm→cenc<br/>tenc→CTR params<br/>+PSSH (WV+PR)<br/>−PSSH (FairPlay)"]
-        Decrypt["Decrypt mdat<br/>AES-128-CBC<br/>pattern 1:9 / 0:0"]
-        Encrypt["Re-encrypt mdat<br/>AES-128-CTR<br/>full encryption"]
-        RewriteSenc["Rewrite senc<br/>sequential IVs"]
+        ParseInit["Parse Init<br/>Protection Info<br/>(confirm scheme)"]
+        RewriteInit["Rewrite Init<br/>schm→target scheme<br/>tenc→target params<br/>PSSH per target<br/>(±FairPlay)"]
+        Decrypt["Decrypt mdat<br/>via create_decryptor()<br/>(CBCS or CENC)"]
+        Encrypt["Re-encrypt mdat<br/>via create_encryptor()<br/>(CBCS or CENC)"]
+        RewriteSenc["Rewrite senc<br/>new IVs<br/>(8B or 16B)"]
     end
 
-    subgraph Output["OUTPUT (CENC)"]
-        OutManifest["Output Manifest<br/>(progressive:<br/>live → complete)"]
-        OutInit["Init Segment<br/>(sinf/schm=cenc/tenc<br/>WV + PR PSSH only)"]
-        OutSeg["Media Segments<br/>(AES-128-CTR<br/>full encryption)"]
+    subgraph Output["OUTPUT (target scheme)"]
+        OutManifest["Output Manifest<br/>(progressive:<br/>live → complete)<br/>scheme-aware DRM"]
+        OutInit["Init Segment<br/>(sinf/schm=target<br/>scheme-filtered PSSHs)"]
+        OutSeg["Media Segments<br/>(target-scheme<br/>encrypted mdat)"]
     end
 
     SrcManifest --> Parse
@@ -127,7 +127,7 @@ graph TD
 
     subgraph Core["Core Modules"]
         Media["media/<br/>ISOBMFF parser<br/>init rewrite<br/>segment rewrite"]
-        DRMMod["drm/<br/>SPEKE client<br/>CPIX XML<br/>CBCS decrypt<br/>CENC encrypt"]
+        DRMMod["drm/<br/>EncryptionScheme<br/>SampleDecryptor/Encryptor<br/>SPEKE client + CPIX XML<br/>CBCS decrypt+encrypt<br/>CENC encrypt+decrypt"]
         Manifest["manifest/<br/>HLS renderer<br/>DASH renderer<br/>HLS input parser<br/>DASH input parser"]
         CacheMod2["cache/<br/>CacheBackend trait<br/>EncryptedCacheBackend<br/>Redis HTTP / TCP<br/>In-memory (sandbox)"]
     end
@@ -186,11 +186,11 @@ sequenceDiagram
     EP->>SPEKE: POST CPIX request
     SPEKE-->>EP: CPIX response (keys + PSSH)
     EP->>Redis: SET keys, rewrite_params, source (encrypted)
-    EP->>EP: Rewrite init segment (CBCS→CENC)
+    EP->>EP: Rewrite init segment (source→target scheme)
     EP->>Redis: SET init segment
     EP->>Origin: GET segment_0
-    Origin-->>EP: segment_0 (CBCS)
-    EP->>EP: Decrypt (CBC) → Re-encrypt (CTR)
+    Origin-->>EP: segment_0 (source scheme)
+    EP->>EP: Decrypt (source) → Re-encrypt (target)
     EP->>Redis: SET segment_0, manifest_state
     EP-->>Client: 200 OK (manifest_url, segments_completed=1)
 
@@ -198,7 +198,7 @@ sequenceDiagram
     EP->>EP: POST /webhook/repackage/continue
     EP->>Redis: GET rewrite_params, source, manifest_state
     EP->>Origin: GET segment_1
-    Origin-->>EP: segment_1 (CBCS)
+    Origin-->>EP: segment_1 (source scheme)
     EP->>EP: Decrypt → Re-encrypt
     EP->>Redis: SET segment_1, update manifest_state
     EP->>EP: POST /webhook/repackage/continue (next)
@@ -362,27 +362,27 @@ flowchart LR
 
 ## 9. Encryption Transform Detail
 
-Shows the per-segment CBCS-to-CENC transformation at the byte level.
+Shows the per-segment encryption transform at the byte level. Source and target schemes are configurable — the pipeline uses `create_decryptor()` and `create_encryptor()` factory functions to dispatch to the correct scheme implementation.
 
 ```mermaid
 flowchart TD
-    subgraph SourceSegment["Source Segment (CBCS)"]
-        MOOF1["moof box<br/>├ mfhd (sequence)<br/>└ traf<br/>   ├ tfhd<br/>   ├ tfdt<br/>   ├ trun (sample sizes)<br/>   └ senc (per-sample IVs<br/>      + subsample map)"]
-        MDAT1["mdat box<br/>(AES-128-CBC<br/>pattern 1:9 video<br/>or 0:0 audio)"]
+    subgraph SourceSegment["Source Segment (CBCS or CENC)"]
+        MOOF1["moof box<br/>├ mfhd (sequence)<br/>└ traf<br/>   ├ tfhd<br/>   ├ tfdt<br/>   ├ trun (sample sizes)<br/>   └ senc (per-sample IVs<br/>      ± subsample map)"]
+        MDAT1["mdat box<br/>(source-scheme<br/>encrypted)"]
     end
 
     subgraph Transform["Transform Steps"]
         S1["1. Parse senc → extract<br/>per-sample IVs +<br/>subsample ranges"]
         S2["2. Parse trun → extract<br/>per-sample byte sizes"]
-        S3["3. For each sample in mdat:<br/>   Decrypt with CBC + pattern"]
-        S4["4. For each sample:<br/>   Generate sequential CTR IV<br/>   Encrypt with CTR (full)"]
-        S5["5. Rebuild senc with<br/>new IVs (no subsamples)"]
+        S3["3. create_decryptor(source_scheme)<br/>   For each sample in mdat:<br/>   Decrypt with source scheme"]
+        S4["4. create_encryptor(target_scheme)<br/>   For each sample:<br/>   Generate target-scheme IV<br/>   Encrypt with target scheme"]
+        S5["5. Rebuild senc with<br/>new IVs (8B for CENC,<br/>16B for CBCS)"]
         S6["6. Rebuild moof + mdat"]
     end
 
-    subgraph OutputSegment["Output Segment (CENC)"]
-        MOOF2["moof box<br/>├ mfhd (sequence)<br/>└ traf<br/>   ├ tfhd<br/>   ├ tfdt<br/>   ├ trun (same sizes)<br/>   └ senc (sequential IVs<br/>      no subsamples)"]
-        MDAT2["mdat box<br/>(AES-128-CTR<br/>full encryption)"]
+    subgraph OutputSegment["Output Segment (target scheme)"]
+        MOOF2["moof box<br/>├ mfhd (sequence)<br/>└ traf<br/>   ├ tfhd<br/>   ├ tfdt<br/>   ├ trun (same sizes)<br/>   └ senc (new IVs<br/>      target IV size)"]
+        MDAT2["mdat box<br/>(target-scheme<br/>encrypted)"]
     end
 
     MOOF1 --> S1
@@ -403,25 +403,55 @@ flowchart TD
 
 | Feature | Description |
 |---------|-------------|
-| **CBCS → CENC** | Transforms AES-128-CBC pattern encryption to AES-128-CTR full encryption |
+| **Configurable Encryption** | Transforms between CBCS ↔ CENC in any direction; target scheme configurable per request |
+| **Source Scheme Auto-Detection** | Detects source encryption from init segment `schm` box or manifest DRM signaling |
+| **Trait-Based Crypto Dispatch** | `SampleDecryptor`/`SampleEncryptor` traits with factory functions for scheme-agnostic pipeline |
 | **Progressive Output** | Clients can begin playback as soon as the first segment is ready |
 | **Split Execution** | WASI-compatible self-invocation chaining avoids request timeouts |
 | **Encryption at Rest** | Sensitive cache entries (DRM keys, SPEKE responses) encrypted with AES-256-GCM |
 | **Immediate Cleanup** | All sensitive data deleted from cache the moment processing completes |
 | **Aggressive CDN Caching** | Segments and finalized manifests cached for 1 year; live manifests refresh every second |
-| **Multi-DRM** | Widevine + PlayReady output; FairPlay recognized in input but excluded from output |
-| **Zero External Test Dependencies** | All 432 tests use synthetic CMAF fixtures — no network or media files needed |
+| **Multi-DRM** | Widevine + PlayReady for CENC output; FairPlay + Widevine + PlayReady for CBCS output |
+| **Zero External Test Dependencies** | All 495 tests use synthetic CMAF fixtures — no network or media files needed |
 | **WASM-Native** | Entire runtime compiles to `wasm32-wasip2` with no async runtime or system calls |
 
 ## Inputs and Outputs
 
 | Direction | What | Format | Protocol |
 |-----------|------|--------|----------|
-| **Input** | Source manifest | HLS `.m3u8` or DASH `.mpd` | HTTP GET from origin |
-| **Input** | Source init segment | CMAF (CBCS sinf/schm/tenc/pssh) | HTTP GET from origin |
-| **Input** | Source media segments | CMAF (CBC pattern encrypted mdat) | HTTP GET from origin |
+| **Input** | Source manifest | HLS `.m3u8` or DASH `.mpd` (source scheme auto-detected) | HTTP GET from origin |
+| **Input** | Source init segment | CMAF (CBCS or CENC sinf/schm/tenc/pssh) | HTTP GET from origin |
+| **Input** | Source media segments | CMAF (source-scheme encrypted mdat) | HTTP GET from origin |
 | **Input** | DRM content keys | CPIX XML (SPEKE 2.0) | HTTP POST to license server |
-| **Output** | Repackaged manifest | HLS `.m3u8` or DASH `.mpd` (CENC DRM signaling) | HTTP GET via CDN |
-| **Output** | Repackaged init segment | CMAF (CENC schm/tenc/pssh, WV+PR only) | HTTP GET via CDN |
-| **Output** | Repackaged media segments | CMAF (CTR full encrypted mdat) | HTTP GET via CDN |
+| **Output** | Repackaged manifest | HLS `.m3u8` or DASH `.mpd` (target-scheme DRM signaling) | HTTP GET via CDN |
+| **Output** | Repackaged init segment | CMAF (target-scheme schm/tenc/pssh, DRM systems per scheme) | HTTP GET via CDN |
+| **Output** | Repackaged media segments | CMAF (target-scheme encrypted mdat) | HTTP GET via CDN |
 | **Output** | Job status | JSON | HTTP GET via CDN |
+
+---
+
+## Planned Architecture Extensions
+
+The following phases extend the architecture beyond the current single-scheme repackaging:
+
+### Phase 2: Container Format Flexibility
+- New `ContainerFormat` enum (`Cmaf`, `Fmp4`) in `src/media/container.rs`
+- ftyp brand rewriting for output container format
+- Segment extension and MIME type dispatch per format
+
+### Phase 3: Dual-Scheme Output
+- Multi-rendition pipeline: loop over target schemes, produce independent segment sets
+- Scheme-suffixed Redis cache keys
+- Dual-encrypted segments: multiple `sinf` boxes in init, sequential CBCS+CENC encryption in mdat
+- Multi-variant HLS master playlists and multi-AdaptationSet DASH MPDs
+
+### Phase 4: Full Remux
+- Sample-level mdat parsing via `src/media/samples.rs`
+- Segment boundary restructuring at sync points (GOP-aligned splitting)
+- Timescale extraction from mdhd/mvhd
+- Variable segment count support in progressive output state machine
+
+### Phase 5: Compatibility Validation
+- `src/media/compat.rs` for target device validation (Chromium 53+ floor)
+- Codec detection from stsd sample entries (avc1, hev1, mp4a)
+- Early pipeline rejection for incompatible configurations

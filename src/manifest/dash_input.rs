@@ -4,6 +4,7 @@
 //! durations, and live/VOD status. This is the *input* side — the output
 //! renderer is in `dash.rs`.
 
+use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgePackagerError, Result};
 use crate::manifest::types::SourceManifest;
 use quick_xml::events::Event;
@@ -26,6 +27,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     reader.config_mut().trim_text(true);
 
     let mut is_live = false;
+    let mut source_scheme: Option<EncryptionScheme> = None;
     let mut init_template: Option<String> = None;
     let mut media_template: Option<String> = None;
     let mut timescale: u64 = 1;
@@ -114,6 +116,38 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                             timeline_entries.push((d, r));
                         }
                     }
+                    b"ContentProtection" => {
+                        // Detect source encryption scheme from ContentProtection elements.
+                        // Look for the MPEG-DASH mp4protection scheme which carries the
+                        // encryption scheme in its value attribute.
+                        let mut scheme_uri: Option<String> = None;
+                        let mut value: Option<String> = None;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"schemeIdUri" => {
+                                    scheme_uri = Some(
+                                        String::from_utf8_lossy(&attr.value).to_string(),
+                                    );
+                                }
+                                b"value" => {
+                                    value = Some(
+                                        String::from_utf8_lossy(&attr.value).to_string(),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        // The mp4protection scheme signals which encryption scheme is in use
+                        if scheme_uri.as_deref() == Some("urn:mpeg:dash:mp4protection:2011") {
+                            if let Some(val) = value {
+                                match val.as_str() {
+                                    "cenc" => source_scheme = Some(EncryptionScheme::Cenc),
+                                    "cbcs" => source_scheme = Some(EncryptionScheme::Cbcs),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -199,6 +233,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
         segment_urls,
         segment_durations,
         is_live,
+        source_scheme,
     })
 }
 
@@ -433,6 +468,76 @@ mod tests {
         assert_eq!(result.segment_urls.len(), 2);
         assert!((result.segment_durations[0] - 6.006).abs() < 0.001);
         assert!((result.segment_durations[1] - 6.006).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_detects_cenc_from_content_protection() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet>
+      <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc"/>
+      <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000">
+          <SegmentTimeline>
+            <S d="6000" r="1"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, Some(EncryptionScheme::Cenc));
+    }
+
+    #[test]
+    fn parse_detects_cbcs_from_content_protection() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet>
+      <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs"/>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000">
+          <SegmentTimeline>
+            <S d="6000" r="1"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, Some(EncryptionScheme::Cbcs));
+    }
+
+    #[test]
+    fn parse_no_content_protection_source_scheme_is_none() {
+        let result = parse_dash_manifest(&minimal_static_mpd(), BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, None);
+    }
+
+    #[test]
+    fn parse_ignores_non_mp4protection_content_protection() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet>
+      <ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" value="Widevine"/>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000">
+          <SegmentTimeline>
+            <S d="6000" r="1"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        assert_eq!(result.source_scheme, None);
     }
 
     #[test]
