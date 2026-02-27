@@ -210,7 +210,14 @@ async fn handle_repackage(
     let cid = content_id.clone();
     let fmt = output_format;
     tokio::task::spawn_blocking(move || {
-        let pipeline = RepackagePipeline::new(config, Box::new(cache.clone()));
+        // Wrap cache with encryption layer so sensitive data (DRM keys, SPEKE
+        // responses, rewrite params) is never stored in plaintext.
+        let enc_key = edge_packager::cache::encrypted::derive_key("edge-packager-sandbox");
+        let encrypted_cache = edge_packager::cache::encrypted::EncryptedCacheBackend::new(
+            Box::new(cache.clone()),
+            &enc_key,
+        );
+        let pipeline = RepackagePipeline::new(config, Box::new(encrypted_cache));
         match pipeline.execute(&request) {
             Ok(status) => {
                 eprintln!(
