@@ -3,6 +3,7 @@ pub mod progressive;
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::manifest::types::OutputFormat;
+use crate::media::container::ContainerFormat;
 use serde::{Deserialize, Serialize};
 
 /// A request to repackage content between encryption schemes.
@@ -17,6 +18,9 @@ pub struct RepackageRequest {
     /// Target encryption scheme (default: CENC for backward compatibility).
     #[serde(default = "default_target_scheme")]
     pub target_scheme: EncryptionScheme,
+    /// Target container format (default: CMAF for backward compatibility).
+    #[serde(default)]
+    pub container_format: ContainerFormat,
     /// Optional: specific key IDs to request. If empty, derived from source.
     pub key_ids: Vec<String>,
 }
@@ -52,6 +56,7 @@ pub enum JobState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::container::ContainerFormat;
 
     #[test]
     fn repackage_request_construction() {
@@ -60,11 +65,13 @@ mod tests {
             source_url: "https://cdn.example.com/manifest.m3u8".to_string(),
             output_format: OutputFormat::Hls,
             target_scheme: EncryptionScheme::Cenc,
+            container_format: ContainerFormat::default(),
             key_ids: vec!["aabbccdd".to_string()],
         };
         assert_eq!(req.content_id, "movie-123");
         assert_eq!(req.output_format, OutputFormat::Hls);
         assert_eq!(req.target_scheme, EncryptionScheme::Cenc);
+        assert_eq!(req.container_format, ContainerFormat::Cmaf);
         assert_eq!(req.key_ids.len(), 1);
     }
 
@@ -75,6 +82,7 @@ mod tests {
             source_url: "https://example.com/source.mpd".into(),
             output_format: OutputFormat::Dash,
             target_scheme: EncryptionScheme::Cbcs,
+            container_format: ContainerFormat::Fmp4,
             key_ids: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -82,6 +90,7 @@ mod tests {
         assert_eq!(parsed.content_id, "test");
         assert_eq!(parsed.output_format, OutputFormat::Dash);
         assert_eq!(parsed.target_scheme, EncryptionScheme::Cbcs);
+        assert_eq!(parsed.container_format, ContainerFormat::Fmp4);
         assert!(parsed.key_ids.is_empty());
     }
 
@@ -91,6 +100,7 @@ mod tests {
         let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
         let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.target_scheme, EncryptionScheme::Cenc);
+        assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
     }
 
     #[test]
@@ -153,6 +163,7 @@ mod tests {
             source_url: "https://example.com/source".into(),
             output_format: OutputFormat::Hls,
             target_scheme: EncryptionScheme::Cenc,
+            container_format: ContainerFormat::default(),
             key_ids: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();

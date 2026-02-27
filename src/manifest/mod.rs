@@ -18,10 +18,11 @@ pub fn render_manifest(state: &ManifestState) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::container::ContainerFormat;
     use types::{ManifestPhase, SegmentInfo, InitSegmentInfo};
 
     fn make_live_state(format: OutputFormat) -> ManifestState {
-        let mut s = ManifestState::new("test".into(), format, "/".into());
+        let mut s = ManifestState::new("test".into(), format, "/".into(), ContainerFormat::default());
         s.phase = ManifestPhase::Live;
         s.init_segment = Some(InitSegmentInfo {
             uri: "/init.mp4".into(),
@@ -54,14 +55,14 @@ mod tests {
 
     #[test]
     fn render_manifest_awaiting_hls_returns_ok() {
-        let state = ManifestState::new("test".into(), OutputFormat::Hls, "/".into());
+        let state = ManifestState::new("test".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
         let result = render_manifest(&state);
         assert!(result.is_ok());
     }
 
     #[test]
     fn render_manifest_awaiting_dash_returns_ok() {
-        let state = ManifestState::new("test".into(), OutputFormat::Dash, "/".into());
+        let state = ManifestState::new("test".into(), OutputFormat::Dash, "/".into(), ContainerFormat::default());
         let result = render_manifest(&state);
         assert!(result.is_ok());
     }

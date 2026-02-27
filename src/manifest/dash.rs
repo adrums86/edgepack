@@ -25,7 +25,8 @@ pub fn render(state: &ManifestState) -> Result<String> {
          xmlns:cenc=\"urn:mpeg:cenc:2013\" \
          xmlns:mspr=\"urn:microsoft:playready\" \
          type=\"{mpd_type}\" \
-         profiles=\"urn:mpeg:dash:profile:isoff-live:2011,urn:mpeg:dash:profile:cmaf:2019\""
+         profiles=\"{profiles}\"",
+        profiles = state.container_format.dash_profiles()
     ));
 
     match state.phase {
@@ -182,10 +183,11 @@ fn build_segment_template(state: &ManifestState) -> String {
 
     let timescale = 1000u32; // millisecond timescale
 
+    let seg_ext = state.container_format.video_segment_extension();
     let mut xml = format!(
         "      <SegmentTemplate timescale=\"{timescale}\" \
          initialization=\"{init_uri}\" \
-         media=\"{base}segment_$Number$.cmfv\" \
+         media=\"{base}segment_$Number${seg_ext}\" \
          startNumber=\"0\">\n",
         base = state.base_url
     );
@@ -245,9 +247,10 @@ mod tests {
     use super::*;
     use crate::drm::scheme::EncryptionScheme;
     use crate::manifest::types::*;
+    use crate::media::container::ContainerFormat;
 
     fn make_state(phase: ManifestPhase) -> ManifestState {
-        let mut s = ManifestState::new("content-1".into(), OutputFormat::Dash, "/base/".into());
+        let mut s = ManifestState::new("content-1".into(), OutputFormat::Dash, "/base/".into(), ContainerFormat::default());
         s.phase = phase;
         s
     }

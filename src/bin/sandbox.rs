@@ -191,6 +191,7 @@ async fn handle_repackage(
         source_url,
         output_format,
         target_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        container_format: edge_packager::media::container::ContainerFormat::Cmaf,
         key_ids: vec![],
     };
 
@@ -396,7 +397,9 @@ fn is_local_path(s: &str) -> bool {
 }
 
 fn parse_segment_number(filename: &str) -> Option<u32> {
-    let name = filename.strip_suffix(".cmfv")?;
+    let name = filename
+        .strip_suffix(".cmfv")
+        .or_else(|| filename.strip_suffix(".m4s"))?;
     let num_str = name.strip_prefix("segment_")?;
     num_str.parse().ok()
 }
@@ -471,12 +474,23 @@ fn write_output_to_disk(
     }
 
     // Write media segments
+    // Determine extension from manifest state if available
+    let seg_ext = if let Ok(Some(state_data)) = cache.get(&manifest_key) {
+        if let Ok(state) = serde_json::from_slice::<ManifestState>(&state_data) {
+            state.container_format.video_segment_extension().to_string()
+        } else {
+            ".cmfv".to_string()
+        }
+    } else {
+        ".cmfv".to_string()
+    };
+
     let mut seg_num = 0u32;
     loop {
         let seg_key = CacheKeys::media_segment(content_id, fmt_str, seg_num);
         match cache.get(&seg_key) {
             Ok(Some(data)) => {
-                let seg_path = out_dir.join(format!("segment_{seg_num}.cmfv"));
+                let seg_path = out_dir.join(format!("segment_{seg_num}{seg_ext}"));
                 std::fs::write(&seg_path, &data)
                     .map_err(|e| format!("write segment {seg_num}: {e}"))?;
                 seg_num += 1;

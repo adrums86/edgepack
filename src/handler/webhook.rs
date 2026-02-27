@@ -19,6 +19,9 @@ pub struct WebhookPayload {
     /// Target encryption scheme: "cenc" or "cbcs" (default: "cenc").
     #[serde(default = "default_target_scheme_str")]
     pub target_scheme: String,
+    /// Target container format: "cmaf" or "fmp4" (default: "cmaf").
+    #[serde(default = "default_container_format_str")]
+    pub container_format: String,
     /// Optional key IDs to request (hex strings).
     #[serde(default)]
     pub key_ids: Vec<String>,
@@ -26,6 +29,10 @@ pub struct WebhookPayload {
 
 fn default_target_scheme_str() -> String {
     "cenc".to_string()
+}
+
+fn default_container_format_str() -> String {
+    "cmaf".to_string()
 }
 
 /// Webhook response returned after first manifest publishes.
@@ -88,11 +95,23 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         }
     };
 
+    // Parse container format
+    let container_format = crate::media::container::ContainerFormat::from_str_value(
+        &payload.container_format,
+    )
+    .ok_or_else(|| {
+        EdgePackagerError::InvalidInput(format!(
+            "invalid container_format: {} (expected 'cmaf' or 'fmp4')",
+            payload.container_format
+        ))
+    })?;
+
     let request = RepackageRequest {
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
         output_format,
         target_scheme,
+        container_format,
         key_ids: payload.key_ids,
     };
 
@@ -377,12 +396,14 @@ mod tests {
             source_url: "https://example.com".into(),
             format: "hls".into(),
             target_scheme: "cenc".into(),
+            container_format: "cmaf".into(),
             key_ids: vec!["aabb".into()],
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, "c1");
         assert_eq!(parsed.target_scheme, "cenc");
+        assert_eq!(parsed.container_format, "cmaf");
         assert_eq!(parsed.key_ids.len(), 1);
     }
 
@@ -392,6 +413,7 @@ mod tests {
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
         assert!(parsed.key_ids.is_empty());
         assert_eq!(parsed.target_scheme, "cenc");
+        assert_eq!(parsed.container_format, "cmaf");
     }
 
     #[test]
@@ -399,6 +421,28 @@ mod tests {
         let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","target_scheme":"cbcs"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.target_scheme, "cbcs");
+    }
+
+    #[test]
+    fn webhook_payload_fmp4_container_format() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","container_format":"fmp4"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.container_format, "fmp4");
+    }
+
+    #[test]
+    fn webhook_invalid_container_format() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "container_format": "webm"
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid container_format"));
     }
 
     #[test]
