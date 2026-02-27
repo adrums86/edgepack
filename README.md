@@ -262,6 +262,22 @@ handler/ ──► repackager/ ──► media/     (CMAF parse + rewrite)
                          ──► cache/    (Redis state)
 ```
 
+### Detailed Architecture Diagrams
+
+See [`docs/architecture.md`](docs/architecture.md) for detailed Mermaid diagrams covering:
+
+- System context (CDN infrastructure, external dependencies)
+- End-to-end data flow (CBCS input → transform → CENC output)
+- Internal module architecture and dependency graph
+- Split execution model (WASI self-invocation chaining sequence)
+- Progressive output state machine (AwaitingFirstSegment → Live → Complete)
+- Cache security model (AES-256-GCM encryption + post-processing cleanup)
+- Redis cache key layout with sensitivity classification
+- CDN caching strategy per resource type
+- Per-segment encryption transform detail (ISOBMFF box-level)
+
+All diagrams use Mermaid syntax and can be imported into Confluence (Mermaid macro), Jira, and Lucidchart (File → Import → Mermaid).
+
 ## Supported Encryption Schemes
 
 | Direction | Scheme | Mode | Pattern | DRM Systems |

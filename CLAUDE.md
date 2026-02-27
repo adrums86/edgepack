@@ -74,6 +74,10 @@ src/
     └── webhook.rs      POST /webhook/repackage + continue handler
 ```
 
+## Architecture Diagrams
+
+Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md). The file contains 9 diagrams: system context, data flow, module architecture, split execution sequence, progressive output state machine, cache security model, cache key layout, CDN caching strategy, and per-segment encryption transform. All diagrams are Mermaid syntax, portable to Confluence, Jira, and Lucidchart.
+
 ## Key Concepts
 
 ### Two-Tier Caching
