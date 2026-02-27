@@ -380,3 +380,155 @@ impl From<CachedKeySet> for DrmKeySet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drm::{system_ids, DrmSystemData};
+
+    fn make_key_set() -> DrmKeySet {
+        DrmKeySet {
+            keys: vec![ContentKey {
+                kid: [0x01; 16],
+                key: vec![0xAA; 16],
+                iv: Some(vec![0xBB; 8]),
+            }],
+            drm_systems: vec![
+                DrmSystemData {
+                    system_id: system_ids::WIDEVINE,
+                    kid: [0x01; 16],
+                    pssh_data: vec![0x10, 0x20],
+                    content_protection_data: None,
+                },
+                DrmSystemData {
+                    system_id: system_ids::PLAYREADY,
+                    kid: [0x01; 16],
+                    pssh_data: vec![0x30, 0x40],
+                    content_protection_data: Some("<pro>test</pro>".into()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn format_str_hls() {
+        assert_eq!(format_str(OutputFormat::Hls), "hls");
+    }
+
+    #[test]
+    fn format_str_dash() {
+        assert_eq!(format_str(OutputFormat::Dash), "dash");
+    }
+
+    #[test]
+    fn find_key_for_kid_found() {
+        let key_set = make_key_set();
+        let kid = [0x01; 16];
+        let key = find_key_for_kid(&key_set, &kid).unwrap();
+        assert_eq!(key.kid, kid);
+        assert_eq!(key.key, vec![0xAA; 16]);
+    }
+
+    #[test]
+    fn find_key_for_kid_not_found() {
+        let key_set = make_key_set();
+        let kid = [0xFF; 16];
+        let result = find_key_for_kid(&key_set, &kid);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no key found"));
+    }
+
+    #[test]
+    fn cached_key_set_roundtrip() {
+        let original = make_key_set();
+        let cached = CachedKeySet::from(&original);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&cached).unwrap();
+        let deserialized: CachedKeySet = serde_json::from_str(&json).unwrap();
+
+        // Convert back
+        let restored: DrmKeySet = deserialized.into();
+        assert_eq!(restored.keys.len(), 1);
+        assert_eq!(restored.keys[0].kid, [0x01; 16]);
+        assert_eq!(restored.keys[0].key, vec![0xAA; 16]);
+        assert_eq!(restored.keys[0].iv, Some(vec![0xBB; 8]));
+        assert_eq!(restored.drm_systems.len(), 2);
+    }
+
+    #[test]
+    fn cached_key_set_preserves_drm_systems() {
+        let original = make_key_set();
+        let cached = CachedKeySet::from(&original);
+        let json = serde_json::to_string(&cached).unwrap();
+        let deserialized: CachedKeySet = serde_json::from_str(&json).unwrap();
+        let restored: DrmKeySet = deserialized.into();
+
+        assert_eq!(restored.drm_systems[0].system_id, system_ids::WIDEVINE);
+        assert_eq!(restored.drm_systems[0].pssh_data, vec![0x10, 0x20]);
+        assert!(restored.drm_systems[0].content_protection_data.is_none());
+
+        assert_eq!(restored.drm_systems[1].system_id, system_ids::PLAYREADY);
+        assert_eq!(restored.drm_systems[1].pssh_data, vec![0x30, 0x40]);
+        assert_eq!(
+            restored.drm_systems[1].content_protection_data,
+            Some("<pro>test</pro>".into())
+        );
+    }
+
+    #[test]
+    fn cached_key_set_no_iv() {
+        let key_set = DrmKeySet {
+            keys: vec![ContentKey {
+                kid: [0x02; 16],
+                key: vec![0xCC; 16],
+                iv: None,
+            }],
+            drm_systems: vec![],
+        };
+        let cached = CachedKeySet::from(&key_set);
+        let json = serde_json::to_string(&cached).unwrap();
+        let deserialized: CachedKeySet = serde_json::from_str(&json).unwrap();
+        let restored: DrmKeySet = deserialized.into();
+        assert!(restored.keys[0].iv.is_none());
+    }
+
+    #[test]
+    fn build_manifest_drm_info_widevine_and_playready() {
+        let key_set = make_key_set();
+        let kid = [0x01; 16];
+        let info = build_manifest_drm_info(&key_set, &kid);
+
+        assert!(info.widevine_pssh.is_some());
+        assert!(info.playready_pssh.is_some());
+        assert!(info.playready_pro.is_some());
+        assert_eq!(info.default_kid.len(), 32);
+        assert!(info.default_kid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn build_manifest_drm_info_no_drm_systems() {
+        let key_set = DrmKeySet {
+            keys: vec![],
+            drm_systems: vec![],
+        };
+        let kid = [0x01; 16];
+        let info = build_manifest_drm_info(&key_set, &kid);
+
+        assert!(info.widevine_pssh.is_none());
+        assert!(info.playready_pssh.is_none());
+        assert!(info.playready_pro.is_none());
+    }
+
+    #[test]
+    fn build_manifest_drm_info_kid_hex_format() {
+        let key_set = DrmKeySet {
+            keys: vec![],
+            drm_systems: vec![],
+        };
+        let kid = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                   0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let info = build_manifest_drm_info(&key_set, &kid);
+        assert_eq!(info.default_kid, "0123456789abcdef0123456789abcdef");
+    }
+}

@@ -316,3 +316,173 @@ fn pad_iv_to_16(iv: &[u8]) -> Vec<u8> {
     padded[start..].copy_from_slice(&iv[..iv.len().min(16)]);
     padded
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::cmaf;
+
+    #[test]
+    fn pad_iv_to_16_from_8_bytes() {
+        let iv = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let padded = pad_iv_to_16(&iv);
+        assert_eq!(padded.len(), 16);
+        assert_eq!(&padded[..8], &[0u8; 8]);
+        assert_eq!(&padded[8..], &iv);
+    }
+
+    #[test]
+    fn pad_iv_to_16_from_16_bytes() {
+        let iv = [0xAA; 16];
+        let padded = pad_iv_to_16(&iv);
+        assert_eq!(padded, iv.to_vec());
+    }
+
+    #[test]
+    fn pad_iv_to_16_empty() {
+        let padded = pad_iv_to_16(&[]);
+        assert_eq!(padded, vec![0u8; 16]);
+    }
+
+    #[test]
+    fn pad_iv_to_16_single_byte() {
+        let padded = pad_iv_to_16(&[0xFF]);
+        assert_eq!(padded[15], 0xFF);
+        assert_eq!(&padded[..15], &[0u8; 15]);
+    }
+
+    #[test]
+    fn extract_sample_sizes_all_present() {
+        let trun = TrackRunBox {
+            flags: 0x0200,
+            sample_count: 2,
+            data_offset: None,
+            first_sample_flags: None,
+            entries: vec![
+                crate::media::cmaf::TrunEntry {
+                    sample_duration: None,
+                    sample_size: Some(100),
+                    sample_flags: None,
+                    sample_composition_time_offset: None,
+                },
+                crate::media::cmaf::TrunEntry {
+                    sample_duration: None,
+                    sample_size: Some(200),
+                    sample_flags: None,
+                    sample_composition_time_offset: None,
+                },
+            ],
+        };
+        let sizes = extract_sample_sizes(&trun).unwrap();
+        assert_eq!(sizes, vec![100, 200]);
+    }
+
+    #[test]
+    fn extract_sample_sizes_missing_returns_error() {
+        let trun = TrackRunBox {
+            flags: 0,
+            sample_count: 1,
+            data_offset: None,
+            first_sample_flags: None,
+            entries: vec![crate::media::cmaf::TrunEntry {
+                sample_duration: None,
+                sample_size: None,
+                sample_flags: None,
+                sample_composition_time_offset: None,
+            }],
+        };
+        let result = extract_sample_sizes(&trun);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("sample_size"));
+    }
+
+    #[test]
+    fn rebuild_mdat_produces_valid_box() {
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mdat = rebuild_mdat(&payload);
+        // Header: 4 bytes size + 4 bytes type + payload
+        assert_eq!(mdat.len(), 8 + 4);
+        assert_eq!(&mdat[4..8], b"mdat");
+        assert_eq!(&mdat[8..], &payload);
+        let size = u32::from_be_bytes([mdat[0], mdat[1], mdat[2], mdat[3]]);
+        assert_eq!(size, 12);
+    }
+
+    #[test]
+    fn rebuild_mdat_empty_payload() {
+        let mdat = rebuild_mdat(&[]);
+        assert_eq!(mdat.len(), 8);
+        assert_eq!(&mdat[4..8], b"mdat");
+    }
+
+    #[test]
+    fn segment_rewrite_params_construction() {
+        let params = SegmentRewriteParams {
+            source_key: ContentKey {
+                kid: [0x01; 16],
+                key: vec![0xAA; 16],
+                iv: None,
+            },
+            target_key: ContentKey {
+                kid: [0x02; 16],
+                key: vec![0xBB; 16],
+                iv: None,
+            },
+            source_iv_size: 8,
+            target_iv_size: 8,
+            crypt_byte_block: 1,
+            skip_byte_block: 9,
+            constant_iv: None,
+            segment_number: 42,
+        };
+        assert_eq!(params.source_iv_size, 8);
+        assert_eq!(params.target_iv_size, 8);
+        assert_eq!(params.crypt_byte_block, 1);
+        assert_eq!(params.skip_byte_block, 9);
+        assert_eq!(params.segment_number, 42);
+    }
+
+    #[test]
+    fn rewrite_segment_missing_moof_returns_error() {
+        // Only mdat, no moof
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, 12, b"mdat");
+        data.extend_from_slice(&[0u8; 4]);
+
+        let params = SegmentRewriteParams {
+            source_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
+            target_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
+            source_iv_size: 8,
+            target_iv_size: 8,
+            crypt_byte_block: 0,
+            skip_byte_block: 0,
+            constant_iv: None,
+            segment_number: 0,
+        };
+        let result = rewrite_segment(&data, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no moof"));
+    }
+
+    #[test]
+    fn rewrite_segment_missing_mdat_returns_error() {
+        // Only moof (with no senc/trun inside, but the mdat check comes first)
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, 12, b"moof");
+        data.extend_from_slice(&[0u8; 4]);
+
+        let params = SegmentRewriteParams {
+            source_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
+            target_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
+            source_iv_size: 8,
+            target_iv_size: 8,
+            crypt_byte_block: 0,
+            skip_byte_block: 0,
+            constant_iv: None,
+            segment_number: 0,
+        };
+        let result = rewrite_segment(&data, &params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no mdat"));
+    }
+}

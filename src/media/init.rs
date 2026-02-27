@@ -484,3 +484,219 @@ pub fn parse_protection_info(init_data: &[u8]) -> Result<Option<ProtectionScheme
 
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drm::{system_ids, ContentKey, DrmSystemData};
+    use crate::media::cmaf;
+
+    fn make_key_set() -> DrmKeySet {
+        DrmKeySet {
+            keys: vec![ContentKey {
+                kid: [0x01; 16],
+                key: vec![0xAA; 16],
+                iv: None,
+            }],
+            drm_systems: vec![
+                DrmSystemData {
+                    system_id: system_ids::WIDEVINE,
+                    kid: [0x01; 16],
+                    pssh_data: vec![0x10, 0x20],
+                    content_protection_data: None,
+                },
+                DrmSystemData {
+                    system_id: system_ids::PLAYREADY,
+                    kid: [0x01; 16],
+                    pssh_data: vec![0x30, 0x40],
+                    content_protection_data: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn build_schm_cenc_produces_valid_box() {
+        let schm = build_schm_cenc();
+        // Size(4) + type(4) + version/flags(4) + scheme_type(4) + scheme_version(4) = 20
+        assert_eq!(schm.len(), 20);
+        // Check box type
+        assert_eq!(&schm[4..8], b"schm");
+        // Check scheme type is "cenc"
+        assert_eq!(&schm[12..16], b"cenc");
+        // Check scheme version (1.0 = 0x00010000)
+        assert_eq!(&schm[16..20], &0x00010000u32.to_be_bytes());
+    }
+
+    #[test]
+    fn build_tenc_cenc_produces_valid_box() {
+        let kid = [0x01; 16];
+        let tenc = build_tenc_cenc(&kid, 8);
+        // Check box type
+        assert_eq!(&tenc[4..8], b"tenc");
+        // Check isProtected = 1
+        let version_flags_reserved_len = 4 + 1; // version(1)+flags(3)+reserved(1)
+        let is_protected_offset = 8 + version_flags_reserved_len;
+        assert_eq!(tenc[is_protected_offset], 1);
+        // Check IV size = 8
+        assert_eq!(tenc[is_protected_offset + 1], 8);
+        // Check KID
+        assert_eq!(&tenc[is_protected_offset + 2..is_protected_offset + 18], &[0x01; 16]);
+    }
+
+    #[test]
+    fn build_tenc_cenc_iv_size_16() {
+        let kid = [0x02; 16];
+        let tenc = build_tenc_cenc(&kid, 16);
+        let is_protected_offset = 8 + 5;
+        assert_eq!(tenc[is_protected_offset + 1], 16);
+    }
+
+    #[test]
+    fn build_cenc_pssh_boxes_skips_fairplay() {
+        let mut key_set = make_key_set();
+        key_set.drm_systems.push(DrmSystemData {
+            system_id: system_ids::FAIRPLAY,
+            kid: [0x01; 16],
+            pssh_data: vec![0xFF],
+            content_protection_data: None,
+        });
+        let pssh_data = build_cenc_pssh_boxes(&key_set).unwrap();
+        // Should contain Widevine and PlayReady but not FairPlay
+        // Count PSSH boxes by scanning for "pssh" box type
+        let mut pssh_count = 0;
+        let mut pos = 0;
+        while pos + 8 <= pssh_data.len() {
+            if &pssh_data[pos + 4..pos + 8] == b"pssh" {
+                pssh_count += 1;
+                let size = u32::from_be_bytes([
+                    pssh_data[pos], pssh_data[pos + 1], pssh_data[pos + 2], pssh_data[pos + 3],
+                ]) as usize;
+                pos += size;
+            } else {
+                pos += 1;
+            }
+        }
+        assert_eq!(pssh_count, 2); // Widevine + PlayReady only
+    }
+
+    #[test]
+    fn build_cenc_pssh_boxes_includes_key_ids() {
+        let key_set = make_key_set();
+        let pssh_data = build_cenc_pssh_boxes(&key_set).unwrap();
+        assert!(!pssh_data.is_empty());
+        // Verify it starts with a valid box
+        assert_eq!(&pssh_data[4..8], b"pssh");
+    }
+
+    #[test]
+    fn parse_protection_info_no_sinf_returns_none() {
+        // ftyp box only — no sinf
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, 16, b"ftyp");
+        data.extend_from_slice(b"isom\x00\x00\x00\x00"); // brand + version
+        let result = parse_protection_info(&data).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_protection_info_empty_data_returns_none() {
+        let result = parse_protection_info(&[]).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_protection_info_finds_sinf_with_tenc() {
+        // Build a minimal init segment with a sinf box containing frma + schm + schi(tenc)
+        let mut init_data = Vec::new();
+
+        // ftyp
+        cmaf::write_box_header(&mut init_data, 12, b"ftyp");
+        init_data.extend_from_slice(b"isom");
+
+        // Build sinf contents
+        let mut sinf_children = Vec::new();
+
+        // frma: original_format = "avc1"
+        cmaf::write_box_header(&mut sinf_children, 12, b"frma");
+        sinf_children.extend_from_slice(b"avc1");
+
+        // schm: version(1)+flags(3)+scheme_type(4)+scheme_version(4) = full box
+        let schm_size: u32 = 8 + 4 + 4 + 4;
+        cmaf::write_box_header(&mut sinf_children, schm_size, b"schm");
+        sinf_children.extend_from_slice(&[0; 4]); // version + flags
+        sinf_children.extend_from_slice(b"cbcs");
+        sinf_children.extend_from_slice(&0x00010000u32.to_be_bytes());
+
+        // schi containing tenc
+        // tenc: header(8) + version(1) + flags(3) + reserved/crypt_skip(1)
+        //       + isProtected(1) + ivSize(1) + KID(16) = 31
+        let tenc_size: u32 = 8 + 1 + 3 + 1 + 1 + 1 + 16;
+        let mut tenc_data = Vec::new();
+        cmaf::write_box_header(&mut tenc_data, tenc_size, b"tenc");
+        tenc_data.push(0); // version
+        tenc_data.extend_from_slice(&[0; 3]); // flags
+        tenc_data.push(0x19); // crypt=1, skip=9
+        tenc_data.push(1); // isProtected
+        tenc_data.push(8); // ivSize
+        tenc_data.extend_from_slice(&[0xAA; 16]); // KID
+
+        let schi_size = 8 + tenc_data.len() as u32;
+        cmaf::write_box_header(&mut sinf_children, schi_size, b"schi");
+        sinf_children.extend_from_slice(&tenc_data);
+
+        // Now wrap in sinf
+        let sinf_size = 8 + sinf_children.len() as u32;
+        cmaf::write_box_header(&mut init_data, sinf_size, b"sinf");
+        init_data.extend_from_slice(&sinf_children);
+
+        let result = parse_protection_info(&init_data).unwrap();
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(&info.original_format, b"avc1");
+        assert_eq!(&info.scheme_type, b"cbcs");
+    }
+
+    #[test]
+    fn rewrite_init_segment_empty_data() {
+        let key_set = make_key_set();
+        // Empty data should produce empty output
+        let result = rewrite_init_segment(&[], &key_set, 8).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn rewrite_init_segment_ftyp_only_passthrough() {
+        let key_set = make_key_set();
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, 16, b"ftyp");
+        data.extend_from_slice(b"isom\x00\x00\x02\x00");
+
+        let result = rewrite_init_segment(&data, &key_set, 8).unwrap();
+        // ftyp should be copied as-is
+        assert_eq!(&result[4..8], b"ftyp");
+        assert_eq!(result.len(), data.len());
+    }
+
+    #[test]
+    fn rewrite_init_segment_moov_adds_pssh() {
+        let key_set = make_key_set();
+
+        // Build minimal moov with mvhd child
+        let mut mvhd_data = Vec::new();
+        cmaf::write_box_header(&mut mvhd_data, 16, b"mvhd");
+        mvhd_data.extend_from_slice(&[0u8; 8]);
+
+        let moov_size = 8 + mvhd_data.len() as u32;
+        let mut data = Vec::new();
+        cmaf::write_box_header(&mut data, moov_size, b"moov");
+        data.extend_from_slice(&mvhd_data);
+
+        let result = rewrite_init_segment(&data, &key_set, 8).unwrap();
+        // Result should contain moov with PSSH boxes added
+        assert_eq!(&result[4..8], b"moov");
+        // Should contain at least one pssh box
+        let has_pssh = result.windows(4).any(|w| w == b"pssh");
+        assert!(has_pssh);
+    }
+}

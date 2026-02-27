@@ -53,3 +53,60 @@ impl CacheKeys {
         format!("ep:{content_id}:speke")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_keys_drm_keys() {
+        assert_eq!(CacheKeys::drm_keys("abc123"), "ep:abc123:keys");
+    }
+
+    #[test]
+    fn cache_keys_drm_keys_special_chars() {
+        assert_eq!(CacheKeys::drm_keys("my-content_v2"), "ep:my-content_v2:keys");
+    }
+
+    #[test]
+    fn cache_keys_job_state() {
+        assert_eq!(CacheKeys::job_state("abc", "hls"), "ep:abc:hls:state");
+        assert_eq!(CacheKeys::job_state("abc", "dash"), "ep:abc:dash:state");
+    }
+
+    #[test]
+    fn cache_keys_manifest_state() {
+        assert_eq!(
+            CacheKeys::manifest_state("abc", "hls"),
+            "ep:abc:hls:manifest_state"
+        );
+    }
+
+    #[test]
+    fn cache_keys_speke_response() {
+        assert_eq!(CacheKeys::speke_response("abc"), "ep:abc:speke");
+    }
+
+    #[test]
+    fn create_backend_http() {
+        let config = RedisConfig {
+            url: "https://redis.example.com".into(),
+            token: "token123".into(),
+            backend: RedisBackendType::Http,
+        };
+        let backend = create_backend(&config);
+        assert!(backend.is_ok());
+    }
+
+    #[test]
+    fn create_backend_tcp() {
+        let config = RedisConfig {
+            url: "redis://localhost:6379".into(),
+            token: "token123".into(),
+            backend: RedisBackendType::Tcp,
+        };
+        let backend = create_backend(&config);
+        // TCP backend constructor should succeed (it's a stub)
+        assert!(backend.is_ok());
+    }
+}

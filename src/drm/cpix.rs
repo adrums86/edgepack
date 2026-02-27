@@ -243,3 +243,224 @@ fn find_attribute(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drm::system_ids;
+
+    #[test]
+    fn format_uuid_zero() {
+        let bytes = [0u8; 16];
+        assert_eq!(
+            format_uuid(&bytes),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn format_uuid_widevine() {
+        let uuid = format_uuid(&system_ids::WIDEVINE);
+        assert_eq!(uuid, "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed");
+    }
+
+    #[test]
+    fn format_uuid_playready() {
+        let uuid = format_uuid(&system_ids::PLAYREADY);
+        assert_eq!(uuid, "9a04f079-9840-4286-ab92-e65be0885f95");
+    }
+
+    #[test]
+    fn parse_uuid_with_hyphens() {
+        let bytes = parse_uuid("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed").unwrap();
+        assert_eq!(bytes, system_ids::WIDEVINE);
+    }
+
+    #[test]
+    fn parse_uuid_without_hyphens() {
+        let bytes = parse_uuid("edef8ba979d64acea3c827dcd51d21ed").unwrap();
+        assert_eq!(bytes, system_ids::WIDEVINE);
+    }
+
+    #[test]
+    fn parse_uuid_roundtrip() {
+        let original = system_ids::PLAYREADY;
+        let formatted = format_uuid(&original);
+        let parsed = parse_uuid(&formatted).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parse_uuid_too_short() {
+        let result = parse_uuid("abcdef");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected 32 hex chars"));
+    }
+
+    #[test]
+    fn parse_uuid_too_long() {
+        let result = parse_uuid("edef8ba979d64acea3c827dcd51d21edFF");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_cpix_request_single_key_single_system() {
+        let kid = [0x01u8; 16];
+        let system = system_ids::WIDEVINE;
+        let xml = build_cpix_request("test-content", &[kid], &[system]).unwrap();
+
+        assert!(xml.contains("<?xml version="));
+        assert!(xml.contains("urn:dashif:org:cpix"));
+        assert!(xml.contains("contentId=\"test-content\""));
+        assert!(xml.contains("ContentKeyList"));
+        assert!(xml.contains("ContentKey"));
+        assert!(xml.contains("commonEncryptionScheme=\"cenc\""));
+        assert!(xml.contains("DRMSystemList"));
+        assert!(xml.contains("DRMSystem"));
+        assert!(xml.contains("PSSH"));
+        assert!(xml.contains("ContentKeyUsageRuleList"));
+        assert!(xml.contains("intendedTrackType=\"VIDEO\""));
+    }
+
+    #[test]
+    fn build_cpix_request_multiple_keys() {
+        let kid1 = [0x01u8; 16];
+        let kid2 = [0x02u8; 16];
+        let xml = build_cpix_request(
+            "test",
+            &[kid1, kid2],
+            &[system_ids::WIDEVINE],
+        )
+        .unwrap();
+
+        // First key should be VIDEO, second AUDIO
+        assert!(xml.contains("intendedTrackType=\"VIDEO\""));
+        assert!(xml.contains("intendedTrackType=\"AUDIO\""));
+    }
+
+    #[test]
+    fn build_cpix_request_multiple_systems() {
+        let kid = [0x01u8; 16];
+        let xml = build_cpix_request(
+            "test",
+            &[kid],
+            &[system_ids::WIDEVINE, system_ids::PLAYREADY],
+        )
+        .unwrap();
+
+        let wv_uuid = format_uuid(&system_ids::WIDEVINE);
+        let pr_uuid = format_uuid(&system_ids::PLAYREADY);
+        assert!(xml.contains(&wv_uuid));
+        assert!(xml.contains(&pr_uuid));
+    }
+
+    #[test]
+    fn build_cpix_request_is_valid_xml() {
+        let kid = [0x01u8; 16];
+        let xml = build_cpix_request("test", &[kid], &[system_ids::WIDEVINE]).unwrap();
+        // Verify it can be parsed as XML
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Err(e) => panic!("Invalid XML: {e}"),
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+
+    fn build_sample_cpix_response() -> String {
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        let key_b64 = b64.encode([0xAA; 16]);
+        let pssh_b64 = b64.encode([0xBB; 32]);
+        let kid_uuid = format_uuid(&[0x01; 16]);
+        let wv_uuid = format_uuid(&system_ids::WIDEVINE);
+
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<cpix:CPIX xmlns:cpix="urn:dashif:org:cpix" xmlns:pskc="urn:ietf:params:xml:ns:keyprov:pskc">
+  <cpix:ContentKeyList>
+    <cpix:ContentKey kid="{kid_uuid}">
+      <cpix:Data>
+        <pskc:Secret>
+          <pskc:PlainValue>{key_b64}</pskc:PlainValue>
+        </pskc:Secret>
+      </cpix:Data>
+    </cpix:ContentKey>
+  </cpix:ContentKeyList>
+  <cpix:DRMSystemList>
+    <cpix:DRMSystem kid="{kid_uuid}" systemId="{wv_uuid}">
+      <cpix:PSSH>{pssh_b64}</cpix:PSSH>
+    </cpix:DRMSystem>
+  </cpix:DRMSystemList>
+</cpix:CPIX>"#
+        )
+    }
+
+    #[test]
+    fn parse_cpix_response_extracts_key() {
+        let xml = build_sample_cpix_response();
+        let result = parse_cpix_response(xml.as_bytes()).unwrap();
+
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(result.keys[0].kid, [0x01; 16]);
+        assert_eq!(result.keys[0].key, vec![0xAA; 16]);
+        assert!(result.keys[0].iv.is_none());
+    }
+
+    #[test]
+    fn parse_cpix_response_extracts_drm_system() {
+        let xml = build_sample_cpix_response();
+        let result = parse_cpix_response(xml.as_bytes()).unwrap();
+
+        assert_eq!(result.drm_systems.len(), 1);
+        assert_eq!(result.drm_systems[0].system_id, system_ids::WIDEVINE);
+        assert_eq!(result.drm_systems[0].kid, [0x01; 16]);
+        assert_eq!(result.drm_systems[0].pssh_data, vec![0xBB; 32]);
+    }
+
+    #[test]
+    fn parse_cpix_response_no_keys_errors() {
+        let xml = r#"<?xml version="1.0"?><cpix:CPIX xmlns:cpix="urn:dashif:org:cpix"></cpix:CPIX>"#;
+        let result = parse_cpix_response(xml.as_bytes());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no content keys"));
+    }
+
+    #[test]
+    fn parse_cpix_response_invalid_xml_errors() {
+        let result = parse_cpix_response(b"this is not xml < >");
+        // Should either parse with no keys (and error) or fail with XML error
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_cpix_response_multiple_keys() {
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        let key1_b64 = b64.encode([0xAA; 16]);
+        let key2_b64 = b64.encode([0xCC; 16]);
+        let kid1 = format_uuid(&[0x01; 16]);
+        let kid2 = format_uuid(&[0x02; 16]);
+
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+<cpix:CPIX xmlns:cpix="urn:dashif:org:cpix" xmlns:pskc="urn:ietf:params:xml:ns:keyprov:pskc">
+  <cpix:ContentKeyList>
+    <cpix:ContentKey kid="{kid1}">
+      <cpix:Data><pskc:Secret><pskc:PlainValue>{key1_b64}</pskc:PlainValue></pskc:Secret></cpix:Data>
+    </cpix:ContentKey>
+    <cpix:ContentKey kid="{kid2}">
+      <cpix:Data><pskc:Secret><pskc:PlainValue>{key2_b64}</pskc:PlainValue></pskc:Secret></cpix:Data>
+    </cpix:ContentKey>
+  </cpix:ContentKeyList>
+</cpix:CPIX>"#
+        );
+
+        let result = parse_cpix_response(xml.as_bytes()).unwrap();
+        assert_eq!(result.keys.len(), 2);
+        assert_eq!(result.keys[0].key, vec![0xAA; 16]);
+        assert_eq!(result.keys[1].key, vec![0xCC; 16]);
+    }
+}

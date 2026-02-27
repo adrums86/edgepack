@@ -83,3 +83,68 @@ pub fn handle_status_request(
         "no job found for {content_id}/{format:?}"
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_manifest_request_hls_not_found() {
+        let result = handle_manifest_request("content-1", OutputFormat::Hls);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("manifest not found"));
+        assert!(err.to_string().contains("content-1"));
+        assert!(err.to_string().contains("Hls"));
+    }
+
+    #[test]
+    fn handle_manifest_request_dash_not_found() {
+        let result = handle_manifest_request("content-2", OutputFormat::Dash);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Dash"));
+    }
+
+    #[test]
+    fn handle_init_segment_request_not_found() {
+        let result = handle_init_segment_request("content-1", OutputFormat::Hls);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("init segment not found"));
+        assert!(err.to_string().contains("content-1"));
+    }
+
+    #[test]
+    fn handle_media_segment_request_not_found() {
+        let result = handle_media_segment_request("content-1", OutputFormat::Hls, 5);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("segment 5 not found"));
+        assert!(err.to_string().contains("content-1"));
+    }
+
+    #[test]
+    fn handle_media_segment_request_different_numbers() {
+        let result = handle_media_segment_request("c", OutputFormat::Dash, 0);
+        assert!(result.unwrap_err().to_string().contains("segment 0"));
+
+        let result = handle_media_segment_request("c", OutputFormat::Dash, 42);
+        assert!(result.unwrap_err().to_string().contains("segment 42"));
+    }
+
+    #[test]
+    fn handle_status_request_not_found() {
+        let result = handle_status_request("content-1", OutputFormat::Hls);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("no job found"));
+        assert!(err.to_string().contains("content-1"));
+    }
+
+    #[test]
+    fn handle_status_request_dash() {
+        let result = handle_status_request("content-99", OutputFormat::Dash);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("content-99"));
+    }
+}

@@ -80,3 +80,55 @@ impl CacheBackend for RedisHttpBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_trims_trailing_slash() {
+        let backend = RedisHttpBackend::new("https://example.com/", "token");
+        assert_eq!(backend.url, "https://example.com");
+    }
+
+    #[test]
+    fn new_no_trailing_slash() {
+        let backend = RedisHttpBackend::new("https://example.com", "token");
+        assert_eq!(backend.url, "https://example.com");
+    }
+
+    #[test]
+    fn new_preserves_token() {
+        let backend = RedisHttpBackend::new("https://example.com", "my-secret-token");
+        assert_eq!(backend.token, "my-secret-token");
+    }
+
+    #[test]
+    fn get_returns_not_implemented_error() {
+        let backend = RedisHttpBackend::new("https://example.com", "token");
+        let result = backend.get("test-key");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn set_returns_not_implemented_error() {
+        let backend = RedisHttpBackend::new("https://example.com", "token");
+        let result = backend.set("key", b"value", 3600);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exists_returns_not_implemented_error() {
+        let backend = RedisHttpBackend::new("https://example.com", "token");
+        let result = backend.exists("key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn delete_returns_not_implemented_error() {
+        let backend = RedisHttpBackend::new("https://example.com", "token");
+        let result = backend.delete("key");
+        assert!(result.is_err());
+    }
+}

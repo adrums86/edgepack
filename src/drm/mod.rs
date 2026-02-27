@@ -68,3 +68,97 @@ pub struct DrmKeySet {
     /// DRM system-specific data for each system and key.
     pub drm_systems: Vec<DrmSystemData>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::system_ids::*;
+
+    #[test]
+    fn widevine_system_id_correct() {
+        assert_eq!(WIDEVINE[0], 0xed);
+        assert_eq!(WIDEVINE[15], 0xed);
+        assert_eq!(WIDEVINE.len(), 16);
+    }
+
+    #[test]
+    fn playready_system_id_correct() {
+        assert_eq!(PLAYREADY[0], 0x9a);
+        assert_eq!(PLAYREADY[15], 0x95);
+        assert_eq!(PLAYREADY.len(), 16);
+    }
+
+    #[test]
+    fn fairplay_system_id_correct() {
+        assert_eq!(FAIRPLAY[0], 0x94);
+        assert_eq!(FAIRPLAY[15], 0xa2);
+        assert_eq!(FAIRPLAY.len(), 16);
+    }
+
+    #[test]
+    fn system_id_name_widevine() {
+        assert_eq!(system_id_name(&WIDEVINE), "Widevine");
+    }
+
+    #[test]
+    fn system_id_name_playready() {
+        assert_eq!(system_id_name(&PLAYREADY), "PlayReady");
+    }
+
+    #[test]
+    fn system_id_name_fairplay() {
+        assert_eq!(system_id_name(&FAIRPLAY), "FairPlay");
+    }
+
+    #[test]
+    fn system_id_name_unknown() {
+        assert_eq!(system_id_name(&[0u8; 16]), "Unknown");
+    }
+
+    #[test]
+    fn all_system_ids_are_distinct() {
+        assert_ne!(WIDEVINE, PLAYREADY);
+        assert_ne!(WIDEVINE, FAIRPLAY);
+        assert_ne!(PLAYREADY, FAIRPLAY);
+    }
+
+    #[test]
+    fn content_key_construction() {
+        let key = super::ContentKey {
+            kid: [1u8; 16],
+            key: vec![2u8; 16],
+            iv: Some(vec![3u8; 16]),
+        };
+        assert_eq!(key.kid, [1u8; 16]);
+        assert_eq!(key.key.len(), 16);
+        assert!(key.iv.is_some());
+    }
+
+    #[test]
+    fn content_key_without_iv() {
+        let key = super::ContentKey {
+            kid: [0u8; 16],
+            key: vec![0u8; 16],
+            iv: None,
+        };
+        assert!(key.iv.is_none());
+    }
+
+    #[test]
+    fn drm_key_set_construction() {
+        let ks = super::DrmKeySet {
+            keys: vec![super::ContentKey {
+                kid: [1u8; 16],
+                key: vec![2u8; 16],
+                iv: None,
+            }],
+            drm_systems: vec![super::DrmSystemData {
+                system_id: WIDEVINE,
+                kid: [1u8; 16],
+                pssh_data: vec![0xDE, 0xAD],
+                content_protection_data: None,
+            }],
+        };
+        assert_eq!(ks.keys.len(), 1);
+        assert_eq!(ks.drm_systems.len(), 1);
+    }
+}

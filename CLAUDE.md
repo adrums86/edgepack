@@ -15,12 +15,14 @@ cargo build
 # Release build (optimised for size: opt-level=s, LTO, stripped)
 cargo build --release
 
-# Run unit tests (uses native host target, not WASM)
-cargo test
+# Run unit tests (MUST specify native host target — tests cannot run in WASI)
+cargo test --target $(rustc -vV | grep host | awk '{print $2}')
 
 # Check without building
 cargo check
 ```
+
+**Important**: `cargo test` without `--target` will try to execute the WASM binary directly, which fails with a permission error. Always pass the native host target flag.
 
 The WASM target requires `rustup target add wasm32-wasip2`. The `.cargo/config.toml` sets `wasm32-wasip2` as the default build target, so bare `cargo build` produces a `.wasm` file.
 
@@ -124,6 +126,23 @@ These sections compile but return placeholder errors and need WASI HTTP transpor
 
 All crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements).
 
+## Unit Tests
+
+The project has 287 unit tests inlined as `#[cfg(test)] mod tests` blocks in every source file. Tests cover:
+
+- **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads)
+- **Encryption correctness**: CBCS decrypt and CENC encrypt/decrypt with known-answer tests and roundtrips
+- **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
+- **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase (AwaitingFirstSegment, Live, Complete), DRM signaling, variant streams
+- **Progressive output state machine**: Phase transitions, cache-control header generation, segment URI formatting
+- **HTTP routing**: Path parsing, format validation, segment number extraction, all route dispatching
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, serde roundtrips
+- **Error variants**: Display output for every EdgePackagerError variant
+
+To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
+
+When adding new functionality, follow the existing pattern: add `#[cfg(test)] mod tests { ... }` at the bottom of the source file, import `use super::*;`, and create small focused test functions with descriptive names.
+
 ## Coding Conventions
 
 - **No `async`/`await`**: WASI Preview 2 doesn't have a standard async runtime. All I/O is synchronous (blocking WASI calls).
@@ -132,6 +151,7 @@ All crates are chosen for WASM compatibility (no system dependencies, no async r
 - **Explicit state machines**: `ManifestPhase` and `JobState` enums drive control flow rather than implicit boolean flags.
 - **`#[derive(Serialize, Deserialize)]`** on all types that cross the Redis boundary.
 - **No `main.rs`**: This is a library crate (`crate-type = ["cdylib"]`). The WASI runtime calls the exported handler functions.
+- **Inline tests**: All tests live in `#[cfg(test)] mod tests` blocks within each source file, not in a separate `tests/` directory.
 
 ## HTTP Route Table
 

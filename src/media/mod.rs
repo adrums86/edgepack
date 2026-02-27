@@ -62,3 +62,50 @@ impl TrackType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fourcc_is_4_bytes() {
+        assert_eq!(std::mem::size_of::<FourCC>(), 4);
+    }
+
+    #[test]
+    fn box_type_constants_are_correct() {
+        assert_eq!(&box_type::FTYP, b"ftyp");
+        assert_eq!(&box_type::MOOV, b"moov");
+        assert_eq!(&box_type::MOOF, b"moof");
+        assert_eq!(&box_type::MDAT, b"mdat");
+        assert_eq!(&box_type::TRAK, b"trak");
+        assert_eq!(&box_type::SINF, b"sinf");
+        assert_eq!(&box_type::SCHM, b"schm");
+        assert_eq!(&box_type::TENC, b"tenc");
+        assert_eq!(&box_type::PSSH, b"pssh");
+        assert_eq!(&box_type::SENC, b"senc");
+        assert_eq!(&box_type::TRUN, b"trun");
+    }
+
+    #[test]
+    fn track_type_video() {
+        assert_eq!(TrackType::from_handler(b"vide"), TrackType::Video);
+    }
+
+    #[test]
+    fn track_type_audio() {
+        assert_eq!(TrackType::from_handler(b"soun"), TrackType::Audio);
+    }
+
+    #[test]
+    fn track_type_subtitle() {
+        assert_eq!(TrackType::from_handler(b"subt"), TrackType::Subtitle);
+        assert_eq!(TrackType::from_handler(b"text"), TrackType::Subtitle);
+    }
+
+    #[test]
+    fn track_type_unknown() {
+        assert_eq!(TrackType::from_handler(b"hint"), TrackType::Unknown);
+        assert_eq!(TrackType::from_handler(b"meta"), TrackType::Unknown);
+    }
+}
