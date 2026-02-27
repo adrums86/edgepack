@@ -53,14 +53,19 @@ pub fn post(
     })
 }
 
-/// Send an HTTP request. Dispatches to WASI or native stub based on target.
+/// Send an HTTP request. Dispatches to WASI, reqwest (sandbox), or native stub.
 fn send(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
     #[cfg(target_arch = "wasm32")]
     {
         send_wasi(req)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
+    {
+        send_reqwest(req)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
         send_native_stub(req)
     }
@@ -204,10 +209,57 @@ fn wasi_err(context: &str) -> EdgePackagerError {
 }
 
 // ---------------------------------------------------------------------------
-// Native stub (non-wasm32 targets — used during development/testing)
+// Reqwest implementation (sandbox feature on non-wasm32 targets)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
+fn send_reqwest(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
+    let client = reqwest::blocking::Client::new();
+
+    let mut builder = match req.method {
+        HttpClientMethod::Get => client.get(&req.url),
+        HttpClientMethod::Post => client.post(&req.url),
+    };
+
+    for (key, value) in &req.headers {
+        builder = builder.header(key, value);
+    }
+
+    if let Some(body) = req.body {
+        builder = builder.body(body);
+    }
+
+    let response = builder.send().map_err(|e| EdgePackagerError::Http {
+        status: 0,
+        message: format!("HTTP request failed: {e}"),
+    })?;
+
+    let status = response.status().as_u16();
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let body = response
+        .bytes()
+        .map_err(|e| EdgePackagerError::Http {
+            status,
+            message: format!("failed to read response body: {e}"),
+        })?
+        .to_vec();
+
+    Ok(HttpClientResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Native stub (non-wasm32 targets without sandbox — used during testing)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 fn send_native_stub(_req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
     Err(EdgePackagerError::Http {
         status: 0,
@@ -219,6 +271,7 @@ fn send_native_stub(_req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "sandbox"))]
     #[test]
     fn get_returns_error_on_native() {
         let result = get("https://example.com", &[]);
@@ -227,6 +280,7 @@ mod tests {
         assert!(err.contains("only available in WASI"));
     }
 
+    #[cfg(not(feature = "sandbox"))]
     #[test]
     fn post_returns_error_on_native() {
         let result = post(
