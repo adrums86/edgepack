@@ -148,3 +148,251 @@ impl ProgressiveOutput {
         format!("public, max-age={vod_max_age}, immutable")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_drm_info() -> ManifestDrmInfo {
+        ManifestDrmInfo {
+            widevine_pssh: Some("WV_PSSH".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            default_kid: "00112233445566778899aabbccddeeff".into(),
+        }
+    }
+
+    #[test]
+    fn new_starts_in_awaiting_state() {
+        let po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            make_drm_info(),
+        );
+        assert_eq!(po.manifest_state().phase, ManifestPhase::AwaitingFirstSegment);
+        assert_eq!(po.manifest_state().content_id, "c1");
+        assert_eq!(po.manifest_state().format, OutputFormat::Hls);
+        assert!(po.manifest_state().drm_info.is_some());
+    }
+
+    #[test]
+    fn set_init_segment_stores_data() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00, 0x01, 0x02]);
+        assert!(po.init_segment_data().is_some());
+        assert_eq!(po.init_segment_data().unwrap(), &[0x00, 0x01, 0x02]);
+        assert!(po.manifest_state().init_segment.is_some());
+        let init = po.manifest_state().init_segment.as_ref().unwrap();
+        assert_eq!(init.uri, "/base/init.mp4");
+        assert_eq!(init.byte_size, 3);
+    }
+
+    #[test]
+    fn add_first_segment_transitions_to_live() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+
+        let manifest = po.add_segment(0, vec![0xAA; 100], 6.006);
+        assert!(manifest.is_some());
+        assert_eq!(po.manifest_state().phase, ManifestPhase::Live);
+        assert_eq!(po.manifest_state().segments.len(), 1);
+        assert_eq!(po.manifest_state().segments[0].number, 0);
+    }
+
+    #[test]
+    fn add_subsequent_segment_stays_live() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 100], 6.0);
+        po.add_segment(1, vec![0xBB; 100], 6.0);
+
+        assert_eq!(po.manifest_state().phase, ManifestPhase::Live);
+        assert_eq!(po.manifest_state().segments.len(), 2);
+    }
+
+    #[test]
+    fn finalize_transitions_to_complete() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 100], 6.0);
+
+        let manifest = po.finalize();
+        assert!(manifest.is_some());
+        assert_eq!(po.manifest_state().phase, ManifestPhase::Complete);
+        assert!(po.manifest_state().is_complete());
+    }
+
+    #[test]
+    fn finalize_hls_manifest_contains_endlist() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 100], 6.0);
+
+        let manifest = po.finalize().unwrap();
+        assert!(manifest.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn finalize_dash_manifest_static() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Dash,
+            "/base/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 100], 6.0);
+
+        let manifest = po.finalize().unwrap();
+        assert!(manifest.contains("type=\"static\""));
+    }
+
+    #[test]
+    fn current_manifest_none_when_awaiting() {
+        let po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/".into(),
+            make_drm_info(),
+        );
+        assert!(po.current_manifest().is_none());
+    }
+
+    #[test]
+    fn current_manifest_some_when_live() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        assert!(po.current_manifest().is_some());
+    }
+
+    #[test]
+    fn segment_data_lookup() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        po.add_segment(1, vec![0xBB; 60], 6.0);
+
+        assert!(po.segment_data(0).is_some());
+        assert_eq!(po.segment_data(0).unwrap().len(), 50);
+        assert!(po.segment_data(1).is_some());
+        assert_eq!(po.segment_data(1).unwrap().len(), 60);
+        assert!(po.segment_data(2).is_none());
+    }
+
+    #[test]
+    fn target_duration_updates_when_longer_segment() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        assert!((po.manifest_state().target_duration - 6.0).abs() < f64::EPSILON);
+
+        po.add_segment(0, vec![0xAA; 50], 8.0);
+        assert!((po.manifest_state().target_duration - 8.0).abs() < f64::EPSILON);
+
+        // Shorter segment shouldn't lower target duration
+        po.add_segment(1, vec![0xBB; 50], 4.0);
+        assert!((po.manifest_state().target_duration - 8.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn segment_uri_format() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/repackage/c1/hls/".into(),
+            make_drm_info(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(5, vec![0xAA; 50], 6.0);
+        assert_eq!(
+            po.manifest_state().segments[0].uri,
+            "/repackage/c1/hls/segment_5.cmfv"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_control_awaiting() {
+        let po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), make_drm_info());
+        assert_eq!(po.manifest_cache_control(31536000, 1), "no-cache");
+    }
+
+    #[test]
+    fn manifest_cache_control_live() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), make_drm_info());
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        assert_eq!(
+            po.manifest_cache_control(31536000, 1),
+            "public, max-age=1, s-maxage=1"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_control_complete() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), make_drm_info());
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        po.finalize();
+        assert_eq!(
+            po.manifest_cache_control(31536000, 1),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn segment_cache_control_always_immutable() {
+        assert_eq!(
+            ProgressiveOutput::segment_cache_control(31536000),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn segment_cache_control_custom_max_age() {
+        assert_eq!(
+            ProgressiveOutput::segment_cache_control(86400),
+            "public, max-age=86400, immutable"
+        );
+    }
+}

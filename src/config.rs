@@ -133,3 +133,120 @@ fn env_var(name: &str) -> Result<String> {
 fn env_var_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_config_defaults() {
+        let c = CacheConfig::default();
+        assert_eq!(c.vod_max_age, 31_536_000);
+        assert_eq!(c.live_manifest_max_age, 1);
+        assert_eq!(c.drm_key_ttl, 86_400);
+        assert_eq!(c.job_state_ttl, 172_800);
+    }
+
+    #[test]
+    fn drm_system_ids_defaults() {
+        let ids = DrmSystemIds::default();
+        assert!(ids.widevine);
+        assert!(ids.playready);
+    }
+
+    #[test]
+    fn cache_config_serializes_roundtrip() {
+        let c = CacheConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let c2: CacheConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(c2.vod_max_age, c.vod_max_age);
+        assert_eq!(c2.live_manifest_max_age, c.live_manifest_max_age);
+    }
+
+    #[test]
+    fn redis_backend_type_serializes() {
+        let http = RedisBackendType::Http;
+        let json = serde_json::to_string(&http).unwrap();
+        assert!(json.contains("Http"));
+
+        let tcp = RedisBackendType::Tcp;
+        let json = serde_json::to_string(&tcp).unwrap();
+        assert!(json.contains("Tcp"));
+    }
+
+    #[test]
+    fn speke_auth_bearer_serializes() {
+        let auth = SpekeAuth::Bearer("my-token".into());
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("my-token"));
+        let roundtrip: SpekeAuth = serde_json::from_str(&json).unwrap();
+        match roundtrip {
+            SpekeAuth::Bearer(t) => assert_eq!(t, "my-token"),
+            _ => panic!("expected Bearer"),
+        }
+    }
+
+    #[test]
+    fn speke_auth_api_key_serializes() {
+        let auth = SpekeAuth::ApiKey {
+            header: "x-api-key".into(),
+            value: "secret".into(),
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        let roundtrip: SpekeAuth = serde_json::from_str(&json).unwrap();
+        match roundtrip {
+            SpekeAuth::ApiKey { header, value } => {
+                assert_eq!(header, "x-api-key");
+                assert_eq!(value, "secret");
+            }
+            _ => panic!("expected ApiKey"),
+        }
+    }
+
+    #[test]
+    fn speke_auth_basic_serializes() {
+        let auth = SpekeAuth::Basic {
+            username: "user".into(),
+            password: "pass".into(),
+        };
+        let json = serde_json::to_string(&auth).unwrap();
+        let roundtrip: SpekeAuth = serde_json::from_str(&json).unwrap();
+        match roundtrip {
+            SpekeAuth::Basic { username, password } => {
+                assert_eq!(username, "user");
+                assert_eq!(password, "pass");
+            }
+            _ => panic!("expected Basic"),
+        }
+    }
+
+    #[test]
+    fn env_var_missing_returns_config_error() {
+        let result = env_var("EDGE_PACKAGER_TEST_NONEXISTENT_VAR_12345");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("missing env var"));
+    }
+
+    #[test]
+    fn env_var_or_returns_default_when_missing() {
+        let val = env_var_or("EDGE_PACKAGER_TEST_NONEXISTENT_VAR_12345", "fallback");
+        assert_eq!(val, "fallback");
+    }
+
+    #[test]
+    fn env_var_or_returns_set_value() {
+        std::env::set_var("EDGE_PACKAGER_TEST_ENVVAR_OR", "actual");
+        let val = env_var_or("EDGE_PACKAGER_TEST_ENVVAR_OR", "fallback");
+        assert_eq!(val, "actual");
+        std::env::remove_var("EDGE_PACKAGER_TEST_ENVVAR_OR");
+    }
+
+    #[test]
+    fn from_env_fails_without_required_vars() {
+        // Make sure the required vars are NOT set
+        std::env::remove_var("REDIS_URL");
+        let result = AppConfig::from_env();
+        assert!(result.is_err());
+    }
+}

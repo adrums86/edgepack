@@ -46,11 +46,46 @@ target/wasm32-wasip2/release/edge_packager.wasm
 
 ### Running Tests
 
-Tests run on the native host target (not WASM):
+Tests run on the native host target (not WASM), since the test harness cannot execute inside a WASI runtime:
 
 ```bash
 cargo test --target $(rustc -vV | grep host | awk '{print $2}')
 ```
+
+On Apple Silicon Macs, this is equivalent to:
+
+```bash
+cargo test --target aarch64-apple-darwin
+```
+
+On x86-64 Linux:
+
+```bash
+cargo test --target x86_64-unknown-linux-gnu
+```
+
+The project includes 287 unit tests covering every module. To run tests for a specific module:
+
+```bash
+# Run all tests in the drm module
+cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::
+
+# Run a single test by name
+cargo test --target $(rustc -vV | grep host | awk '{print $2}') handler::tests::route_health_check
+```
+
+#### Test Coverage Summary
+
+| Module | Tests | What's Covered |
+|--------|-------|----------------|
+| `error` | 16 | Error display strings, Result alias |
+| `config` | 11 | Defaults, serde roundtrips, env var loading |
+| `cache` | 17 | CacheKeys formatting, backend factory, stub errors |
+| `drm` | 51 | System IDs, CPIX XML roundtrips, CBCS decrypt, CENC encrypt/decrypt, SPEKE client, auth headers |
+| `media` | 53 | FourCC types, ISOBMFF box parsing/building/iteration, init segment rewriting, segment rewriting, IV padding |
+| `manifest` | 48 | HLS/DASH rendering for all lifecycle phases, DRM signaling, variant streams, ISO 8601 duration, KID formatting |
+| `repackager` | 38 | Job types/serde, progressive output state machine, cache-control headers, key set caching roundtrips |
+| `handler` | 53 | HTTP routing, path parsing, format validation, segment number parsing, webhook validation, response construction |
 
 ## Configuration
 

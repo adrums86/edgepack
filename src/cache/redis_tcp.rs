@@ -47,3 +47,31 @@ impl CacheBackend for RedisTcpBackend {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_succeeds() {
+        let backend = RedisTcpBackend::new("redis://localhost:6379", "password");
+        assert!(backend.is_ok());
+    }
+
+    #[test]
+    fn all_operations_return_not_implemented() {
+        let backend = RedisTcpBackend::new("redis://localhost:6379", "password").unwrap();
+
+        assert!(backend.get("key").is_err());
+        assert!(backend.set("key", b"value", 60).is_err());
+        assert!(backend.exists("key").is_err());
+        assert!(backend.delete("key").is_err());
+    }
+
+    #[test]
+    fn error_message_suggests_http_backend() {
+        let backend = RedisTcpBackend::new("redis://localhost:6379", "password").unwrap();
+        let err = backend.get("key").unwrap_err();
+        assert!(err.to_string().contains("use HTTP backend"));
+    }
+}

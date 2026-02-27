@@ -137,3 +137,195 @@ impl ManifestState {
         self.phase == ManifestPhase::Complete
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_format_content_type_hls() {
+        assert_eq!(OutputFormat::Hls.content_type(), "application/vnd.apple.mpegurl");
+    }
+
+    #[test]
+    fn output_format_content_type_dash() {
+        assert_eq!(OutputFormat::Dash.content_type(), "application/dash+xml");
+    }
+
+    #[test]
+    fn output_format_manifest_extension_hls() {
+        assert_eq!(OutputFormat::Hls.manifest_extension(), "m3u8");
+    }
+
+    #[test]
+    fn output_format_manifest_extension_dash() {
+        assert_eq!(OutputFormat::Dash.manifest_extension(), "mpd");
+    }
+
+    #[test]
+    fn output_format_serde_roundtrip() {
+        let hls = OutputFormat::Hls;
+        let json = serde_json::to_string(&hls).unwrap();
+        let parsed: OutputFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, hls);
+
+        let dash = OutputFormat::Dash;
+        let json = serde_json::to_string(&dash).unwrap();
+        let parsed: OutputFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, dash);
+    }
+
+    #[test]
+    fn output_format_equality() {
+        assert_eq!(OutputFormat::Hls, OutputFormat::Hls);
+        assert_eq!(OutputFormat::Dash, OutputFormat::Dash);
+        assert_ne!(OutputFormat::Hls, OutputFormat::Dash);
+    }
+
+    #[test]
+    fn segment_info_construction() {
+        let seg = SegmentInfo {
+            number: 5,
+            duration: 6.006,
+            uri: "segment_5.cmfv".to_string(),
+            byte_size: 1024,
+        };
+        assert_eq!(seg.number, 5);
+        assert!((seg.duration - 6.006).abs() < f64::EPSILON);
+        assert_eq!(seg.uri, "segment_5.cmfv");
+        assert_eq!(seg.byte_size, 1024);
+    }
+
+    #[test]
+    fn segment_info_serde_roundtrip() {
+        let seg = SegmentInfo {
+            number: 3,
+            duration: 4.004,
+            uri: "segment_3.cmfv".to_string(),
+            byte_size: 2048,
+        };
+        let json = serde_json::to_string(&seg).unwrap();
+        let parsed: SegmentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.number, 3);
+        assert!((parsed.duration - 4.004).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn init_segment_info_construction() {
+        let init = InitSegmentInfo {
+            uri: "init.mp4".to_string(),
+            byte_size: 512,
+        };
+        assert_eq!(init.uri, "init.mp4");
+        assert_eq!(init.byte_size, 512);
+    }
+
+    #[test]
+    fn variant_info_video() {
+        let v = VariantInfo {
+            id: "v1".to_string(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".to_string(),
+            resolution: Some((1920, 1080)),
+            frame_rate: Some(30.0),
+            track_type: TrackMediaType::Video,
+        };
+        assert_eq!(v.track_type, TrackMediaType::Video);
+        assert_eq!(v.resolution, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn variant_info_audio() {
+        let v = VariantInfo {
+            id: "a1".to_string(),
+            bandwidth: 128_000,
+            codecs: "mp4a.40.2".to_string(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Audio,
+        };
+        assert_eq!(v.track_type, TrackMediaType::Audio);
+        assert!(v.resolution.is_none());
+    }
+
+    #[test]
+    fn track_media_type_equality() {
+        assert_eq!(TrackMediaType::Video, TrackMediaType::Video);
+        assert_eq!(TrackMediaType::Audio, TrackMediaType::Audio);
+        assert_ne!(TrackMediaType::Video, TrackMediaType::Audio);
+    }
+
+    #[test]
+    fn manifest_drm_info_construction() {
+        let drm = ManifestDrmInfo {
+            widevine_pssh: Some("AAAA".to_string()),
+            playready_pssh: Some("BBBB".to_string()),
+            playready_pro: None,
+            default_kid: "0123456789abcdef0123456789abcdef".to_string(),
+        };
+        assert!(drm.widevine_pssh.is_some());
+        assert!(drm.playready_pssh.is_some());
+        assert!(drm.playready_pro.is_none());
+        assert_eq!(drm.default_kid.len(), 32);
+    }
+
+    #[test]
+    fn manifest_phase_values() {
+        assert_eq!(ManifestPhase::AwaitingFirstSegment, ManifestPhase::AwaitingFirstSegment);
+        assert_eq!(ManifestPhase::Live, ManifestPhase::Live);
+        assert_eq!(ManifestPhase::Complete, ManifestPhase::Complete);
+        assert_ne!(ManifestPhase::AwaitingFirstSegment, ManifestPhase::Live);
+        assert_ne!(ManifestPhase::Live, ManifestPhase::Complete);
+    }
+
+    #[test]
+    fn manifest_state_new_defaults() {
+        let state = ManifestState::new("test-content".into(), OutputFormat::Hls, "/base/".into());
+        assert_eq!(state.content_id, "test-content");
+        assert_eq!(state.format, OutputFormat::Hls);
+        assert_eq!(state.phase, ManifestPhase::AwaitingFirstSegment);
+        assert!(state.init_segment.is_none());
+        assert!(state.segments.is_empty());
+        assert!((state.target_duration - 6.0).abs() < f64::EPSILON);
+        assert!(state.variants.is_empty());
+        assert!(state.drm_info.is_none());
+        assert_eq!(state.media_sequence, 0);
+        assert_eq!(state.base_url, "/base/");
+    }
+
+    #[test]
+    fn manifest_state_is_complete() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Dash, "/".into());
+        assert!(!state.is_complete());
+
+        state.phase = ManifestPhase::Live;
+        assert!(!state.is_complete());
+
+        state.phase = ManifestPhase::Complete;
+        assert!(state.is_complete());
+    }
+
+    #[test]
+    fn manifest_state_serde_roundtrip() {
+        let mut state = ManifestState::new("content-1".into(), OutputFormat::Hls, "/base/".into());
+        state.phase = ManifestPhase::Live;
+        state.segments.push(SegmentInfo {
+            number: 0,
+            duration: 6.0,
+            uri: "segment_0.cmfv".to_string(),
+            byte_size: 1024,
+        });
+        state.init_segment = Some(InitSegmentInfo {
+            uri: "init.mp4".into(),
+            byte_size: 256,
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: ManifestState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.content_id, "content-1");
+        assert_eq!(parsed.format, OutputFormat::Hls);
+        assert_eq!(parsed.phase, ManifestPhase::Live);
+        assert_eq!(parsed.segments.len(), 1);
+        assert!(parsed.init_segment.is_some());
+    }
+}

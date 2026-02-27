@@ -238,3 +238,208 @@ fn format_kid_with_hyphens(kid_hex: &str) -> String {
         &kid_hex[20..32]
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::types::*;
+
+    fn make_state(phase: ManifestPhase) -> ManifestState {
+        let mut s = ManifestState::new("content-1".into(), OutputFormat::Dash, "/base/".into());
+        s.phase = phase;
+        s
+    }
+
+    fn make_live_state_with_segments(count: u32) -> ManifestState {
+        let mut s = make_state(ManifestPhase::Live);
+        s.init_segment = Some(InitSegmentInfo {
+            uri: "/base/init.mp4".into(),
+            byte_size: 256,
+        });
+        for i in 0..count {
+            s.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("/base/segment_{i}.cmfv"),
+                byte_size: 1024,
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn format_iso8601_duration_zero() {
+        assert_eq!(format_iso8601_duration(0.0), "PT0S");
+        assert_eq!(format_iso8601_duration(-1.0), "PT0S");
+    }
+
+    #[test]
+    fn format_iso8601_duration_seconds_only() {
+        let result = format_iso8601_duration(30.5);
+        assert!(result.starts_with("PT"));
+        assert!(result.contains("S"));
+        assert!(!result.contains("H"));
+        assert!(!result.contains("M"));
+    }
+
+    #[test]
+    fn format_iso8601_duration_minutes_and_seconds() {
+        let result = format_iso8601_duration(90.0);
+        assert!(result.starts_with("PT"));
+        assert!(result.contains("1M"));
+        assert!(result.contains("S"));
+    }
+
+    #[test]
+    fn format_iso8601_duration_hours() {
+        let result = format_iso8601_duration(3661.0);
+        assert!(result.contains("1H"));
+        assert!(result.contains("1M"));
+        assert!(result.contains("S"));
+    }
+
+    #[test]
+    fn format_kid_with_hyphens_valid() {
+        let kid = "0123456789abcdef0123456789abcdef";
+        let result = format_kid_with_hyphens(kid);
+        assert_eq!(result, "01234567-89ab-cdef-0123-456789abcdef");
+    }
+
+    #[test]
+    fn format_kid_with_hyphens_short() {
+        let kid = "0123";
+        let result = format_kid_with_hyphens(kid);
+        assert_eq!(result, "0123"); // returned unchanged
+    }
+
+    #[test]
+    fn format_kid_with_hyphens_long() {
+        let kid = "0123456789abcdef0123456789abcdef00";
+        let result = format_kid_with_hyphens(kid);
+        assert_eq!(result, kid); // returned unchanged (34 chars)
+    }
+
+    #[test]
+    fn render_awaiting_returns_minimal() {
+        let state = make_state(ManifestPhase::AwaitingFirstSegment);
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("<?xml"));
+        assert!(!mpd.contains("<MPD"));
+    }
+
+    #[test]
+    fn render_live_dynamic_type() {
+        let state = make_live_state_with_segments(2);
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("type=\"dynamic\""));
+        assert!(mpd.contains("minimumUpdatePeriod=\"PT1S\""));
+        assert!(mpd.contains("availabilityStartTime="));
+        assert!(mpd.contains("<Period"));
+        assert!(mpd.contains("<AdaptationSet"));
+        assert!(mpd.contains("<SegmentTemplate"));
+        assert!(mpd.contains("<SegmentTimeline"));
+        assert!(mpd.contains("</MPD>"));
+    }
+
+    #[test]
+    fn render_complete_static_type() {
+        let mut state = make_live_state_with_segments(3);
+        state.phase = ManifestPhase::Complete;
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("type=\"static\""));
+        assert!(mpd.contains("mediaPresentationDuration="));
+        assert!(!mpd.contains("minimumUpdatePeriod"));
+    }
+
+    #[test]
+    fn render_with_drm_content_protection() {
+        let mut state = make_live_state_with_segments(1);
+        state.drm_info = Some(ManifestDrmInfo {
+            widevine_pssh: Some("WVDATA".into()),
+            playready_pssh: Some("PRDATA".into()),
+            playready_pro: Some("<pro>data</pro>".into()),
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("urn:mpeg:dash:mp4protection:2011"));
+        assert!(mpd.contains("value=\"cenc\""));
+        assert!(mpd.contains("cenc:default_KID=\"01234567-89ab-cdef-0123-456789abcdef\""));
+        assert!(mpd.contains("urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"));
+        assert!(mpd.contains("<cenc:pssh>WVDATA</cenc:pssh>"));
+        assert!(mpd.contains("urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95"));
+        assert!(mpd.contains("<cenc:pssh>PRDATA</cenc:pssh>"));
+        assert!(mpd.contains("<mspr:pro><pro>data</pro></mspr:pro>"));
+    }
+
+    #[test]
+    fn render_segment_timeline_durations() {
+        let state = make_live_state_with_segments(3);
+        let mpd = render(&state).unwrap();
+        let s_count = mpd.matches("<S d=").count();
+        assert_eq!(s_count, 3);
+        assert!(mpd.contains("<S d=\"6000\"/>"));
+    }
+
+    #[test]
+    fn render_with_video_variants() {
+        let mut state = make_live_state_with_segments(1);
+        state.variants.push(VariantInfo {
+            id: "v720".into(),
+            bandwidth: 3_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: Some((1280, 720)),
+            frame_rate: Some(30.0),
+            track_type: TrackMediaType::Video,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("contentType=\"video\""));
+        assert!(mpd.contains("id=\"v720\""));
+        assert!(mpd.contains("bandwidth=\"3000000\""));
+        assert!(mpd.contains("codecs=\"avc1.64001f\""));
+        assert!(mpd.contains("width=\"1280\""));
+        assert!(mpd.contains("height=\"720\""));
+    }
+
+    #[test]
+    fn render_with_audio_variants() {
+        let mut state = make_live_state_with_segments(1);
+        state.variants.push(VariantInfo {
+            id: "a1".into(),
+            bandwidth: 128_000,
+            codecs: "mp4a.40.2".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Audio,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("contentType=\"audio\""));
+        assert!(mpd.contains("id=\"a1\""));
+        assert!(mpd.contains("bandwidth=\"128000\""));
+    }
+
+    #[test]
+    fn render_default_video_adaptation_set_when_no_variants() {
+        let state = make_live_state_with_segments(1);
+        let mpd = render(&state).unwrap();
+        // Should still have a video AdaptationSet with default representation
+        assert!(mpd.contains("contentType=\"video\""));
+        assert!(mpd.contains("bandwidth=\"2000000\""));
+    }
+
+    #[test]
+    fn render_profiles() {
+        let state = make_live_state_with_segments(1);
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("urn:mpeg:dash:profile:isoff-live:2011"));
+        assert!(mpd.contains("urn:mpeg:dash:profile:cmaf:2019"));
+    }
+
+    #[test]
+    fn render_namespaces() {
+        let state = make_live_state_with_segments(1);
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("xmlns=\"urn:mpeg:dash:schema:mpd:2011\""));
+        assert!(mpd.contains("xmlns:cenc=\"urn:mpeg:cenc:2013\""));
+        assert!(mpd.contains("xmlns:mspr=\"urn:microsoft:playready\""));
+    }
+}

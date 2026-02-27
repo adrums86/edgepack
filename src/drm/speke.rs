@@ -99,3 +99,115 @@ impl SpekeClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DrmSystemIds;
+    use url::Url;
+
+    fn make_config(auth: SpekeAuth, widevine: bool, playready: bool) -> DrmConfig {
+        DrmConfig {
+            speke_url: Url::parse("https://drm.example.com/speke").unwrap(),
+            speke_auth: auth,
+            system_ids: DrmSystemIds { widevine, playready },
+        }
+    }
+
+    #[test]
+    fn new_with_both_systems() {
+        let config = make_config(SpekeAuth::Bearer("tok".into()), true, true);
+        let client = SpekeClient::new(&config);
+        assert_eq!(client.system_ids.len(), 2);
+        assert!(client.system_ids.contains(&system_ids::WIDEVINE));
+        assert!(client.system_ids.contains(&system_ids::PLAYREADY));
+    }
+
+    #[test]
+    fn new_with_widevine_only() {
+        let config = make_config(SpekeAuth::Bearer("tok".into()), true, false);
+        let client = SpekeClient::new(&config);
+        assert_eq!(client.system_ids.len(), 1);
+        assert_eq!(client.system_ids[0], system_ids::WIDEVINE);
+    }
+
+    #[test]
+    fn new_with_playready_only() {
+        let config = make_config(SpekeAuth::Bearer("tok".into()), false, true);
+        let client = SpekeClient::new(&config);
+        assert_eq!(client.system_ids.len(), 1);
+        assert_eq!(client.system_ids[0], system_ids::PLAYREADY);
+    }
+
+    #[test]
+    fn new_with_no_systems() {
+        let config = make_config(SpekeAuth::Bearer("tok".into()), false, false);
+        let client = SpekeClient::new(&config);
+        assert!(client.system_ids.is_empty());
+    }
+
+    #[test]
+    fn new_preserves_endpoint() {
+        let config = make_config(SpekeAuth::Bearer("tok".into()), true, true);
+        let client = SpekeClient::new(&config);
+        assert_eq!(client.endpoint, "https://drm.example.com/speke");
+    }
+
+    #[test]
+    fn auth_header_bearer() {
+        let config = make_config(SpekeAuth::Bearer("my-token".into()), true, true);
+        let client = SpekeClient::new(&config);
+        let (header, value) = client.build_auth_header();
+        assert_eq!(header, "Authorization");
+        assert_eq!(value, "Bearer my-token");
+    }
+
+    #[test]
+    fn auth_header_api_key() {
+        let config = make_config(
+            SpekeAuth::ApiKey {
+                header: "x-api-key".into(),
+                value: "secret123".into(),
+            },
+            true,
+            true,
+        );
+        let client = SpekeClient::new(&config);
+        let (header, value) = client.build_auth_header();
+        assert_eq!(header, "x-api-key");
+        assert_eq!(value, "secret123");
+    }
+
+    #[test]
+    fn auth_header_basic() {
+        let config = make_config(
+            SpekeAuth::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            },
+            true,
+            true,
+        );
+        let client = SpekeClient::new(&config);
+        let (header, value) = client.build_auth_header();
+        assert_eq!(header, "Authorization");
+        assert!(value.starts_with("Basic "));
+        // Decode and verify
+        let encoded = value.strip_prefix("Basic ").unwrap();
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            encoded,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "user:pass");
+    }
+
+    #[test]
+    fn request_keys_returns_not_implemented() {
+        let config = make_config(SpekeAuth::Bearer("tok".into()), true, true);
+        let client = SpekeClient::new(&config);
+        let result = client.request_keys("content-1", &[[0x01; 16]]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not yet implemented"));
+    }
+}
