@@ -138,6 +138,22 @@ impl ManifestState {
     }
 }
 
+/// Parsed source manifest information (input side).
+///
+/// Extracted from an HLS M3U8 or DASH MPD source manifest. Contains
+/// the URLs needed to fetch init and media segments from the origin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceManifest {
+    /// URL of the init segment.
+    pub init_segment_url: String,
+    /// URLs of all media segments in order.
+    pub segment_urls: Vec<String>,
+    /// Duration of each media segment in seconds.
+    pub segment_durations: Vec<f64>,
+    /// Whether the source is a live/dynamic stream.
+    pub is_live: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

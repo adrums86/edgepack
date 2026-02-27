@@ -86,12 +86,13 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryptio
 |--------|-------|----------------|
 | `error` | 16 | Error display strings, Result alias |
 | `config` | 11 | Defaults, serde roundtrips, env var loading |
-| `cache` | 17 | CacheKeys formatting, backend factory, stub errors |
+| `cache` | 30 | CacheKeys formatting, backend factory, Upstash JSON response parsing, cache key helpers |
 | `drm` | 51 | System IDs, CPIX XML roundtrips, CBCS decrypt, CENC encrypt/decrypt, SPEKE client, auth headers |
 | `media` | 53 | FourCC types, ISOBMFF box parsing/building/iteration, init segment rewriting, segment rewriting, IV padding |
-| `manifest` | 48 | HLS/DASH rendering for all lifecycle phases, DRM signaling, variant streams, ISO 8601 duration, KID formatting |
-| `repackager` | 38 | Job types/serde, progressive output state machine, cache-control headers, key set caching roundtrips |
-| `handler` | 53 | HTTP routing, path parsing, format validation, segment number parsing, webhook validation, response construction |
+| `manifest` | 76 | HLS/DASH rendering for all lifecycle phases, DRM signaling, variant streams, ISO 8601 duration, KID formatting, HLS M3U8 input parsing, DASH MPD input parsing |
+| `repackager` | 41 | Job types/serde, progressive output state machine, cache-control headers, key set caching, continuation params, pipeline execution |
+| `handler` | 59 | HTTP routing, path parsing, format validation, segment number parsing, webhook validation, response construction, continue endpoint |
+| `http_client` | 5 | Response construction, native stub errors |
 
 #### Integration Test Coverage (72 tests)
 
@@ -164,15 +165,19 @@ Content-Type: application/json
 }
 ```
 
-Returns `202 Accepted` with:
+Returns `200 OK` as soon as the first segment and live manifest are published (clients can begin playback immediately):
 ```json
 {
-  "status": "accepted",
+  "status": "processing",
   "content_id": "my-content-123",
   "format": "hls",
-  "manifest_url": "/repackage/my-content-123/hls/manifest"
+  "manifest_url": "/repackage/my-content-123/hls/manifest",
+  "segments_completed": 1,
+  "segments_total": 42
 }
 ```
+
+Remaining segments are processed asynchronously via self-invocation chaining. Each invocation processes one segment and chains the next via an internal `POST /webhook/repackage/continue` endpoint.
 
 ### Job Status
 
@@ -209,6 +214,10 @@ Segments never change once written. The CDN serves them without hitting the edge
 | `ep:{id}:keys` | 24h | Cached DRM content keys |
 | `ep:{id}:{fmt}:state` | 48h | Job state and progress |
 | `ep:{id}:{fmt}:manifest_state` | 48h | Progressive manifest state (segment list, phase) |
+| `ep:{id}:{fmt}:init` | 48h | Rewritten init segment binary data |
+| `ep:{id}:{fmt}:seg:{n}` | 48h | Rewritten media segment binary data |
+| `ep:{id}:{fmt}:source` | 48h | Source manifest metadata (segment URLs, durations) |
+| `ep:{id}:{fmt}:rewrite_params` | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
 | `ep:{id}:speke` | 24h | Cached SPEKE license server responses |
 
 ## Architecture
@@ -264,17 +273,18 @@ handler/ ──► repackager/ ──► media/     (CMAF parse + rewrite)
 | `url` | URL parsing |
 | `thiserror` | Error type derivation |
 | `log` | Logging facade |
+| `wasi` | WASI Preview 2 bindings (wasm32 target only) |
 
 All dependencies are selected for WASM compatibility (no system calls, no async runtime).
 
 ## Project Status
 
-The project scaffolding, type system, and core algorithms (ISOBMFF parsing, CBCS decryption, CENC encryption, manifest generation, progressive output) are implemented and compile to WASM. The following areas require implementation to complete the runtime:
+The runtime is fully implemented and compiles to a functional WASM component:
 
-- **WASI HTTP transport**: The `wasi:http/outgoing-handler` calls for Redis, SPEKE, and origin fetching are stubbed out
-- **WASI incoming handler**: Wiring the HTTP router to `wasi:http/incoming-handler` for serving requests
-- **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing (the output renderers exist)
-- **Request handler wiring**: Connecting the GET handlers to the cache backend and pipeline
+- **WASI HTTP transport**: Shared HTTP client (`http_client.rs`) uses `wasi:http/outgoing-handler` for all outbound requests (Redis, SPEKE, origin fetching). Native builds return a stub error to preserve test builds.
+- **WASI incoming handler**: `wasi_handler.rs` bridges `wasi:http/incoming-handler` to the library router. Converts WASI request/response types and maps errors to appropriate HTTP status codes.
+- **Source manifest parsing**: HLS M3U8 (`manifest/hls_input.rs`) and DASH MPD (`manifest/dash_input.rs`) input parsers extract segment URLs, durations, init segment references, and live/VOD detection.
+- **Request handler wiring**: All GET handlers query Redis for cached segment data and manifest state. The webhook creates a `RepackagePipeline`, processes the first segment to produce a live manifest, and chains remaining processing via self-invocation.
 
 ## License
 

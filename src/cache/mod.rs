@@ -52,6 +52,26 @@ impl CacheKeys {
     pub fn speke_response(content_id: &str) -> String {
         format!("ep:{content_id}:speke")
     }
+
+    /// Rewritten init segment binary data.
+    pub fn init_segment(content_id: &str, format: &str) -> String {
+        format!("ep:{content_id}:{format}:init")
+    }
+
+    /// Rewritten media segment binary data.
+    pub fn media_segment(content_id: &str, format: &str, number: u32) -> String {
+        format!("ep:{content_id}:{format}:seg:{number}")
+    }
+
+    /// Serialized source manifest metadata (for continuation chaining).
+    pub fn source_manifest(content_id: &str, format: &str) -> String {
+        format!("ep:{content_id}:{format}:source")
+    }
+
+    /// Serialized segment rewrite parameters (for continuation chaining).
+    pub fn rewrite_params(content_id: &str, format: &str) -> String {
+        format!("ep:{content_id}:{format}:rewrite_params")
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +105,28 @@ mod tests {
     #[test]
     fn cache_keys_speke_response() {
         assert_eq!(CacheKeys::speke_response("abc"), "ep:abc:speke");
+    }
+
+    #[test]
+    fn cache_keys_init_segment() {
+        assert_eq!(CacheKeys::init_segment("abc", "hls"), "ep:abc:hls:init");
+        assert_eq!(CacheKeys::init_segment("abc", "dash"), "ep:abc:dash:init");
+    }
+
+    #[test]
+    fn cache_keys_media_segment() {
+        assert_eq!(CacheKeys::media_segment("abc", "hls", 0), "ep:abc:hls:seg:0");
+        assert_eq!(CacheKeys::media_segment("abc", "dash", 42), "ep:abc:dash:seg:42");
+    }
+
+    #[test]
+    fn cache_keys_source_manifest() {
+        assert_eq!(CacheKeys::source_manifest("abc", "hls"), "ep:abc:hls:source");
+    }
+
+    #[test]
+    fn cache_keys_rewrite_params() {
+        assert_eq!(CacheKeys::rewrite_params("abc", "dash"), "ep:abc:dash:rewrite_params");
     }
 
     #[test]

@@ -52,33 +52,28 @@ impl SpekeClient {
 
     /// POST a CPIX document to the SPEKE endpoint.
     ///
-    /// In a WASI environment, this uses `wasi:http/outgoing-handler`.
+    /// Uses the shared HTTP client (WASI outgoing-handler on wasm32).
     fn post_cpix(&self, body: &str) -> Result<String> {
-        // Build HTTP request:
-        // POST {endpoint}
-        // Content-Type: application/xml
-        // Authorization: Bearer {token}  (or appropriate auth header)
-        //
-        // {CPIX XML body}
+        let (auth_header_name, auth_header_value) = self.build_auth_header();
+        let headers = vec![
+            ("Content-Type".to_string(), "application/xml".to_string()),
+            (auth_header_name, auth_header_value),
+        ];
 
-        let _endpoint = &self.endpoint;
-        let _content_type = "application/xml";
-        let _auth_header = self.build_auth_header();
-        let _body = body;
+        let response =
+            crate::http_client::post(&self.endpoint, &headers, body.as_bytes().to_vec())
+                .map_err(|e| EdgePackagerError::Speke(format!("SPEKE HTTP request failed: {e}")))?;
 
-        // TODO: Implement using wasi:http/outgoing-handler
-        //
-        // 1. Create outgoing HTTP request to SPEKE endpoint
-        // 2. Set Content-Type: application/xml
-        // 3. Set auth header (Bearer, API key, or Basic)
-        // 4. Set body to CPIX XML
-        // 5. Send via wasi:http/outgoing-handler
-        // 6. Read response body (expect 200 with CPIX XML)
-        // 7. Return response body as string
+        if response.status != 200 {
+            return Err(EdgePackagerError::Speke(format!(
+                "SPEKE server returned HTTP {}",
+                response.status
+            )));
+        }
 
-        Err(EdgePackagerError::Speke(
-            "WASI HTTP transport not yet implemented".into(),
-        ))
+        String::from_utf8(response.body).map_err(|e| {
+            EdgePackagerError::Speke(format!("SPEKE response is not valid UTF-8: {e}"))
+        })
     }
 
     fn build_auth_header(&self) -> (String, String) {
@@ -203,11 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn request_keys_returns_not_implemented() {
+    fn request_keys_returns_error_on_native() {
+        // On native targets, the HTTP client returns an error (no WASI transport),
+        // which gets wrapped as a Speke error by post_cpix.
         let config = make_config(SpekeAuth::Bearer("tok".into()), true, true);
         let client = SpekeClient::new(&config);
         let result = client.request_keys("content-1", &[[0x01; 16]]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not yet implemented"));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SPEKE HTTP request failed") || err.contains("only available in WASI"));
     }
 }

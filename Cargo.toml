@@ -21,6 +21,9 @@ url = { version = "2", features = ["serde"] }
 log = "0.4"
 cipher = "0.4"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasi = "0.14"
+
 [profile.release]
 opt-level = "s"
 lto = true
