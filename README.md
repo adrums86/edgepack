@@ -64,7 +64,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes 342 unit tests covering every module. To run tests for a specific module:
+The project includes **359 tests** (287 unit tests + 72 integration tests) covering every module. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -72,9 +72,15 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::
 
 # Run a single test by name
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') handler::tests::route_health_check
+
+# Run only integration tests
+cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
+
+# Run a specific integration test suite
+cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
 ```
 
-#### Test Coverage Summary
+#### Unit Test Coverage (287 tests)
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
@@ -87,6 +93,19 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') handler::tests::
 | `repackager` | 41 | Job types/serde, progressive output state machine, cache-control headers, key set caching, continuation params, pipeline execution |
 | `handler` | 59 | HTTP routing, path parsing, format validation, segment number parsing, webhook validation, response construction, continue endpoint |
 | `http_client` | 5 | Response construction, native stub errors |
+
+#### Integration Test Coverage (72 tests)
+
+Integration tests live in the `tests/` directory and exercise cross-module workflows with synthetic CMAF fixtures — no external services or network required.
+
+| Test Suite | Tests | What's Covered |
+|------------|-------|----------------|
+| `encryption_roundtrip` | 8 | Full CBCS→plaintext→CENC pipeline: full-sample, pattern (1:9), subsample (NAL unit), multi-sample IV uniqueness, audio (0:0 pattern), cross-segment IV isolation |
+| `isobmff_integration` | 18 | Synthetic init segment parsing and rewriting (CBCS→CENC), PSSH box generation (Widevine+PlayReady, FairPlay exclusion), senc box roundtrip (with/without subsamples), media segment decrypt→re-encrypt→verify, error handling for malformed segments |
+| `manifest_integration` | 20 | Progressive output lifecycle (HLS+DASH), manifest phase transitions, DRM signaling in manifests (Widevine/PlayReady key URIs, SAMPLE-AES-CTR, ContentProtection, cenc:pssh, mspr:pro), cache-control headers per phase, ManifestState serde roundtrip, cross-format consistency |
+| `handler_integration` | 26 | HTTP routing for all endpoints (health, manifest, init, segment, status, webhook), webhook payload validation (valid/invalid JSON, missing fields), HttpResponse helpers (ok, accepted, error, cache headers), unknown routes (404), method filtering |
+
+All integration tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data (ftyp, moov, sinf, schm, tenc, pssh, moof, traf, trun, senc, mdat) programmatically in Rust — no external test media files needed.
 
 ## Configuration
 
