@@ -1,6 +1,9 @@
 pub mod redis_http;
 pub mod redis_tcp;
 
+#[cfg(feature = "sandbox")]
+pub mod memory;
+
 use crate::config::{RedisBackendType, RedisConfig};
 use crate::error::Result;
 

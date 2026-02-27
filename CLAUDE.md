@@ -20,6 +20,9 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}')
 
 # Check without building
 cargo check
+
+# Build and run the local sandbox (native binary with web UI)
+cargo run --bin sandbox --features sandbox
 ```
 
 **Important**: `cargo test` without `--target` will try to execute the WASM binary directly, which fails with a permission error. Always pass the native host target flag.
@@ -35,8 +38,11 @@ src/
 ├── config.rs           AppConfig loaded from env vars
 ├── http_client.rs      Shared outgoing HTTP client (WASI wasi:http/outgoing-handler)
 ├── wasi_handler.rs     WASI incoming handler bridge (wasm32 only)
+├── bin/
+│   └── sandbox.rs      Local sandbox binary (Axum web UI + API, sandbox feature only)
 ├── cache/              Redis-backed application state store
 │   ├── mod.rs          CacheBackend trait + CacheKeys builder + factory
+│   ├── memory.rs       In-memory cache backend (sandbox feature only)
 │   ├── redis_http.rs   Upstash-compatible HTTP Redis (primary)
 │   └── redis_tcp.rs    TCP Redis stub (forward compatibility)
 ├── drm/                DRM key acquisition and encryption
@@ -113,6 +119,36 @@ All HTTP transport and request handling is fully implemented:
 7. **`handler/request.rs`**: All four GET handlers query Redis for cached segment data and manifest state via `HandlerContext`.
 8. **`handler/webhook.rs`**: Creates pipeline, calls `execute_first()`, fires self-invocation to `/webhook/repackage/continue`, returns 200 after first manifest publishes. Continue handler chains remaining segment processing.
 
+## Local Sandbox
+
+The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache.
+
+### Architecture
+
+- **`http_client.rs`** has a three-way `#[cfg]` dispatch: `wasm32` → WASI HTTP, `sandbox` feature → `reqwest::blocking`, neither → stub error
+- **`cache/memory.rs`** implements `CacheBackend` using `Arc<RwLock<HashMap>>` (shared between pipeline thread and API server)
+- **`src/bin/sandbox.rs`** is a single-file Axum server with embedded HTML/CSS/JS UI
+
+### Feature Gate
+
+```toml
+[features]
+sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
+```
+
+All sandbox dependencies are gated behind `cfg(not(target_arch = "wasm32"))` — they never appear in the WASM build. The `[[bin]]` entry uses `required-features = ["sandbox"]` so `cargo build` (WASM target) never compiles the sandbox.
+
+### Build & Run
+
+```bash
+cargo run --bin sandbox --features sandbox
+# Web UI at http://localhost:3333
+```
+
+### Output
+
+Pipeline output is written to `sandbox/output/{content_id}/{format}/` and also served via the API at `/api/output/{id}/{format}/{file}`.
+
 ## Dependencies
 
 | Crate | Version | Purpose |
@@ -130,14 +166,19 @@ All HTTP transport and request handling is fully implemented:
 | `thiserror` | 2 | Derive macro for error types |
 | `log` | 0.4 | Logging facade |
 | `wasi` | 0.14 | WASI Preview 2 bindings (wasm32 target only) |
+| `axum` | 0.8 | HTTP server for sandbox web UI (sandbox feature, non-wasm32 only) |
+| `tokio` | 1 | Async runtime for sandbox (sandbox feature, non-wasm32 only) |
+| `reqwest` | 0.12 | Native HTTP client for sandbox (sandbox feature, non-wasm32 only) |
+| `tower-http` | 0.6 | Static file serving for local paths (sandbox feature, non-wasm32 only) |
+| `tracing-subscriber` | 0.3 | Log output for sandbox (sandbox feature, non-wasm32 only) |
 
-All crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements).
+Core crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements). Sandbox crates are gated behind `cfg(not(target_arch = "wasm32"))` and never appear in the WASM build.
 
 ## Tests
 
-The project has **359 tests** total: 287 unit tests and 72 integration tests. All run on the native host target.
+The project has **414 tests** total: 342 unit tests and 72 integration tests. All run on the native host target.
 
-### Unit Tests (287)
+### Unit Tests (342)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -190,7 +231,7 @@ When adding new functionality, follow the existing pattern:
 - **Trait-based abstraction**: `CacheBackend` trait allows swapping Redis implementations without changing business logic.
 - **Explicit state machines**: `ManifestPhase` and `JobState` enums drive control flow rather than implicit boolean flags.
 - **`#[derive(Serialize, Deserialize)]`** on all types that cross the Redis boundary.
-- **No `main.rs`**: This is a library crate (`crate-type = ["cdylib", "rlib"]`). The WASI runtime calls the exported handler functions. The `rlib` target enables integration tests to link against the crate.
+- **No `main.rs`**: This is a library crate (`crate-type = ["cdylib", "rlib"]`). The WASI runtime calls the exported handler functions. The `rlib` target enables integration tests to link against the crate. The sandbox binary (`src/bin/sandbox.rs`) is a separate binary target gated behind `required-features = ["sandbox"]`.
 - **Two test locations**: Unit tests live inline in `#[cfg(test)] mod tests` blocks within each source file. Integration tests live in the `tests/` directory with shared fixtures in `tests/common/mod.rs`.
 
 ## HTTP Route Table

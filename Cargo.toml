@@ -7,6 +7,14 @@ description = "CDN edge WASM application for repackaging DASH/HLS CMAF media fro
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
+
+[[bin]]
+name = "sandbox"
+path = "src/bin/sandbox.rs"
+required-features = ["sandbox"]
+
 [dependencies]
 aes = "0.8"
 base64 = "0.22"
@@ -23,6 +31,13 @@ cipher = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasi = "0.14"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+reqwest = { version = "0.12", features = ["blocking"], optional = true }
+tower-http = { version = "0.6", features = ["fs"], optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
 
 [profile.release]
 opt-level = "s"

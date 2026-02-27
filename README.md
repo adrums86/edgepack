@@ -64,7 +64,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **359 tests** (287 unit tests + 72 integration tests) covering every module. To run tests for a specific module:
+The project includes **414 tests** (342 unit tests + 72 integration tests) covering every module. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -80,13 +80,13 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
 ```
 
-#### Unit Test Coverage (287 tests)
+#### Unit Test Coverage (342 tests)
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
 | `error` | 16 | Error display strings, Result alias |
 | `config` | 11 | Defaults, serde roundtrips, env var loading |
-| `cache` | 30 | CacheKeys formatting, backend factory, Upstash JSON response parsing, cache key helpers |
+| `cache` | 39 | CacheKeys formatting, backend factory, Upstash JSON response parsing, in-memory cache ops |
 | `drm` | 51 | System IDs, CPIX XML roundtrips, CBCS decrypt, CENC encrypt/decrypt, SPEKE client, auth headers |
 | `media` | 53 | FourCC types, ISOBMFF box parsing/building/iteration, init segment rewriting, segment rewriting, IV padding |
 | `manifest` | 76 | HLS/DASH rendering for all lifecycle phases, DRM signaling, variant streams, ISO 8601 duration, KID formatting, HLS M3U8 input parsing, DASH MPD input parsing |
@@ -276,6 +276,65 @@ handler/ ──► repackager/ ──► media/     (CMAF parse + rewrite)
 | `wasi` | WASI Preview 2 bindings (wasm32 target only) |
 
 All dependencies are selected for WASM compatibility (no system calls, no async runtime).
+
+### Sandbox-Only Dependencies
+
+These are only included when building with `--features sandbox` and are gated behind `cfg(not(target_arch = "wasm32"))` — they never appear in the WASM build.
+
+| Crate | Purpose |
+|-------|---------|
+| `axum` | HTTP server for sandbox web UI |
+| `tokio` | Async runtime for Axum |
+| `reqwest` | Native HTTP client (replaces WASI HTTP transport) |
+| `tower-http` | Static file serving for local manifest files |
+| `tracing-subscriber` | Log output for sandbox |
+
+## Local Sandbox
+
+The sandbox lets you test the full repackaging pipeline locally without deploying to a CDN edge. It reuses the same `RepackagePipeline` as the production WASM build, but with `reqwest` for HTTP transport and an in-memory cache instead of Redis.
+
+### Running
+
+```bash
+cargo run --bin sandbox --features sandbox
+```
+
+The web UI is available at **http://localhost:3333**.
+
+### What You Need
+
+- A source manifest URL (HLS `.m3u8` or DASH `.mpd`) pointing to CBCS-encrypted CMAF content
+- A SPEKE 2.0 license server endpoint URL and credentials (bearer token, API key, or basic auth)
+
+You can also use a local file path (e.g. `./content/master.m3u8`) — the sandbox automatically starts a local HTTP server to serve the directory.
+
+### How It Works
+
+1. The web UI collects source URL, SPEKE credentials, and output format
+2. The sandbox builds an `AppConfig` and `RepackageRequest`, then runs `RepackagePipeline::execute()` in a blocking thread
+3. The pipeline fetches the source manifest, gets DRM keys via SPEKE, and repackages all segments
+4. Progress is polled from the shared in-memory cache via `/api/status/{id}/{format}`
+5. On completion, output is written to disk at `sandbox/output/{content_id}/{format}/`
+
+### Output Structure
+
+```
+sandbox/output/{content_id}/{format}/
+├── manifest.m3u8   (or manifest.mpd)
+├── init.mp4
+├── segment_0.cmfv
+├── segment_1.cmfv
+└── ...
+```
+
+### Sandbox API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Web UI |
+| POST | `/api/repackage` | Start repackaging job |
+| GET | `/api/status/{id}/{format}` | Poll job progress |
+| GET | `/api/output/{id}/{format}/{file}` | Serve output files |
 
 ## Project Status
 
