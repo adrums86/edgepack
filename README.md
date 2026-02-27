@@ -64,7 +64,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **414 tests** (342 unit tests + 72 integration tests) covering every module. To run tests for a specific module:
+The project includes **432 tests** (360 unit tests + 72 integration tests) covering every module. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -80,17 +80,17 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
 ```
 
-#### Unit Test Coverage (342 tests)
+#### Unit Test Coverage (360 tests)
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
 | `error` | 16 | Error display strings, Result alias |
 | `config` | 11 | Defaults, serde roundtrips, env var loading |
-| `cache` | 39 | CacheKeys formatting, backend factory, Upstash JSON response parsing, in-memory cache ops |
+| `cache` | 53 | CacheKeys formatting, backend factory, Upstash JSON response parsing, in-memory cache ops, encrypted backend (AES-256-GCM roundtrip, tamper detection, key sensitivity patterns, key derivation) |
 | `drm` | 51 | System IDs, CPIX XML roundtrips, CBCS decrypt, CENC encrypt/decrypt, SPEKE client, auth headers |
 | `media` | 53 | FourCC types, ISOBMFF box parsing/building/iteration, init segment rewriting, segment rewriting, IV padding |
 | `manifest` | 76 | HLS/DASH rendering for all lifecycle phases, DRM signaling, variant streams, ISO 8601 duration, KID formatting, HLS M3U8 input parsing, DASH MPD input parsing |
-| `repackager` | 41 | Job types/serde, progressive output state machine, cache-control headers, key set caching, continuation params, pipeline execution |
+| `repackager` | 45 | Job types/serde, progressive output state machine, cache-control headers, key set caching, continuation params, pipeline execution, sensitive data cleanup |
 | `handler` | 59 | HTTP routing, path parsing, format validation, segment number parsing, webhook validation, response construction, continue endpoint |
 | `http_client` | 5 | Response construction, native stub errors |
 
@@ -209,16 +209,24 @@ Segments never change once written. The CDN serves them without hitting the edge
 
 ### Redis (application state)
 
-| Key | TTL | Purpose |
-|-----|-----|---------|
-| `ep:{id}:keys` | 24h | Cached DRM content keys |
-| `ep:{id}:{fmt}:state` | 48h | Job state and progress |
-| `ep:{id}:{fmt}:manifest_state` | 48h | Progressive manifest state (segment list, phase) |
-| `ep:{id}:{fmt}:init` | 48h | Rewritten init segment binary data |
-| `ep:{id}:{fmt}:seg:{n}` | 48h | Rewritten media segment binary data |
-| `ep:{id}:{fmt}:source` | 48h | Source manifest metadata (segment URLs, durations) |
-| `ep:{id}:{fmt}:rewrite_params` | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
-| `ep:{id}:speke` | 24h | Cached SPEKE license server responses |
+| Key | TTL | Sensitive | Purpose |
+|-----|-----|-----------|---------|
+| `ep:{id}:keys` | 24h | **Yes** | Cached DRM content keys |
+| `ep:{id}:{fmt}:state` | 48h | No | Job state and progress |
+| `ep:{id}:{fmt}:manifest_state` | 48h | No | Progressive manifest state (segment list, phase) |
+| `ep:{id}:{fmt}:init` | 48h | No | Rewritten init segment binary data |
+| `ep:{id}:{fmt}:seg:{n}` | 48h | No | Rewritten media segment binary data |
+| `ep:{id}:{fmt}:source` | 48h | No | Source manifest metadata (segment URLs, durations) |
+| `ep:{id}:{fmt}:rewrite_params` | 48h | **Yes** | Continuation parameters (encryption keys, IV sizes, pattern) |
+| `ep:{id}:speke` | 24h | **Yes** | Cached SPEKE license server responses |
+
+### Security Model
+
+Sensitive cache entries (marked **Yes** above) are protected with two layers:
+
+1. **Encryption at rest** — All sensitive values are encrypted with AES-256-GCM before being stored in Redis. The encryption key is derived from the `REDIS_TOKEN` using AES-128-ECB as a PRF on two distinct constant blocks, producing 32 bytes of key material. Wire format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`. Non-sensitive keys pass through unencrypted.
+
+2. **Immediate cleanup** — As soon as the pipeline finishes processing all segments (whether via `execute()`, `execute_first()` for single-segment content, or `execute_remaining()` for the final segment), all sensitive cache entries are explicitly deleted. This ensures DRM keys, SPEKE responses, and rewrite parameters do not persist in Redis beyond the active processing window. Cleanup failures are intentionally swallowed so they cannot prevent the pipeline from reporting success.
 
 ## Architecture
 
@@ -266,6 +274,7 @@ handler/ ──► repackager/ ──► media/     (CMAF parse + rewrite)
 | Crate | Purpose |
 |-------|---------|
 | `aes`, `cbc`, `ctr`, `cipher` | AES encryption/decryption (CBCS and CENC) |
+| `aes-gcm` | AES-256-GCM authenticated encryption for cache-at-rest security |
 | `quick-xml` | CPIX XML and DASH MPD parsing/generation |
 | `serde`, `serde_json` | Serialization for config, Redis, webhooks |
 | `base64` | Key encoding in CPIX, PSSH data in manifests |

@@ -135,6 +135,9 @@ impl RepackagePipeline {
             )?;
         }
 
+        // Clean up sensitive cache entries now that processing is complete
+        self.cleanup_sensitive_data(content_id, format);
+
         Ok(JobStatus {
             content_id: content_id.clone(),
             format,
@@ -261,6 +264,8 @@ impl RepackagePipeline {
             .set(&CacheKeys::manifest_state(content_id, &fmt), &state_json, ttl)?;
 
         let state = if is_last {
+            // Single-segment content: clean up immediately since execute_remaining() won't run
+            self.cleanup_sensitive_data(content_id, format);
             JobState::Complete
         } else {
             JobState::Processing
@@ -388,6 +393,8 @@ impl RepackagePipeline {
 
         let completed = (i + 1) as u32;
         let state = if is_last {
+            // Final segment: clean up all sensitive cache data
+            self.cleanup_sensitive_data(content_id, format);
             JobState::Complete
         } else {
             JobState::Processing
@@ -490,6 +497,22 @@ impl RepackagePipeline {
             .map_err(|e| EdgePackagerError::Cache(format!("serialize job state: {e}")))?;
         let key = CacheKeys::job_state(content_id, &format_str(format));
         self.cache.set(&key, &json, self.config.cache.job_state_ttl)
+    }
+
+    /// Delete all sensitive cache entries for a completed job.
+    ///
+    /// Removes DRM keys, SPEKE response, rewrite params, and source manifest
+    /// metadata. Non-sensitive data (job state, manifest state, init/media
+    /// segments) is left for CDN serving.
+    ///
+    /// Cleanup errors are intentionally swallowed — they must not prevent
+    /// the pipeline from reporting success to the caller.
+    fn cleanup_sensitive_data(&self, content_id: &str, format: OutputFormat) {
+        let fmt = format_str(format);
+        let _ = self.cache.delete(&CacheKeys::drm_keys(content_id));
+        let _ = self.cache.delete(&CacheKeys::speke_response(content_id));
+        let _ = self.cache.delete(&CacheKeys::rewrite_params(content_id, &fmt));
+        let _ = self.cache.delete(&CacheKeys::source_manifest(content_id, &fmt));
     }
 }
 
@@ -671,7 +694,44 @@ impl From<CachedKeySet> for DrmKeySet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::CacheBackend;
     use crate::drm::{system_ids, DrmSystemData};
+    use std::sync::{Arc, Mutex};
+
+    /// Mock cache backend that records all `delete()` calls for verification.
+    struct SpyCacheBackend {
+        inner: std::collections::HashMap<String, Vec<u8>>,
+        deleted_keys: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SpyCacheBackend {
+        fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
+            let deleted = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    inner: std::collections::HashMap::new(),
+                    deleted_keys: Arc::clone(&deleted),
+                },
+                deleted,
+            )
+        }
+    }
+
+    impl CacheBackend for SpyCacheBackend {
+        fn get(&self, key: &str) -> crate::error::Result<Option<Vec<u8>>> {
+            Ok(self.inner.get(key).cloned())
+        }
+        fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.inner.contains_key(key))
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.deleted_keys.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+    }
 
     fn make_key_set() -> DrmKeySet {
         DrmKeySet {
@@ -875,5 +935,104 @@ mod tests {
         };
         let restored = restore_content_key(&cached);
         assert!(restored.iv.is_none());
+    }
+
+    // --- cleanup_sensitive_data tests ---
+
+    fn make_test_config() -> AppConfig {
+        use crate::config::*;
+        AppConfig {
+            redis: RedisConfig {
+                url: "unused://localhost".into(),
+                token: "test-token".into(),
+                backend: RedisBackendType::Http,
+            },
+            drm: DrmConfig {
+                speke_url: url::Url::parse("https://speke.test/v2").unwrap(),
+                speke_auth: SpekeAuth::Bearer("test".into()),
+                system_ids: DrmSystemIds::default(),
+            },
+            cache: CacheConfig::default(),
+        }
+    }
+
+    #[test]
+    fn cleanup_deletes_all_sensitive_keys_hls() {
+        let (cache, deleted) = SpyCacheBackend::new();
+        let pipeline = RepackagePipeline::new(make_test_config(), Box::new(cache));
+
+        pipeline.cleanup_sensitive_data("my-content", OutputFormat::Hls);
+
+        let keys = deleted.lock().unwrap();
+        assert_eq!(keys.len(), 4);
+        assert!(keys.contains(&"ep:my-content:keys".to_string()));
+        assert!(keys.contains(&"ep:my-content:speke".to_string()));
+        assert!(keys.contains(&"ep:my-content:hls:rewrite_params".to_string()));
+        assert!(keys.contains(&"ep:my-content:hls:source".to_string()));
+    }
+
+    #[test]
+    fn cleanup_deletes_all_sensitive_keys_dash() {
+        let (cache, deleted) = SpyCacheBackend::new();
+        let pipeline = RepackagePipeline::new(make_test_config(), Box::new(cache));
+
+        pipeline.cleanup_sensitive_data("content-42", OutputFormat::Dash);
+
+        let keys = deleted.lock().unwrap();
+        assert_eq!(keys.len(), 4);
+        assert!(keys.contains(&"ep:content-42:keys".to_string()));
+        assert!(keys.contains(&"ep:content-42:speke".to_string()));
+        assert!(keys.contains(&"ep:content-42:dash:rewrite_params".to_string()));
+        assert!(keys.contains(&"ep:content-42:dash:source".to_string()));
+    }
+
+    #[test]
+    fn cleanup_does_not_delete_non_sensitive_keys() {
+        let (cache, deleted) = SpyCacheBackend::new();
+        let pipeline = RepackagePipeline::new(make_test_config(), Box::new(cache));
+
+        pipeline.cleanup_sensitive_data("abc", OutputFormat::Hls);
+
+        let keys = deleted.lock().unwrap();
+        // Should NOT contain state, manifest_state, init, or segment keys
+        for key in keys.iter() {
+            assert!(!key.contains(":state"), "should not delete job state: {key}");
+            assert!(
+                !key.contains(":manifest_state"),
+                "should not delete manifest state: {key}"
+            );
+            assert!(
+                !key.ends_with(":init"),
+                "should not delete init segment: {key}"
+            );
+            assert!(!key.contains(":seg:"), "should not delete segments: {key}");
+        }
+    }
+
+    #[test]
+    fn cleanup_swallows_delete_errors() {
+        use crate::error::EdgePackagerError;
+
+        /// Cache backend where delete() always fails.
+        struct FailingDeleteCache;
+        impl CacheBackend for FailingDeleteCache {
+            fn get(&self, _: &str) -> crate::error::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &[u8], _: u64) -> crate::error::Result<()> {
+                Ok(())
+            }
+            fn exists(&self, _: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            fn delete(&self, _: &str) -> crate::error::Result<()> {
+                Err(EdgePackagerError::Cache("connection refused".into()))
+            }
+        }
+
+        let pipeline = RepackagePipeline::new(make_test_config(), Box::new(FailingDeleteCache));
+
+        // Should not panic — errors are swallowed with `let _ =`
+        pipeline.cleanup_sensitive_data("test", OutputFormat::Hls);
     }
 }

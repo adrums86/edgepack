@@ -1,3 +1,4 @@
+pub mod encrypted;
 pub mod redis_http;
 pub mod redis_tcp;
 
@@ -19,17 +20,23 @@ pub trait CacheBackend: Send + Sync {
 }
 
 /// Create a cache backend from configuration.
+///
+/// The returned backend automatically encrypts sensitive cache entries
+/// (DRM keys, SPEKE responses, rewrite parameters) using AES-256-GCM
+/// with a key derived from the Redis token.
 pub fn create_backend(config: &RedisConfig) -> Result<Box<dyn CacheBackend>> {
-    match config.backend {
-        RedisBackendType::Http => Ok(Box::new(redis_http::RedisHttpBackend::new(
+    let inner: Box<dyn CacheBackend> = match config.backend {
+        RedisBackendType::Http => Box::new(redis_http::RedisHttpBackend::new(
             &config.url,
             &config.token,
-        ))),
-        RedisBackendType::Tcp => Ok(Box::new(redis_tcp::RedisTcpBackend::new(
+        )),
+        RedisBackendType::Tcp => Box::new(redis_tcp::RedisTcpBackend::new(
             &config.url,
             &config.token,
-        )?)),
-    }
+        )?),
+    };
+    let enc_key = encrypted::derive_key(&config.token);
+    Ok(Box::new(encrypted::EncryptedCacheBackend::new(inner, &enc_key)))
 }
 
 /// Cache key builders for consistent key naming.

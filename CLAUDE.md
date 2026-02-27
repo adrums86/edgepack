@@ -42,6 +42,7 @@ src/
 │   └── sandbox.rs      Local sandbox binary (Axum web UI + API, sandbox feature only)
 ├── cache/              Redis-backed application state store
 │   ├── mod.rs          CacheBackend trait + CacheKeys builder + factory
+│   ├── encrypted.rs    AES-256-GCM encryption layer for sensitive cache entries
 │   ├── memory.rs       In-memory cache backend (sandbox feature only)
 │   ├── redis_http.rs   Upstash-compatible HTTP Redis (primary)
 │   └── redis_tcp.rs    TCP Redis stub (forward compatibility)
@@ -154,6 +155,7 @@ Pipeline output is written to `sandbox/output/{content_id}/{format}/` and also s
 | Crate | Version | Purpose |
 |-------|---------|---------|
 | `aes` | 0.8 | AES block cipher (CBCS + CENC) |
+| `aes-gcm` | 0.10 | AES-256-GCM authenticated encryption for cache-at-rest security |
 | `cbc` | 0.1 | CBC mode for CBCS decryption |
 | `ctr` | 0.9 | CTR mode for CENC encryption |
 | `cipher` | 0.4 | Cipher traits shared by cbc/ctr |
@@ -176,9 +178,9 @@ Core crates are chosen for WASM compatibility (no system dependencies, no async 
 
 ## Tests
 
-The project has **414 tests** total: 342 unit tests and 72 integration tests. All run on the native host target.
+The project has **432 tests** total: 360 unit tests and 72 integration tests. All run on the native host target.
 
-### Unit Tests (342)
+### Unit Tests (360)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -274,6 +276,37 @@ When adding new functionality, follow the existing pattern:
 | `ep:{content_id}:{format}:source` | 48h | Source manifest metadata (segment URLs, durations, is_live) |
 | `ep:{content_id}:{format}:rewrite_params` | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
 | `ep:{content_id}:speke` | 24h | Cached SPEKE response (avoids duplicate calls) |
+
+## Cache Security
+
+Sensitive cache entries are protected with encryption at rest and explicit cleanup:
+
+### Sensitive Keys
+
+| Key Pattern | Contains |
+|-------------|----------|
+| `ep:{id}:keys` | Raw AES-128 content keys, KIDs, IVs |
+| `ep:{id}:speke` | Full SPEKE CPIX XML response |
+| `ep:{id}:{fmt}:rewrite_params` | Source/target encryption keys + IVs + pattern config |
+
+### Encryption at Rest (`cache/encrypted.rs`)
+
+`EncryptedCacheBackend` is a decorator wrapping any `CacheBackend`. It transparently encrypts values for sensitive key patterns using AES-256-GCM before storing, and decrypts on retrieval. Non-sensitive keys pass through unmodified.
+
+- **Key derivation**: `derive_key(token)` uses AES-128-ECB as a PRF — encrypts two distinct 16-byte constant blocks with the first 16 bytes of the Redis token to produce 32 bytes of key material. No SHA-256 dependency needed.
+- **Wire format**: `nonce (12 bytes) || ciphertext || tag (16 bytes)` — standard AES-GCM output.
+- **Key sensitivity**: `is_sensitive_key(key)` matches keys ending in `:keys`, `:speke`, or `:rewrite_params`.
+- **Wiring**: `create_backend()` in `cache/mod.rs` automatically wraps the inner backend with `EncryptedCacheBackend`. The sandbox uses `derive_key("edge-packager-sandbox")` since it has no real Redis token.
+
+### Post-Processing Cleanup (`pipeline.rs`)
+
+`cleanup_sensitive_data()` explicitly deletes all four sensitive cache entries after the pipeline completes. It is called at three sites:
+
+1. **`execute()`** — after the segment loop completes
+2. **`execute_first()`** — inside the `if is_last` block (single-segment content)
+3. **`execute_remaining()`** — inside the `if is_last` block (final segment in chained processing)
+
+Cleanup errors are swallowed with `let _ =` so they cannot prevent the pipeline from returning success.
 
 ## ISOBMFF Box Types
 
