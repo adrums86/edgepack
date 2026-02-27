@@ -1,3 +1,4 @@
+use crate::drm::scheme::EncryptionScheme;
 use serde::{Deserialize, Serialize};
 
 /// Output format for the repackaged content.
@@ -71,12 +72,16 @@ pub enum TrackMediaType {
 /// DRM signaling information for manifests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestDrmInfo {
+    /// Encryption scheme used for this output.
+    pub encryption_scheme: EncryptionScheme,
     /// Widevine PSSH box (base64-encoded full box).
     pub widevine_pssh: Option<String>,
     /// PlayReady PSSH / PRO (base64-encoded).
     pub playready_pssh: Option<String>,
     /// PlayReady content protection data (XML, for DASH).
     pub playready_pro: Option<String>,
+    /// FairPlay key URI (for CBCS output with FairPlay).
+    pub fairplay_key_uri: Option<String>,
     /// Default Key ID (hex string, no hyphens).
     pub default_kid: String,
 }
@@ -152,6 +157,9 @@ pub struct SourceManifest {
     pub segment_durations: Vec<f64>,
     /// Whether the source is a live/dynamic stream.
     pub is_live: bool,
+    /// Encryption scheme detected from manifest DRM signaling.
+    /// `None` if not signaled in the manifest (will be detected from init segment instead).
+    pub source_scheme: Option<EncryptionScheme>,
 }
 
 #[cfg(test)]
@@ -274,14 +282,18 @@ mod tests {
     #[test]
     fn manifest_drm_info_construction() {
         let drm = ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
             widevine_pssh: Some("AAAA".to_string()),
             playready_pssh: Some("BBBB".to_string()),
             playready_pro: None,
+            fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".to_string(),
         };
+        assert_eq!(drm.encryption_scheme, EncryptionScheme::Cenc);
         assert!(drm.widevine_pssh.is_some());
         assert!(drm.playready_pssh.is_some());
         assert!(drm.playready_pro.is_none());
+        assert!(drm.fairplay_key_uri.is_none());
         assert_eq!(drm.default_kid.len(), 32);
     }
 

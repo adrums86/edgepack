@@ -155,9 +155,11 @@ mod tests {
 
     fn make_drm_info() -> ManifestDrmInfo {
         ManifestDrmInfo {
+            encryption_scheme: crate::drm::scheme::EncryptionScheme::Cenc,
             widevine_pssh: Some("WV_PSSH".into()),
             playready_pssh: None,
             playready_pro: None,
+            fairplay_key_uri: None,
             default_kid: "00112233445566778899aabbccddeeff".into(),
         }
     }

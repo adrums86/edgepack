@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edge-packager** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF media from CBCS encryption (FairPlay/Widevine/PlayReady) into CENC encryption (Widevine/PlayReady only), producing progressive HLS or DASH output. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys.
+**edge-packager** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF media between encryption schemes (CBCS ↔ CENC), producing progressive HLS or DASH output. The target encryption scheme is configurable per request, supporting CBCS→CENC, CENC→CBCS, CENC→CENC, and CBCS→CBCS transforms with automatic source scheme detection. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys.
 
 ## Build Commands
 
@@ -48,10 +48,12 @@ src/
 │   └── redis_tcp.rs    TCP Redis stub (forward compatibility)
 ├── drm/                DRM key acquisition and encryption
 │   ├── mod.rs          ContentKey, DrmSystemData, DrmKeySet types + system ID constants
+│   ├── scheme.rs       EncryptionScheme enum (Cbcs/Cenc) + scheme-specific helpers
+│   ├── sample_cryptor.rs  SampleDecryptor/SampleEncryptor traits + factory functions
 │   ├── speke.rs        SPEKE 2.0 HTTP client
 │   ├── cpix.rs         CPIX XML request builder + response parser
-│   ├── cbcs.rs         AES-128-CBC pattern decryption (CBCS scheme)
-│   └── cenc.rs         AES-128-CTR encryption (CENC scheme)
+│   ├── cbcs.rs         AES-128-CBC pattern decryption + encryption (CBCS scheme)
+│   └── cenc.rs         AES-128-CTR encryption + decryption (CENC scheme)
 ├── media/              ISOBMFF/CMAF container handling
 │   ├── mod.rs          FourCC type, box_type constants, TrackType enum
 │   ├── cmaf.rs         Zero-copy MP4 box parser, builders, iterators
@@ -87,14 +89,19 @@ Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md).
 
 ### Encryption Transform
 
-The core transform is CBCS → CENC on CMAF segments:
+The core transform is scheme-configurable on CMAF segments (source and target schemes determined at runtime):
 1. Parse `senc` box → get per-sample IVs and subsample maps
-2. Decrypt `mdat` using AES-128-CBC with pattern (crypt_byte_block:skip_byte_block)
-3. Re-encrypt `mdat` using AES-128-CTR (no pattern, full sample encryption)
-4. Rewrite `senc` box with new sequential IVs
+2. Decrypt `mdat` using source scheme (`create_decryptor()` dispatches to CBCS or CENC)
+3. Re-encrypt `mdat` using target scheme (`create_encryptor()` dispatches to CBCS or CENC)
+4. Rewrite `senc` box with new IVs (size depends on target scheme: 16 bytes for CBCS, 8 bytes for CENC)
 5. Rebuild `moof` + `mdat`
 
-Init segments require rewriting `sinf`/`schm`/`tenc`/`pssh` boxes and removing FairPlay PSSH.
+Init segments require rewriting `sinf`/`schm`/`tenc`/`pssh` boxes. The `schm` box type and `tenc` parameters (IV size, pattern) are set based on the target `EncryptionScheme`. PSSH boxes are filtered per target scheme (FairPlay included for CBCS output, excluded for CENC output).
+
+**Scheme-specific behaviour:**
+- **CBCS**: AES-128-CBC, pattern encryption (1:9 video, 0:0 audio), 16-byte IVs, supports FairPlay
+- **CENC**: AES-128-CTR, full encryption (no pattern), 8-byte IVs, Widevine + PlayReady only
+- Source scheme auto-detected from init segment `schm` box or manifest DRM signaling
 
 ### Progressive Manifest Output
 
@@ -182,19 +189,24 @@ Core crates are chosen for WASM compatibility (no system dependencies, no async 
 
 ## Tests
 
-The project has **432 tests** total: 360 unit tests and 72 integration tests. All run on the native host target.
+The project has **495 tests** total: 423 unit tests and 72 integration tests. All run on the native host target.
 
-### Unit Tests (360)
+### Unit Tests (423)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
-- **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads)
-- **Encryption correctness**: CBCS decrypt and CENC encrypt/decrypt with known-answer tests and roundtrips
+- **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads, encryption schemes, continuation params)
+- **Encryption scheme abstraction**: `EncryptionScheme` enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags), `SampleDecryptor`/`SampleEncryptor` trait dispatch via factory functions
+- **Encryption correctness**: CBCS decrypt + encrypt, CENC encrypt + decrypt, scheme-agnostic roundtrips through factory functions
 - **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
-- **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase (AwaitingFirstSegment, Live, Complete), DRM signaling, variant streams
+- **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme)
+- **Segment rewriting**: Scheme-aware decrypt/re-encrypt with configurable source/target scheme and pattern
+- **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering
+- **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements
 - **Progressive output state machine**: Phase transitions, cache-control header generation, segment URI formatting
+- **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion
 - **HTTP routing**: Path parsing, format validation, segment number extraction, all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, serde roundtrips
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, invalid scheme rejection, serde roundtrips
 - **Error variants**: Display output for every EdgePackagerError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
@@ -331,4 +343,38 @@ The parser handles these box types (defined in `media::box_type`):
 | PlayReady | `9a04f079-9840-4286-ab92-e65be0885f95` | `drm::system_ids::PLAYREADY` |
 | FairPlay | `94ce86fb-07ff-4f43-adb8-93d2fa968ca2` | `drm::system_ids::FAIRPLAY` |
 
-FairPlay is recognised in input (CBCS source) but excluded from output (CENC target).
+FairPlay is recognised in both input and output. For CENC target output, FairPlay PSSH boxes are excluded (FairPlay does not support CENC). For CBCS target output, FairPlay PSSH boxes are included alongside Widevine and PlayReady.
+
+## Refactoring Roadmap
+
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phase 1 is complete. Remaining phases:
+
+### Phase 2: Container Format Flexibility (CMAF + fMP4)
+- Create `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`)
+- Add ftyp brand rewriting in `src/media/init.rs`
+- Wire `container_format` through `RepackageRequest`, `WebhookPayload`, manifest renderers
+- Update segment URI extensions and MIME types per container format
+- Estimated: ~170 new LOC, ~100 modified LOC, ~25 new tests
+
+### Phase 3: Dual-Scheme Output
+- Multi-rendition: `target_schemes: Vec<EncryptionScheme>` producing separate segment sets per scheme
+- Scheme-suffixed cache keys (`ep:{id}:{fmt}:cenc:seg:{n}`)
+- Dual-encrypted segments: single segment encrypted with both CBCS and CENC (multiple sinf boxes)
+- Multi-variant HLS master playlist and multi-AdaptationSet DASH MPD
+- Estimated: ~380 new LOC, ~200 modified LOC, ~35 new tests
+
+### Phase 4: Full Remux (Sample-Level mdat Access)
+- Create `src/media/samples.rs` for sample-level parsing/rebuilding
+- Segment boundary restructuring at sync points
+- Timescale parsing from mdhd/mvhd boxes
+- Variable segment count support in progressive output
+- Estimated: ~610 new LOC, ~80 modified LOC, ~40 new tests
+
+### Phase 5: Compatibility Validation & Hardening
+- Create `src/media/compat.rs` for target compatibility checking (e.g. Chromium 53+)
+- Codec detection from stsd sample entries
+- Pipeline validation hooks for early rejection of incompatible configs
+- New error variants: `Compatibility`, `UnsupportedCodec`
+- Estimated: ~260 new LOC, ~45 modified LOC, ~30 new tests
+
+Full plan details: `.claude/plans/radiant-plotting-badger.md`

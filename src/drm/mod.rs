@@ -1,6 +1,8 @@
 pub mod cbcs;
 pub mod cenc;
 pub mod cpix;
+pub mod sample_cryptor;
+pub mod scheme;
 pub mod speke;
 
 /// Well-known DRM system IDs (UUIDs).

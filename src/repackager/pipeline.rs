@@ -1,5 +1,6 @@
 use crate::cache::{CacheBackend, CacheKeys};
 use crate::config::AppConfig;
+use crate::drm::scheme::EncryptionScheme;
 use crate::drm::speke::SpekeClient;
 use crate::drm::{ContentKey, DrmKeySet};
 use crate::error::{EdgePackagerError, Result};
@@ -50,13 +51,20 @@ impl RepackagePipeline {
         let protection_info = init::parse_protection_info(&init_data)?
             .ok_or_else(|| EdgePackagerError::Drm("source content is not encrypted".into()))?;
 
-        // Verify source is CBCS
-        if &protection_info.scheme_type != b"cbcs" {
-            return Err(EdgePackagerError::Drm(format!(
-                "expected CBCS encryption, found {:?}",
+        // Detect source encryption scheme
+        let source_scheme = EncryptionScheme::from_scheme_type(&protection_info.scheme_type)
+            .ok_or_else(|| EdgePackagerError::Drm(format!(
+                "unsupported encryption scheme: {:?}",
                 std::str::from_utf8(&protection_info.scheme_type)
-            )));
-        }
+            )))?;
+
+        let target_scheme = request.target_scheme;
+        let target_iv_size = target_scheme.default_iv_size();
+        let target_pattern = target_scheme.default_video_pattern();
+        let source_pattern = (
+            protection_info.tenc.default_crypt_byte_block,
+            protection_info.tenc.default_skip_byte_block,
+        );
 
         // Step 3: Get content keys via SPEKE 2.0
         let key_ids = vec![protection_info.tenc.default_kid];
@@ -66,13 +74,12 @@ impl RepackagePipeline {
         let source_key = find_key_for_kid(&key_set, &protection_info.tenc.default_kid)?;
         let target_key = source_key.clone(); // Same key, different encryption scheme
 
-        // Step 5: Rewrite init segment (CBCS -> CENC)
-        let target_iv_size = 8u8;
-        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_iv_size)?;
+        // Step 5: Rewrite init segment for target scheme
+        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern)?;
 
         // Step 6: Set up progressive output
         let base_url = format!("/repackage/{content_id}/{}/", format_str(format));
-        let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid);
+        let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid, target_scheme);
         let mut progressive =
             ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info);
 
@@ -94,10 +101,12 @@ impl RepackagePipeline {
             let params = SegmentRewriteParams {
                 source_key: source_key.clone(),
                 target_key: target_key.clone(),
+                source_scheme,
+                target_scheme,
                 source_iv_size: protection_info.tenc.default_per_sample_iv_size,
                 target_iv_size,
-                crypt_byte_block: protection_info.tenc.default_crypt_byte_block,
-                skip_byte_block: protection_info.tenc.default_skip_byte_block,
+                source_pattern,
+                target_pattern,
                 constant_iv: protection_info.tenc.default_constant_iv.clone(),
                 segment_number: i as u32,
             };
@@ -174,12 +183,20 @@ impl RepackagePipeline {
         let protection_info = init::parse_protection_info(&init_data)?
             .ok_or_else(|| EdgePackagerError::Drm("source content is not encrypted".into()))?;
 
-        if &protection_info.scheme_type != b"cbcs" {
-            return Err(EdgePackagerError::Drm(format!(
-                "expected CBCS encryption, found {:?}",
+        // Detect source encryption scheme
+        let source_scheme = EncryptionScheme::from_scheme_type(&protection_info.scheme_type)
+            .ok_or_else(|| EdgePackagerError::Drm(format!(
+                "unsupported encryption scheme: {:?}",
                 std::str::from_utf8(&protection_info.scheme_type)
-            )));
-        }
+            )))?;
+
+        let target_scheme = request.target_scheme;
+        let target_iv_size = target_scheme.default_iv_size();
+        let target_pattern = target_scheme.default_video_pattern();
+        let source_pattern = (
+            protection_info.tenc.default_crypt_byte_block,
+            protection_info.tenc.default_skip_byte_block,
+        );
 
         // Step 3: Get DRM keys
         let key_ids = vec![protection_info.tenc.default_kid];
@@ -188,7 +205,6 @@ impl RepackagePipeline {
         // Step 4: Build and store rewrite parameters for continuation
         let source_key = find_key_for_kid(&key_set, &protection_info.tenc.default_kid)?;
         let target_key = source_key.clone();
-        let target_iv_size = 8u8;
 
         let continuation = ContinuationParams {
             source_key: CachedKey {
@@ -201,10 +217,12 @@ impl RepackagePipeline {
                 key: target_key.key.clone(),
                 iv: target_key.iv.clone(),
             },
+            source_scheme,
+            target_scheme,
             source_iv_size: protection_info.tenc.default_per_sample_iv_size,
             target_iv_size,
-            crypt_byte_block: protection_info.tenc.default_crypt_byte_block,
-            skip_byte_block: protection_info.tenc.default_skip_byte_block,
+            source_pattern,
+            target_pattern,
             constant_iv: protection_info.tenc.default_constant_iv.clone(),
         };
         let cont_json = serde_json::to_vec(&continuation)
@@ -212,8 +230,8 @@ impl RepackagePipeline {
         self.cache
             .set(&CacheKeys::rewrite_params(content_id, &fmt), &cont_json, ttl)?;
 
-        // Step 5: Rewrite init segment
-        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_iv_size)?;
+        // Step 5: Rewrite init segment for target scheme
+        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern)?;
 
         // Store init segment in Redis
         self.cache
@@ -221,7 +239,7 @@ impl RepackagePipeline {
 
         // Step 6: Set up progressive output
         let base_url = format!("/repackage/{content_id}/{fmt}/");
-        let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid);
+        let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid, target_scheme);
         let mut progressive =
             ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info);
         progressive.set_init_segment(new_init);
@@ -233,10 +251,12 @@ impl RepackagePipeline {
         let params = SegmentRewriteParams {
             source_key,
             target_key,
+            source_scheme,
+            target_scheme,
             source_iv_size: protection_info.tenc.default_per_sample_iv_size,
             target_iv_size,
-            crypt_byte_block: protection_info.tenc.default_crypt_byte_block,
-            skip_byte_block: protection_info.tenc.default_skip_byte_block,
+            source_pattern,
+            target_pattern,
             constant_iv: protection_info.tenc.default_constant_iv.clone(),
             segment_number: 0,
         };
@@ -349,10 +369,12 @@ impl RepackagePipeline {
         let params = SegmentRewriteParams {
             source_key,
             target_key,
+            source_scheme: continuation.source_scheme,
+            target_scheme: continuation.target_scheme,
             source_iv_size: continuation.source_iv_size,
             target_iv_size: continuation.target_iv_size,
-            crypt_byte_block: continuation.crypt_byte_block,
-            skip_byte_block: continuation.skip_byte_block,
+            source_pattern: continuation.source_pattern,
+            target_pattern: continuation.target_pattern,
             constant_iv: continuation.constant_iv.clone(),
             segment_number: i as u32,
         };
@@ -533,6 +555,7 @@ fn find_key_for_kid(key_set: &DrmKeySet, kid: &[u8; 16]) -> Result<ContentKey> {
 fn build_manifest_drm_info(
     key_set: &DrmKeySet,
     kid: &[u8; 16],
+    target_scheme: EncryptionScheme,
 ) -> ManifestDrmInfo {
     let b64 = &base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -573,10 +596,23 @@ fn build_manifest_drm_info(
         .find(|d| d.system_id == crate::drm::system_ids::PLAYREADY)
         .and_then(|d| d.content_protection_data.clone());
 
+    // For CBCS output, include FairPlay key URI if available
+    let fairplay_key_uri = if target_scheme == EncryptionScheme::Cbcs {
+        key_set
+            .drm_systems
+            .iter()
+            .find(|d| d.system_id == crate::drm::system_ids::FAIRPLAY)
+            .and_then(|d| d.content_protection_data.clone())
+    } else {
+        None
+    };
+
     ManifestDrmInfo {
+        encryption_scheme: target_scheme,
         widevine_pssh,
         playready_pssh,
         playready_pro,
+        fairplay_key_uri,
         default_kid: kid_hex,
     }
 }
@@ -630,10 +666,12 @@ struct CachedDrmSystem {
 struct ContinuationParams {
     source_key: CachedKey,
     target_key: CachedKey,
+    source_scheme: EncryptionScheme,
+    target_scheme: EncryptionScheme,
     source_iv_size: u8,
     target_iv_size: u8,
-    crypt_byte_block: u8,
-    skip_byte_block: u8,
+    source_pattern: (u8, u8),
+    target_pattern: (u8, u8),
     constant_iv: Option<Vec<u8>>,
 }
 
@@ -844,11 +882,13 @@ mod tests {
     fn build_manifest_drm_info_widevine_and_playready() {
         let key_set = make_key_set();
         let kid = [0x01; 16];
-        let info = build_manifest_drm_info(&key_set, &kid);
+        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
 
         assert!(info.widevine_pssh.is_some());
         assert!(info.playready_pssh.is_some());
         assert!(info.playready_pro.is_some());
+        assert_eq!(info.encryption_scheme, EncryptionScheme::Cenc);
+        assert!(info.fairplay_key_uri.is_none());
         assert_eq!(info.default_kid.len(), 32);
         assert!(info.default_kid.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -860,11 +900,12 @@ mod tests {
             drm_systems: vec![],
         };
         let kid = [0x01; 16];
-        let info = build_manifest_drm_info(&key_set, &kid);
+        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
 
         assert!(info.widevine_pssh.is_none());
         assert!(info.playready_pssh.is_none());
         assert!(info.playready_pro.is_none());
+        assert!(info.fairplay_key_uri.is_none());
     }
 
     #[test]
@@ -875,8 +916,48 @@ mod tests {
         };
         let kid = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let info = build_manifest_drm_info(&key_set, &kid);
+        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
         assert_eq!(info.default_kid, "0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn build_manifest_drm_info_cbcs_includes_fairplay() {
+        let key_set = DrmKeySet {
+            keys: vec![],
+            drm_systems: vec![
+                DrmSystemData {
+                    system_id: system_ids::FAIRPLAY,
+                    kid: [0x01; 16],
+                    pssh_data: vec![],
+                    content_protection_data: Some("skd://fairplay-key-uri".into()),
+                },
+            ],
+        };
+        let kid = [0x01; 16];
+        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cbcs);
+
+        assert_eq!(info.encryption_scheme, EncryptionScheme::Cbcs);
+        assert_eq!(info.fairplay_key_uri, Some("skd://fairplay-key-uri".into()));
+    }
+
+    #[test]
+    fn build_manifest_drm_info_cenc_excludes_fairplay() {
+        let key_set = DrmKeySet {
+            keys: vec![],
+            drm_systems: vec![
+                DrmSystemData {
+                    system_id: system_ids::FAIRPLAY,
+                    kid: [0x01; 16],
+                    pssh_data: vec![],
+                    content_protection_data: Some("skd://fairplay-key-uri".into()),
+                },
+            ],
+        };
+        let kid = [0x01; 16];
+        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
+
+        assert_eq!(info.encryption_scheme, EncryptionScheme::Cenc);
+        assert!(info.fairplay_key_uri.is_none());
     }
 
     #[test]
@@ -892,19 +973,23 @@ mod tests {
                 key: vec![0xAA; 16],
                 iv: None,
             },
+            source_scheme: EncryptionScheme::Cbcs,
+            target_scheme: EncryptionScheme::Cenc,
             source_iv_size: 8,
             target_iv_size: 8,
-            crypt_byte_block: 1,
-            skip_byte_block: 9,
+            source_pattern: (1, 9),
+            target_pattern: (0, 0),
             constant_iv: Some(vec![0xCC; 16]),
         };
 
         let json = serde_json::to_string(&params).unwrap();
         let parsed: ContinuationParams = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.source_key.kid.len(), 16);
+        assert_eq!(parsed.source_scheme, EncryptionScheme::Cbcs);
+        assert_eq!(parsed.target_scheme, EncryptionScheme::Cenc);
         assert_eq!(parsed.source_iv_size, 8);
-        assert_eq!(parsed.crypt_byte_block, 1);
-        assert_eq!(parsed.skip_byte_block, 9);
+        assert_eq!(parsed.source_pattern, (1, 9));
+        assert_eq!(parsed.target_pattern, (0, 0));
         assert!(parsed.constant_iv.is_some());
     }
 

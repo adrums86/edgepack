@@ -190,6 +190,7 @@ async fn handle_repackage(
         content_id: content_id.clone(),
         source_url,
         output_format,
+        target_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
         key_ids: vec![],
     };
 

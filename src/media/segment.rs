@@ -1,5 +1,5 @@
-use crate::drm::cbcs::CbcsDecryptor;
-use crate::drm::cenc::{self, CencEncryptor};
+use crate::drm::sample_cryptor::{create_decryptor, create_encryptor};
+use crate::drm::scheme::EncryptionScheme;
 use crate::drm::ContentKey;
 use crate::error::{EdgePackagerError, Result};
 use crate::media::box_type;
@@ -7,32 +7,38 @@ use crate::media::cmaf::{
     self, iterate_boxes, parse_senc, parse_trun, BoxHeader, SencEntry, TrackRunBox,
 };
 
-/// Parameters for repackaging a media segment from CBCS to CENC.
+/// Parameters for repackaging a media segment between encryption schemes.
+///
+/// Supports any combination: CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS.
 pub struct SegmentRewriteParams {
-    /// Source content key (CBCS) for decryption.
+    /// Source content key for decryption.
     pub source_key: ContentKey,
-    /// Target content key (CENC) for encryption.
+    /// Target content key for encryption.
     pub target_key: ContentKey,
+    /// Source encryption scheme.
+    pub source_scheme: EncryptionScheme,
+    /// Target encryption scheme.
+    pub target_scheme: EncryptionScheme,
     /// Per-sample IV size from source tenc box.
     pub source_iv_size: u8,
-    /// Per-sample IV size for CENC output (8 or 16).
+    /// Per-sample IV size for output.
     pub target_iv_size: u8,
-    /// CBCS pattern: crypt byte blocks.
-    pub crypt_byte_block: u8,
-    /// CBCS pattern: skip byte blocks.
-    pub skip_byte_block: u8,
+    /// Source encryption pattern: (crypt_byte_block, skip_byte_block).
+    pub source_pattern: (u8, u8),
+    /// Target encryption pattern: (crypt_byte_block, skip_byte_block).
+    pub target_pattern: (u8, u8),
     /// Constant IV from tenc (for CBCS when per_sample_iv_size == 0).
     pub constant_iv: Option<Vec<u8>>,
-    /// Segment sequence number (used for generating CENC IVs).
+    /// Segment sequence number (used for generating IVs).
     pub segment_number: u32,
 }
 
-/// Rewrite a media segment (moof + mdat) from CBCS to CENC.
+/// Rewrite a media segment (moof + mdat) between encryption schemes.
 ///
 /// 1. Parse moof to find senc (sample encryption) and trun (sample sizes)
-/// 2. Decrypt mdat samples using CBCS
-/// 3. Re-encrypt using CENC
-/// 4. Rewrite moof with new senc box (CENC IVs)
+/// 2. Decrypt mdat samples using the source scheme
+/// 3. Re-encrypt using the target scheme
+/// 4. Rewrite moof with new senc box (new IVs)
 /// 5. Return rewritten moof + mdat
 pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Result<Vec<u8>> {
     // Find moof and mdat boxes
@@ -70,15 +76,13 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
     let mdat_payload = &mdat_bytes[mdat_header.header_size as usize..];
     let mut decrypted_data = mdat_payload.to_vec();
 
-    // Decrypt each sample using CBCS
-    let cbcs = CbcsDecryptor::new(
-        params.source_key.key.clone().try_into().map_err(|_| {
-            EdgePackagerError::Encryption("source key must be 16 bytes".into())
-        })?,
-        params.crypt_byte_block,
-        params.skip_byte_block,
-    );
+    // Create scheme-appropriate decryptor
+    let source_key_bytes: [u8; 16] = params.source_key.key.clone().try_into().map_err(|_| {
+        EdgePackagerError::Encryption("source key must be 16 bytes".into())
+    })?;
+    let decryptor = create_decryptor(params.source_scheme, source_key_bytes, params.source_pattern);
 
+    // Decrypt each sample
     let mut sample_offset = 0usize;
     for (i, entry) in senc_box.entries.iter().enumerate() {
         let sample_size = sample_sizes.get(i).copied().unwrap_or(0) as usize;
@@ -102,8 +106,12 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
             ));
         };
 
-        // Pad IV to 16 bytes for CBCS (CBC requires 16-byte IV)
-        let iv_16 = pad_iv_to_16(&iv);
+        // Pad IV to 16 bytes if source is CBCS (CBC requires 16-byte IV)
+        let decryption_iv = if params.source_scheme == EncryptionScheme::Cbcs {
+            pad_iv_to_16(&iv)
+        } else {
+            iv
+        };
 
         let subsamples: Option<Vec<(u32, u32)>> = entry.subsamples.as_ref().map(|subs| {
             subs.iter()
@@ -111,15 +119,15 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
                 .collect()
         });
 
-        cbcs.decrypt_sample(sample_data, &iv_16, subsamples.as_deref())?;
+        decryptor.decrypt_sample(sample_data, &decryption_iv, subsamples.as_deref())?;
         sample_offset += sample_size;
     }
 
-    // Re-encrypt each sample using CENC
-    let target_key: [u8; 16] = params.target_key.key.clone().try_into().map_err(|_| {
+    // Create scheme-appropriate encryptor
+    let target_key_bytes: [u8; 16] = params.target_key.key.clone().try_into().map_err(|_| {
         EdgePackagerError::Encryption("target key must be 16 bytes".into())
     })?;
-    let cenc_enc = CencEncryptor::new(target_key);
+    let encryptor = create_encryptor(params.target_scheme, target_key_bytes, params.target_pattern);
 
     let mut new_senc_entries = Vec::with_capacity(senc_box.entries.len());
     sample_offset = 0;
@@ -128,22 +136,21 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
         let sample_size = sample_sizes.get(i).copied().unwrap_or(0) as usize;
         let sample_data = &mut decrypted_data[sample_offset..sample_offset + sample_size];
 
-        // Generate CENC IV for this sample
-        let new_iv = cenc::generate_sample_iv(params.segment_number, i as u32);
+        // Generate IV for the target scheme
+        let new_iv = encryptor.generate_iv(params.segment_number, i as u32);
 
-        // For CENC, we may preserve subsample structure (required for video NALUs)
-        // but use CTR mode encryption instead of CBC pattern
+        // Preserve subsample structure (required for video NALUs)
         let subsamples: Option<Vec<(u32, u32)>> = entry.subsamples.as_ref().map(|subs| {
             subs.iter()
                 .map(|s| (s.clear_bytes as u32, s.encrypted_bytes))
                 .collect()
         });
 
-        cenc_enc.encrypt_sample(sample_data, &new_iv, subsamples.as_deref())?;
+        encryptor.encrypt_sample(sample_data, &new_iv, subsamples.as_deref())?;
 
-        // Build new senc entry with CENC IV
+        // Build new senc entry with target scheme IV
         let new_entry = SencEntry {
-            iv: new_iv.to_vec(),
+            iv: new_iv,
             subsamples: entry.subsamples.clone(),
         };
         new_senc_entries.push(new_entry);
@@ -428,17 +435,21 @@ mod tests {
                 key: vec![0xBB; 16],
                 iv: None,
             },
+            source_scheme: EncryptionScheme::Cbcs,
+            target_scheme: EncryptionScheme::Cenc,
             source_iv_size: 8,
             target_iv_size: 8,
-            crypt_byte_block: 1,
-            skip_byte_block: 9,
+            source_pattern: (1, 9),
+            target_pattern: (0, 0),
             constant_iv: None,
             segment_number: 42,
         };
+        assert_eq!(params.source_scheme, EncryptionScheme::Cbcs);
+        assert_eq!(params.target_scheme, EncryptionScheme::Cenc);
         assert_eq!(params.source_iv_size, 8);
         assert_eq!(params.target_iv_size, 8);
-        assert_eq!(params.crypt_byte_block, 1);
-        assert_eq!(params.skip_byte_block, 9);
+        assert_eq!(params.source_pattern, (1, 9));
+        assert_eq!(params.target_pattern, (0, 0));
         assert_eq!(params.segment_number, 42);
     }
 
@@ -452,10 +463,12 @@ mod tests {
         let params = SegmentRewriteParams {
             source_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
             target_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
+            source_scheme: EncryptionScheme::Cbcs,
+            target_scheme: EncryptionScheme::Cenc,
             source_iv_size: 8,
             target_iv_size: 8,
-            crypt_byte_block: 0,
-            skip_byte_block: 0,
+            source_pattern: (0, 0),
+            target_pattern: (0, 0),
             constant_iv: None,
             segment_number: 0,
         };
@@ -474,10 +487,12 @@ mod tests {
         let params = SegmentRewriteParams {
             source_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
             target_key: ContentKey { kid: [0; 16], key: vec![0; 16], iv: None },
+            source_scheme: EncryptionScheme::Cbcs,
+            target_scheme: EncryptionScheme::Cenc,
             source_iv_size: 8,
             target_iv_size: 8,
-            crypt_byte_block: 0,
-            skip_byte_block: 0,
+            source_pattern: (0, 0),
+            target_pattern: (0, 0),
             constant_iv: None,
             segment_number: 0,
         };
