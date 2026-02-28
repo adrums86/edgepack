@@ -1,4 +1,4 @@
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use aes::Aes128;
 use cipher::{KeyIvInit, StreamCipher};
 
@@ -68,7 +68,7 @@ impl CencEncryptor {
             if encrypted_bytes > 0 {
                 let end = offset + encrypted_bytes as usize;
                 if end > data.len() {
-                    return Err(EdgePackagerError::Encryption(
+                    return Err(EdgepackError::Encryption(
                         "subsample extends beyond sample data".into(),
                     ));
                 }
@@ -145,7 +145,7 @@ impl CencDecryptor {
             if encrypted_bytes > 0 {
                 let end = offset + encrypted_bytes as usize;
                 if end > data.len() {
-                    return Err(EdgePackagerError::Encryption(
+                    return Err(EdgepackError::Encryption(
                         "subsample extends beyond sample data".into(),
                     ));
                 }
@@ -174,7 +174,7 @@ fn build_counter_block(iv: &[u8]) -> Result<[u8; 16]> {
             block.copy_from_slice(iv);
             Ok(block)
         }
-        other => Err(EdgePackagerError::Encryption(format!(
+        other => Err(EdgepackError::Encryption(format!(
             "CENC IV must be 8 or 16 bytes, got {other}"
         ))),
     }

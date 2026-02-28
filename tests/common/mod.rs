@@ -4,12 +4,12 @@
 //! DRM key sets, and other mock data structures used across tests.
 #![allow(dead_code)]
 
-use edge_packager::drm::{system_ids, ContentKey, DrmKeySet, DrmSystemData};
-use edge_packager::manifest::types::{
+use edgepack::drm::{system_ids, ContentKey, DrmKeySet, DrmSystemData};
+use edgepack::manifest::types::{
     InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo,
 };
-use edge_packager::media::cmaf;
-use edge_packager::media::container::ContainerFormat;
+use edgepack::media::cmaf;
+use edgepack::media::container::ContainerFormat;
 
 // ─── DRM Fixtures ───────────────────────────────────────────────────
 
@@ -375,7 +375,7 @@ pub fn make_hls_manifest_state(segment_count: u32, phase: ManifestPhase) -> Mani
         byte_size: 1024,
     });
     state.drm_info = Some(ManifestDrmInfo {
-        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        encryption_scheme: edgepack::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgIARIQ".into()),
         playready_pssh: Some("AAAARHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAE=".into()),
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
@@ -413,7 +413,7 @@ pub fn make_dash_manifest_state(segment_count: u32, phase: ManifestPhase) -> Man
         byte_size: 1024,
     });
     state.drm_info = Some(ManifestDrmInfo {
-        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        encryption_scheme: edgepack::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgIARIQ".into()),
         playready_pssh: Some("AAAARHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAE=".into()),
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),

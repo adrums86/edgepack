@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Encryption scheme for media content.
 ///
 /// Represents the two Common Encryption (CENC) protection schemes defined in
-/// ISO/IEC 23001-7. The edge-packager can accept either scheme as input and
+/// ISO/IEC 23001-7. The edgepack can accept either scheme as input and
 /// produce either (or both) as output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EncryptionScheme {

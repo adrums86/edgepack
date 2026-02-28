@@ -3,7 +3,7 @@
 //! On `wasm32` targets, uses `wasi:http/outgoing-handler` to make real HTTP requests.
 //! On native targets, returns an error (HTTP transport is only available in the WASI runtime).
 
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 
 /// HTTP request method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +81,7 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
     use wasi::http::types::{Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, Scheme};
 
     // 1. Parse URL into components
-    let parsed = crate::url::Url::parse(&req.url).map_err(|e| EdgePackagerError::Http {
+    let parsed = crate::url::Url::parse(&req.url).map_err(|e| EdgepackError::Http {
         status: 0,
         message: format!("invalid URL: {e}"),
     })?;
@@ -106,7 +106,7 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
         .iter()
         .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
         .collect();
-    let fields = Fields::from_list(&header_entries).map_err(|e| EdgePackagerError::Http {
+    let fields = Fields::from_list(&header_entries).map_err(|e| EdgepackError::Http {
         status: 0,
         message: format!("invalid headers: {e:?}"),
     })?;
@@ -138,7 +138,7 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
             .map_err(|_| wasi_err("get request write stream"))?;
         stream
             .blocking_write_and_flush(&body_bytes)
-            .map_err(|e| EdgePackagerError::Http {
+            .map_err(|e| EdgepackError::Http {
                 status: 0,
                 message: format!("write request body: {e:?}"),
             })?;
@@ -148,7 +148,7 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
 
     // 5. Send request
     let future_resp = outgoing_handler::handle(outgoing, None).map_err(|e| {
-        EdgePackagerError::Http {
+        EdgepackError::Http {
             status: 0,
             message: format!("send request: {e:?}"),
         }
@@ -159,7 +159,7 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
         if let Some(result) = future_resp.get() {
             break result
                 .map_err(|_| wasi_err("get future response"))?
-                .map_err(|e| EdgePackagerError::Http {
+                .map_err(|e| EdgepackError::Http {
                     status: 0,
                     message: format!("response error: {e:?}"),
                 })?;
@@ -201,8 +201,8 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn wasi_err(context: &str) -> EdgePackagerError {
-    EdgePackagerError::Http {
+fn wasi_err(context: &str) -> EdgepackError {
+    EdgepackError::Http {
         status: 0,
         message: format!("WASI HTTP {context} failed"),
     }
@@ -229,7 +229,7 @@ fn send_reqwest(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
         builder = builder.body(body);
     }
 
-    let response = builder.send().map_err(|e| EdgePackagerError::Http {
+    let response = builder.send().map_err(|e| EdgepackError::Http {
         status: 0,
         message: format!("HTTP request failed: {e}"),
     })?;
@@ -242,7 +242,7 @@ fn send_reqwest(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
         .collect();
     let body = response
         .bytes()
-        .map_err(|e| EdgePackagerError::Http {
+        .map_err(|e| EdgepackError::Http {
             status,
             message: format!("failed to read response body: {e}"),
         })?
@@ -261,7 +261,7 @@ fn send_reqwest(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 fn send_native_stub(_req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
-    Err(EdgePackagerError::Http {
+    Err(EdgepackError::Http {
         status: 0,
         message: "HTTP client only available in WASI environment (wasm32-wasip2)".into(),
     })

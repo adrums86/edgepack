@@ -1,4 +1,4 @@
-# edge-packager Architecture
+# edgepack Architecture
 
 All diagrams use [Mermaid](https://mermaid.js.org/) syntax. They render natively in Confluence (Mermaid macro), Jira (Mermaid code blocks), GitHub, and can be imported into Lucidchart via **File → Import → Mermaid**.
 
@@ -6,7 +6,7 @@ All diagrams use [Mermaid](https://mermaid.js.org/) syntax. They render natively
 
 ## 1. System Context
 
-Shows how the edge-packager WASM module fits into the CDN infrastructure and its external dependencies.
+Shows how the edgepack WASM module fits into the CDN infrastructure and its external dependencies.
 
 ```mermaid
 graph TB
@@ -16,7 +16,7 @@ graph TB
 
     subgraph CDN["CDN Edge Network"]
         Cache["CDN Cache Layer<br/>HTTP Cache-Control headers"]
-        subgraph WASM["edge-packager.wasm"]
+        subgraph WASM["edgepack.wasm"]
             Handler["HTTP Handler<br/>(wasi:http/incoming-handler)"]
             Pipeline["Repackage Pipeline"]
             MediaEngine["Media Engine<br/>(ISOBMFF/CMAF)"]
@@ -134,7 +134,7 @@ graph TD
 
     subgraph Shared["Shared"]
         Config["config.rs<br/>AppConfig"]
-        Error["error.rs<br/>EdgePackagerError"]
+        Error["error.rs<br/>EdgepackError"]
         HTTP["http_client.rs<br/>WASI / reqwest / stub"]
     end
 
@@ -172,7 +172,7 @@ Shows how the pipeline handles WASI request timeouts by splitting work across se
 sequenceDiagram
     participant Client
     participant CDN as CDN Cache
-    participant EP as edge-packager
+    participant EP as edgepack
     participant Origin
     participant SPEKE as License Server
     participant Redis

@@ -2,7 +2,7 @@ use crate::config::{DrmConfig, SpekeAuth};
 use crate::drm::cpix;
 use crate::drm::system_ids;
 use crate::drm::DrmKeySet;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 
 /// SPEKE 2.0 client for communicating with a DRM license/key server.
 ///
@@ -62,17 +62,17 @@ impl SpekeClient {
 
         let response =
             crate::http_client::post(&self.endpoint, &headers, body.as_bytes().to_vec())
-                .map_err(|e| EdgePackagerError::Speke(format!("SPEKE HTTP request failed: {e}")))?;
+                .map_err(|e| EdgepackError::Speke(format!("SPEKE HTTP request failed: {e}")))?;
 
         if response.status != 200 {
-            return Err(EdgePackagerError::Speke(format!(
+            return Err(EdgepackError::Speke(format!(
                 "SPEKE server returned HTTP {}",
                 response.status
             )));
         }
 
         String::from_utf8(response.body).map_err(|e| {
-            EdgePackagerError::Speke(format!("SPEKE response is not valid UTF-8: {e}"))
+            EdgepackError::Speke(format!("SPEKE response is not valid UTF-8: {e}"))
         })
     }
 

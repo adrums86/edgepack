@@ -10,7 +10,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 
 use crate::cache::CacheBackend;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 
 /// AES-256-GCM encrypted cache backend decorator.
 ///
@@ -39,7 +39,7 @@ impl EncryptedCacheBackend {
         let ciphertext = self
             .cipher
             .encrypt(nonce, plaintext)
-            .map_err(|e| EdgePackagerError::Encryption(format!("encrypt failed: {e}")))?;
+            .map_err(|e| EdgepackError::Encryption(format!("encrypt failed: {e}")))?;
 
         // Wire format: nonce || ciphertext (includes tag appended by aes-gcm)
         let mut output = Vec::with_capacity(12 + ciphertext.len());
@@ -50,7 +50,7 @@ impl EncryptedCacheBackend {
 
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < 12 + 16 {
-            return Err(EdgePackagerError::Encryption(
+            return Err(EdgepackError::Encryption(
                 "ciphertext too short (missing nonce or tag)".into(),
             ));
         }
@@ -60,7 +60,7 @@ impl EncryptedCacheBackend {
 
         self.cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| EdgePackagerError::Encryption(format!("decrypt failed: {e}")))
+            .map_err(|e| EdgepackError::Encryption(format!("decrypt failed: {e}")))
     }
 }
 

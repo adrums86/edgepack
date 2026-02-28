@@ -1,5 +1,5 @@
 use crate::cache::CacheBackend;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 
 /// HTTP-based Redis backend compatible with Upstash REST API.
 ///
@@ -29,10 +29,10 @@ impl RedisHttpBackend {
         ];
 
         let response = crate::http_client::get(&endpoint, &headers)
-            .map_err(|e| EdgePackagerError::Cache(format!("Redis HTTP request failed: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("Redis HTTP request failed: {e}")))?;
 
         if response.status >= 400 {
-            return Err(EdgePackagerError::Cache(format!(
+            return Err(EdgepackError::Cache(format!(
                 "Redis HTTP error: status {}",
                 response.status
             )));
@@ -50,7 +50,7 @@ impl RedisHttpBackend {
 /// on native targets.
 fn parse_upstash_response(_status: u16, body: &[u8]) -> Result<Option<Vec<u8>>> {
     let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        EdgePackagerError::Cache(format!("failed to parse Upstash response: {e}"))
+        EdgepackError::Cache(format!("failed to parse Upstash response: {e}"))
     })?;
 
     match parsed.get("result") {
@@ -62,9 +62,9 @@ fn parse_upstash_response(_status: u16, body: &[u8]) -> Result<Option<Vec<u8>>> 
         None => {
             // Check for error field
             if let Some(serde_json::Value::String(err)) = parsed.get("error") {
-                Err(EdgePackagerError::Cache(format!("Upstash error: {err}")))
+                Err(EdgepackError::Cache(format!("Upstash error: {err}")))
             } else {
-                Err(EdgePackagerError::Cache(
+                Err(EdgepackError::Cache(
                     "unexpected Upstash response format".into(),
                 ))
             }

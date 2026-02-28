@@ -6,7 +6,7 @@
 //! that expiration is irrelevant).
 
 use crate::cache::CacheBackend;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -33,7 +33,7 @@ impl CacheBackend for InMemoryCacheBackend {
         let store = self
             .store
             .read()
-            .map_err(|e| EdgePackagerError::Cache(format!("lock poisoned: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("lock poisoned: {e}")))?;
         Ok(store.get(key).cloned())
     }
 
@@ -41,7 +41,7 @@ impl CacheBackend for InMemoryCacheBackend {
         let mut store = self
             .store
             .write()
-            .map_err(|e| EdgePackagerError::Cache(format!("lock poisoned: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("lock poisoned: {e}")))?;
         store.insert(key.to_string(), value.to_vec());
         Ok(())
     }
@@ -50,7 +50,7 @@ impl CacheBackend for InMemoryCacheBackend {
         let store = self
             .store
             .read()
-            .map_err(|e| EdgePackagerError::Cache(format!("lock poisoned: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("lock poisoned: {e}")))?;
         Ok(store.contains_key(key))
     }
 
@@ -58,7 +58,7 @@ impl CacheBackend for InMemoryCacheBackend {
         let mut store = self
             .store
             .write()
-            .map_err(|e| EdgePackagerError::Cache(format!("lock poisoned: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("lock poisoned: {e}")))?;
         store.remove(key);
         Ok(())
     }

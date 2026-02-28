@@ -1,4 +1,4 @@
-//! Lightweight URL parser for edge-packager.
+//! Lightweight URL parser for edgepack.
 //!
 //! Replaces the `url` crate to avoid pulling in ICU/IDNA Unicode
 //! normalization tables (~200 KB of static data in the WASM binary).

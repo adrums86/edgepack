@@ -21,7 +21,7 @@ fn wasm_release_binary_is_under_600kb() {
     // Locate the artifact.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let wasm_path = std::path::Path::new(manifest_dir)
-        .join("target/wasm32-wasip2/release/edge_packager.wasm");
+        .join("target/wasm32-wasip2/release/edgepack.wasm");
 
     assert!(
         wasm_path.exists(),

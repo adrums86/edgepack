@@ -8,12 +8,12 @@
 
 mod common;
 
-use edge_packager::drm::scheme::EncryptionScheme;
-use edge_packager::drm::{system_ids, ContentKey};
-use edge_packager::media::cmaf::{self, iterate_boxes, parse_pssh, parse_tenc};
-use edge_packager::media::container::ContainerFormat;
-use edge_packager::media::init::{parse_protection_info, rewrite_init_segment};
-use edge_packager::media::segment::{rewrite_segment, SegmentRewriteParams};
+use edgepack::drm::scheme::EncryptionScheme;
+use edgepack::drm::{system_ids, ContentKey};
+use edgepack::media::cmaf::{self, iterate_boxes, parse_pssh, parse_tenc};
+use edgepack::media::container::ContainerFormat;
+use edgepack::media::init::{parse_protection_info, rewrite_init_segment};
+use edgepack::media::segment::{rewrite_segment, SegmentRewriteParams};
 
 // ─── Init Segment Parsing ───────────────────────────────────────────
 

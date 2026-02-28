@@ -1,4 +1,4 @@
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use aes::Aes128;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 
@@ -49,7 +49,7 @@ impl CbcsDecryptor {
         subsamples: Option<&[(u32, u32)]>,
     ) -> Result<()> {
         if iv.len() != 16 {
-            return Err(EdgePackagerError::Encryption(format!(
+            return Err(EdgepackError::Encryption(format!(
                 "CBCS IV must be 16 bytes, got {}",
                 iv.len()
             )));
@@ -81,7 +81,7 @@ impl CbcsDecryptor {
             if encrypted_bytes > 0 {
                 let end = offset + encrypted_bytes as usize;
                 if end > data.len() {
-                    return Err(EdgePackagerError::Encryption(
+                    return Err(EdgepackError::Encryption(
                         "subsample extends beyond sample data".into(),
                     ));
                 }
@@ -152,7 +152,7 @@ impl CbcsDecryptor {
                         &mut data[start..end],
                     )
                     .map_err(|e| {
-                        EdgePackagerError::Encryption(format!("CBCS decrypt error: {e}"))
+                        EdgepackError::Encryption(format!("CBCS decrypt error: {e}"))
                     })?;
 
                 block_idx += blocks_to_decrypt;
@@ -206,7 +206,7 @@ impl CbcsEncryptor {
         subsamples: Option<&[(u32, u32)]>,
     ) -> Result<()> {
         if iv.len() != 16 {
-            return Err(EdgePackagerError::Encryption(format!(
+            return Err(EdgepackError::Encryption(format!(
                 "CBCS IV must be 16 bytes, got {}",
                 iv.len()
             )));
@@ -235,7 +235,7 @@ impl CbcsEncryptor {
             if encrypted_bytes > 0 {
                 let end = offset + encrypted_bytes as usize;
                 if end > data.len() {
-                    return Err(EdgePackagerError::Encryption(
+                    return Err(EdgepackError::Encryption(
                         "subsample extends beyond sample data".into(),
                     ));
                 }
@@ -305,7 +305,7 @@ impl CbcsEncryptor {
                         end - start,
                     )
                     .map_err(|e| {
-                        EdgePackagerError::Encryption(format!("CBCS encrypt error: {e}"))
+                        EdgepackError::Encryption(format!("CBCS encrypt error: {e}"))
                     })?;
 
                 block_idx += blocks_to_encrypt;

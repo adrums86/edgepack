@@ -43,7 +43,7 @@ cargo build --release
 
 Output WASM binary (~495 KB):
 ```
-target/wasm32-wasip2/release/edge_packager.wasm
+target/wasm32-wasip2/release/edgepack.wasm
 ```
 
 ### Running Tests
@@ -246,7 +246,7 @@ Sensitive cache entries (marked **Yes** above) are protected with two layers:
                     │            CDN Edge Node                │
                     │                                         │
    Client ──GET──►  │  ┌──────────┐    ┌──────────────────┐   │
-                    │  │ CDN Cache│◄───│  edge-packager   │   │
+                    │  │ CDN Cache│◄───│    edgepack      │   │
                     │  │ (HTTP    │    │  (.wasm module)  │   │
                     │  │  headers)│    │                  │   │
                     │  └──────────┘    │  Handler         │   │

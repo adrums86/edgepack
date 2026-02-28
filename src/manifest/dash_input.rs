@@ -5,7 +5,7 @@
 //! renderer is in `dash.rs`.
 
 use crate::drm::scheme::EncryptionScheme;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::manifest::types::SourceManifest;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -20,7 +20,7 @@ use crate::url::Url;
 /// The `manifest_url` is used as the base for resolving relative segment URIs.
 pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<SourceManifest> {
     let base_url = Url::parse(manifest_url).map_err(|e| {
-        EdgePackagerError::Manifest(format!("invalid manifest URL: {e}"))
+        EdgepackError::Manifest(format!("invalid manifest URL: {e}"))
     })?;
 
     let mut reader = Reader::from_str(manifest_text);
@@ -165,7 +165,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                return Err(EdgePackagerError::Manifest(format!(
+                return Err(EdgepackError::Manifest(format!(
                     "MPD XML parse error: {e}"
                 )));
             }
@@ -183,7 +183,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
 
     // Build segment list
     let media_pattern = media_template.ok_or_else(|| {
-        EdgePackagerError::Manifest("DASH MPD missing SegmentTemplate@media".into())
+        EdgepackError::Manifest("DASH MPD missing SegmentTemplate@media".into())
     })?;
 
     let mut segment_urls = Vec::new();
@@ -223,7 +223,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
         .map(|t| resolve_url(&effective_base, &t))
         .transpose()?
         .ok_or_else(|| {
-            EdgePackagerError::Manifest(
+            EdgepackError::Manifest(
                 "DASH MPD missing SegmentTemplate@initialization".into(),
             )
         })?;
@@ -244,7 +244,7 @@ fn resolve_url(base: &Url, relative: &str) -> Result<String> {
     }
     base.join(relative)
         .map(|u| u.to_string())
-        .map_err(|e| EdgePackagerError::Manifest(format!("resolve URL: {e}")))
+        .map_err(|e| EdgepackError::Manifest(format!("resolve URL: {e}")))
 }
 
 /// Parse an ISO 8601 duration (e.g., "PT1H30M0S") into seconds.

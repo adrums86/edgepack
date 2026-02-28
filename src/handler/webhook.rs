@@ -1,6 +1,6 @@
 use crate::cache::CacheKeys;
 use crate::drm::scheme::EncryptionScheme;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::handler::{format_str, HandlerContext, HttpRequest, HttpResponse};
 use crate::manifest::types::OutputFormat;
 use crate::repackager::pipeline::RepackagePipeline;
@@ -61,17 +61,17 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     let body = req
         .body
         .as_ref()
-        .ok_or_else(|| EdgePackagerError::InvalidInput("missing request body".into()))?;
+        .ok_or_else(|| EdgepackError::InvalidInput("missing request body".into()))?;
 
     let payload: WebhookPayload = serde_json::from_slice(body)
-        .map_err(|e| EdgePackagerError::InvalidInput(format!("invalid JSON: {e}")))?;
+        .map_err(|e| EdgepackError::InvalidInput(format!("invalid JSON: {e}")))?;
 
     // Validate format
     let output_format = match payload.format.as_str() {
         "hls" => OutputFormat::Hls,
         "dash" => OutputFormat::Dash,
         other => {
-            return Err(EdgePackagerError::InvalidInput(format!(
+            return Err(EdgepackError::InvalidInput(format!(
                 "invalid format: {other} (expected 'hls' or 'dash')"
             )));
         }
@@ -79,7 +79,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
 
     // Validate source URL
     if payload.source_url.is_empty() {
-        return Err(EdgePackagerError::InvalidInput(
+        return Err(EdgepackError::InvalidInput(
             "source_url is required".into(),
         ));
     }
@@ -89,7 +89,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         "cenc" => EncryptionScheme::Cenc,
         "cbcs" => EncryptionScheme::Cbcs,
         other => {
-            return Err(EdgePackagerError::InvalidInput(format!(
+            return Err(EdgepackError::InvalidInput(format!(
                 "invalid target_scheme: {other} (expected 'cenc' or 'cbcs')"
             )));
         }
@@ -100,7 +100,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         &payload.container_format,
     )
     .ok_or_else(|| {
-        EdgePackagerError::InvalidInput(format!(
+        EdgepackError::InvalidInput(format!(
             "invalid container_format: {} (expected 'cmaf', 'fmp4', or 'iso')",
             payload.container_format
         ))
@@ -164,7 +164,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     };
 
     let resp_body = serde_json::to_vec(&response)
-        .map_err(|e| EdgePackagerError::Io(format!("serialize response: {e}")))?;
+        .map_err(|e| EdgepackError::Io(format!("serialize response: {e}")))?;
 
     Ok(HttpResponse::ok(resp_body, "application/json"))
 }
@@ -177,16 +177,16 @@ pub fn handle_continue(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpRe
     let body = req
         .body
         .as_ref()
-        .ok_or_else(|| EdgePackagerError::InvalidInput("missing request body".into()))?;
+        .ok_or_else(|| EdgepackError::InvalidInput("missing request body".into()))?;
 
     let payload: ContinuePayload = serde_json::from_slice(body)
-        .map_err(|e| EdgePackagerError::InvalidInput(format!("invalid JSON: {e}")))?;
+        .map_err(|e| EdgepackError::InvalidInput(format!("invalid JSON: {e}")))?;
 
     let output_format = match payload.format.as_str() {
         "hls" => OutputFormat::Hls,
         "dash" => OutputFormat::Dash,
         other => {
-            return Err(EdgePackagerError::InvalidInput(format!(
+            return Err(EdgepackError::InvalidInput(format!(
                 "invalid format: {other}"
             )));
         }
@@ -207,7 +207,7 @@ pub fn handle_continue(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpRe
     };
 
     let job_status: JobStatus = serde_json::from_slice(&job_data).map_err(|e| {
-        EdgePackagerError::Cache(format!("deserialize job status: {e}"))
+        EdgepackError::Cache(format!("deserialize job status: {e}"))
     })?;
 
     // If already complete, nothing to do

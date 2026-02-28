@@ -3,7 +3,7 @@ pub mod webhook;
 
 use crate::cache::CacheBackend;
 use crate::config::AppConfig;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::manifest::types::OutputFormat;
 
 /// An incoming HTTP request (abstracted from the WASI HTTP interface).
@@ -143,7 +143,7 @@ fn parse_format(s: &str) -> Result<OutputFormat> {
     match s {
         "hls" => Ok(OutputFormat::Hls),
         "dash" => Ok(OutputFormat::Dash),
-        _ => Err(EdgePackagerError::InvalidInput(format!(
+        _ => Err(EdgepackError::InvalidInput(format!(
             "unknown format: {s} (expected 'hls' or 'dash')"
         ))),
     }

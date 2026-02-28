@@ -1,5 +1,5 @@
 [package]
-name = "edge-packager"
+name = "edgepack"
 version = "0.1.0"
 edition = "2021"
 description = "CDN edge WASM application for repackaging DASH/HLS CMAF media from CBCS to CENC encryption"

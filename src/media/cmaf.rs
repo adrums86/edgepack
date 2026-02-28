@@ -1,4 +1,4 @@
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::media::FourCC;
 
 /// An ISOBMFF box header.
@@ -118,7 +118,7 @@ pub struct TrunEntry {
 pub fn read_box_header(data: &[u8], offset: u64) -> Result<BoxHeader> {
     let off = offset as usize;
     if off + 8 > data.len() {
-        return Err(EdgePackagerError::MediaParse(
+        return Err(EdgepackError::MediaParse(
             "not enough data for box header".into(),
         ));
     }
@@ -129,7 +129,7 @@ pub fn read_box_header(data: &[u8], offset: u64) -> Result<BoxHeader> {
     if size32 == 1 {
         // Extended size
         if off + 16 > data.len() {
-            return Err(EdgePackagerError::MediaParse(
+            return Err(EdgepackError::MediaParse(
                 "not enough data for extended box header".into(),
             ));
         }
@@ -219,7 +219,7 @@ pub fn box_payload<'a>(data: &'a [u8], header: &BoxHeader) -> &'a [u8] {
 /// Parse a tenc box from its payload bytes (after version/flags).
 pub fn parse_tenc(payload: &[u8]) -> Result<TrackEncryptionBox> {
     if payload.len() < 6 + 16 {
-        return Err(EdgePackagerError::MediaParse(
+        return Err(EdgepackError::MediaParse(
             "tenc box too small".into(),
         ));
     }
@@ -260,7 +260,7 @@ pub fn parse_tenc(payload: &[u8]) -> Result<TrackEncryptionBox> {
 /// Parse a senc box from its full box data (including version/flags).
 pub fn parse_senc(data: &[u8], per_sample_iv_size: u8) -> Result<SampleEncryptionBox> {
     if data.len() < 8 {
-        return Err(EdgePackagerError::MediaParse("senc box too small".into()));
+        return Err(EdgepackError::MediaParse("senc box too small".into()));
     }
 
     let flags = u32::from_be_bytes([0, data[1], data[2], data[3]]);
@@ -273,7 +273,7 @@ pub fn parse_senc(data: &[u8], per_sample_iv_size: u8) -> Result<SampleEncryptio
     for _ in 0..sample_count {
         let iv_size = per_sample_iv_size as usize;
         if offset + iv_size > data.len() {
-            return Err(EdgePackagerError::MediaParse(
+            return Err(EdgepackError::MediaParse(
                 "senc: not enough data for IV".into(),
             ));
         }
@@ -282,7 +282,7 @@ pub fn parse_senc(data: &[u8], per_sample_iv_size: u8) -> Result<SampleEncryptio
 
         let subsamples = if has_subsamples {
             if offset + 2 > data.len() {
-                return Err(EdgePackagerError::MediaParse(
+                return Err(EdgepackError::MediaParse(
                     "senc: not enough data for subsample count".into(),
                 ));
             }
@@ -292,7 +292,7 @@ pub fn parse_senc(data: &[u8], per_sample_iv_size: u8) -> Result<SampleEncryptio
             let mut subs = Vec::with_capacity(sub_count);
             for _ in 0..sub_count {
                 if offset + 6 > data.len() {
-                    return Err(EdgePackagerError::MediaParse(
+                    return Err(EdgepackError::MediaParse(
                         "senc: not enough data for subsample entry".into(),
                     ));
                 }
@@ -327,7 +327,7 @@ pub fn parse_senc(data: &[u8], per_sample_iv_size: u8) -> Result<SampleEncryptio
 /// Parse a PSSH box from its payload (after box header).
 pub fn parse_pssh(data: &[u8]) -> Result<PsshBox> {
     if data.len() < 4 + 16 + 4 {
-        return Err(EdgePackagerError::MediaParse("PSSH box too small".into()));
+        return Err(EdgepackError::MediaParse("PSSH box too small".into()));
     }
 
     let version = data[0];
@@ -339,7 +339,7 @@ pub fn parse_pssh(data: &[u8]) -> Result<PsshBox> {
 
     if version >= 1 {
         if offset + 4 > data.len() {
-            return Err(EdgePackagerError::MediaParse(
+            return Err(EdgepackError::MediaParse(
                 "PSSH v1: not enough data for KID count".into(),
             ));
         }
@@ -350,7 +350,7 @@ pub fn parse_pssh(data: &[u8]) -> Result<PsshBox> {
 
         for _ in 0..kid_count {
             if offset + 16 > data.len() {
-                return Err(EdgePackagerError::MediaParse(
+                return Err(EdgepackError::MediaParse(
                     "PSSH v1: not enough data for KID".into(),
                 ));
             }
@@ -362,7 +362,7 @@ pub fn parse_pssh(data: &[u8]) -> Result<PsshBox> {
     }
 
     if offset + 4 > data.len() {
-        return Err(EdgePackagerError::MediaParse(
+        return Err(EdgepackError::MediaParse(
             "PSSH: not enough data for data size".into(),
         ));
     }
@@ -388,7 +388,7 @@ pub fn parse_pssh(data: &[u8]) -> Result<PsshBox> {
 /// Parse a trun box from its payload (after box header).
 pub fn parse_trun(data: &[u8]) -> Result<TrackRunBox> {
     if data.len() < 8 {
-        return Err(EdgePackagerError::MediaParse("trun box too small".into()));
+        return Err(EdgepackError::MediaParse("trun box too small".into()));
     }
 
     let flags = u32::from_be_bytes([0, data[1], data[2], data[3]]);
@@ -398,7 +398,7 @@ pub fn parse_trun(data: &[u8]) -> Result<TrackRunBox> {
 
     let data_offset = if flags & 0x0001 != 0 {
         if offset + 4 > data.len() {
-            return Err(EdgePackagerError::MediaParse(
+            return Err(EdgepackError::MediaParse(
                 "trun: not enough data for data_offset".into(),
             ));
         }
@@ -411,7 +411,7 @@ pub fn parse_trun(data: &[u8]) -> Result<TrackRunBox> {
 
     let first_sample_flags = if flags & 0x0004 != 0 {
         if offset + 4 > data.len() {
-            return Err(EdgePackagerError::MediaParse(
+            return Err(EdgepackError::MediaParse(
                 "trun: not enough data for first_sample_flags".into(),
             ));
         }
@@ -433,7 +433,7 @@ pub fn parse_trun(data: &[u8]) -> Result<TrackRunBox> {
 
         if has_duration {
             if offset + 4 > data.len() {
-                return Err(EdgePackagerError::MediaParse(
+                return Err(EdgepackError::MediaParse(
                     "trun: not enough data for sample_duration".into(),
                 ));
             }
@@ -444,7 +444,7 @@ pub fn parse_trun(data: &[u8]) -> Result<TrackRunBox> {
         }
         if has_size {
             if offset + 4 > data.len() {
-                return Err(EdgePackagerError::MediaParse(
+                return Err(EdgepackError::MediaParse(
                     "trun: not enough data for sample_size".into(),
                 ));
             }
@@ -455,7 +455,7 @@ pub fn parse_trun(data: &[u8]) -> Result<TrackRunBox> {
         }
         if has_flags {
             if offset + 4 > data.len() {
-                return Err(EdgePackagerError::MediaParse(
+                return Err(EdgepackError::MediaParse(
                     "trun: not enough data for sample_flags".into(),
                 ));
             }
@@ -466,7 +466,7 @@ pub fn parse_trun(data: &[u8]) -> Result<TrackRunBox> {
         }
         if has_cto {
             if offset + 4 > data.len() {
-                return Err(EdgePackagerError::MediaParse(
+                return Err(EdgepackError::MediaParse(
                     "trun: not enough data for composition_time_offset".into(),
                 ));
             }

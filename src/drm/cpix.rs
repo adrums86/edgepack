@@ -1,5 +1,5 @@
 use crate::drm::{ContentKey, DrmKeySet, DrmSystemData};
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use base64::Engine;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -131,7 +131,7 @@ pub fn parse_cpix_response(xml_data: &[u8]) -> Result<DrmKeySet> {
                     if let Some(kid) = current_kid {
                         let key_data = b64
                             .decode(text)
-                            .map_err(|e| EdgePackagerError::Cpix(format!("invalid base64 key: {e}")))?;
+                            .map_err(|e| EdgepackError::Cpix(format!("invalid base64 key: {e}")))?;
                         keys.push(ContentKey {
                             kid,
                             key: key_data,
@@ -141,7 +141,7 @@ pub fn parse_cpix_response(xml_data: &[u8]) -> Result<DrmKeySet> {
                 } else if in_pssh {
                     if let (Some(kid), Some(system_id)) = (current_kid, current_system_id) {
                         let pssh_data = b64.decode(text).map_err(|e| {
-                            EdgePackagerError::Cpix(format!("invalid base64 PSSH: {e}"))
+                            EdgepackError::Cpix(format!("invalid base64 PSSH: {e}"))
                         })?;
                         // Check if we already have an entry for this system_id+kid
                         if let Some(existing) = drm_systems
@@ -186,7 +186,7 @@ pub fn parse_cpix_response(xml_data: &[u8]) -> Result<DrmKeySet> {
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                return Err(EdgePackagerError::Cpix(format!("XML parse error: {e}")));
+                return Err(EdgepackError::Cpix(format!("XML parse error: {e}")));
             }
             _ => {}
         }
@@ -194,7 +194,7 @@ pub fn parse_cpix_response(xml_data: &[u8]) -> Result<DrmKeySet> {
     }
 
     if keys.is_empty() {
-        return Err(EdgePackagerError::Cpix(
+        return Err(EdgepackError::Cpix(
             "no content keys found in CPIX response".into(),
         ));
     }
@@ -218,7 +218,7 @@ pub fn format_uuid(bytes: &[u8; 16]) -> String {
 pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() != 32 {
-        return Err(EdgePackagerError::Cpix(format!(
+        return Err(EdgepackError::Cpix(format!(
             "invalid UUID: expected 32 hex chars, got {}",
             hex.len()
         )));
@@ -226,7 +226,7 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
     let mut bytes = [0u8; 16];
     for i in 0..16 {
         bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|e| EdgePackagerError::Cpix(format!("invalid UUID hex: {e}")))?;
+            .map_err(|e| EdgepackError::Cpix(format!("invalid UUID hex: {e}")))?;
     }
     Ok(bytes)
 }

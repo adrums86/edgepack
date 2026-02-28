@@ -1,4 +1,4 @@
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::url::Url;
 use serde::{Deserialize, Serialize};
 
@@ -94,7 +94,7 @@ impl AppConfig {
         };
 
         let speke_url = Url::parse(&env_var("SPEKE_URL")?)
-            .map_err(|e| EdgePackagerError::Config(format!("invalid SPEKE_URL: {e}")))?;
+            .map_err(|e| EdgepackError::Config(format!("invalid SPEKE_URL: {e}")))?;
 
         let speke_auth = if let Ok(token) = env_var("SPEKE_BEARER_TOKEN") {
             SpekeAuth::Bearer(token)
@@ -127,7 +127,7 @@ impl AppConfig {
 }
 
 fn env_var(name: &str) -> Result<String> {
-    std::env::var(name).map_err(|_| EdgePackagerError::Config(format!("missing env var: {name}")))
+    std::env::var(name).map_err(|_| EdgepackError::Config(format!("missing env var: {name}")))
 }
 
 fn env_var_or(name: &str, default: &str) -> String {
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn env_var_missing_returns_config_error() {
-        let result = env_var("EDGE_PACKAGER_TEST_NONEXISTENT_VAR_12345");
+        let result = env_var("EDGEPACK_TEST_NONEXISTENT_VAR_12345");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("missing env var"));
@@ -230,16 +230,16 @@ mod tests {
 
     #[test]
     fn env_var_or_returns_default_when_missing() {
-        let val = env_var_or("EDGE_PACKAGER_TEST_NONEXISTENT_VAR_12345", "fallback");
+        let val = env_var_or("EDGEPACK_TEST_NONEXISTENT_VAR_12345", "fallback");
         assert_eq!(val, "fallback");
     }
 
     #[test]
     fn env_var_or_returns_set_value() {
-        std::env::set_var("EDGE_PACKAGER_TEST_ENVVAR_OR", "actual");
-        let val = env_var_or("EDGE_PACKAGER_TEST_ENVVAR_OR", "fallback");
+        std::env::set_var("EDGEPACK_TEST_ENVVAR_OR", "actual");
+        let val = env_var_or("EDGEPACK_TEST_ENVVAR_OR", "fallback");
         assert_eq!(val, "actual");
-        std::env::remove_var("EDGE_PACKAGER_TEST_ENVVAR_OR");
+        std::env::remove_var("EDGEPACK_TEST_ENVVAR_OR");
     }
 
     #[test]

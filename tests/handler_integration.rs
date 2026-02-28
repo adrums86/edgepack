@@ -8,26 +8,26 @@
 
 mod common;
 
-use edge_packager::cache::CacheBackend;
-use edge_packager::config::{
+use edgepack::cache::CacheBackend;
+use edgepack::config::{
     AppConfig, CacheConfig, DrmConfig, DrmSystemIds, RedisBackendType, RedisConfig, SpekeAuth,
 };
-use edge_packager::handler::{route, HandlerContext, HttpMethod, HttpRequest, HttpResponse};
+use edgepack::handler::{route, HandlerContext, HttpMethod, HttpRequest, HttpResponse};
 
 /// A stub cache backend for integration tests that always returns None/Ok.
 struct StubCacheBackend;
 
 impl CacheBackend for StubCacheBackend {
-    fn get(&self, _key: &str) -> edge_packager::error::Result<Option<Vec<u8>>> {
+    fn get(&self, _key: &str) -> edgepack::error::Result<Option<Vec<u8>>> {
         Ok(None)
     }
-    fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> edge_packager::error::Result<()> {
+    fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> edgepack::error::Result<()> {
         Ok(())
     }
-    fn exists(&self, _key: &str) -> edge_packager::error::Result<bool> {
+    fn exists(&self, _key: &str) -> edgepack::error::Result<bool> {
         Ok(false)
     }
-    fn delete(&self, _key: &str) -> edge_packager::error::Result<()> {
+    fn delete(&self, _key: &str) -> edgepack::error::Result<()> {
         Ok(())
     }
 }
@@ -42,7 +42,7 @@ fn test_context() -> HandlerContext {
                 backend: RedisBackendType::Http,
             },
             drm: DrmConfig {
-                speke_url: edge_packager::url::Url::parse("https://drm.example.com/speke").unwrap(),
+                speke_url: edgepack::url::Url::parse("https://drm.example.com/speke").unwrap(),
                 speke_auth: SpekeAuth::Bearer("test-bearer-token".into()),
                 system_ids: DrmSystemIds::default(),
             },

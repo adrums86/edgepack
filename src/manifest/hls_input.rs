@@ -5,7 +5,7 @@
 //! are in `hls.rs`.
 
 use crate::drm::scheme::EncryptionScheme;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::manifest::types::SourceManifest;
 use crate::url::Url;
 
@@ -21,12 +21,12 @@ use crate::url::Url;
 /// - No `#EXT-X-MAP` (init segment) is found
 pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<SourceManifest> {
     let base_url = Url::parse(manifest_url).map_err(|e| {
-        EdgePackagerError::Manifest(format!("invalid manifest URL: {e}"))
+        EdgepackError::Manifest(format!("invalid manifest URL: {e}"))
     })?;
 
     // Detect master playlist
     if manifest_text.contains("#EXT-X-STREAM-INF") {
-        return Err(EdgePackagerError::Manifest(
+        return Err(EdgepackError::Manifest(
             "received HLS master playlist — expected a media playlist URL. \
              Select a specific variant/rendition playlist URL instead."
                 .into(),
@@ -72,7 +72,7 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
     }
 
     let init_url = init_segment_url.ok_or_else(|| {
-        EdgePackagerError::Manifest(
+        EdgepackError::Manifest(
             "HLS manifest missing #EXT-X-MAP (init segment)".into(),
         )
     })?;
@@ -93,7 +93,7 @@ fn resolve_url(base: &Url, relative: &str) -> Result<String> {
     }
     base.join(relative)
         .map(|u| u.to_string())
-        .map_err(|e| EdgePackagerError::Manifest(format!("resolve URL: {e}")))
+        .map_err(|e| EdgepackError::Manifest(format!("resolve URL: {e}")))
 }
 
 /// Extract a quoted attribute value from an HLS tag line.

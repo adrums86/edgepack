@@ -27,7 +27,7 @@ pub fn handle_manifest_request(
     };
 
     let state: ManifestState = serde_json::from_slice(&state_bytes).map_err(|e| {
-        crate::error::EdgePackagerError::Cache(format!("deserialize manifest state: {e}"))
+        crate::error::EdgepackError::Cache(format!("deserialize manifest state: {e}"))
     })?;
 
     let manifest_body = manifest::render_manifest(&state)?;
@@ -117,7 +117,7 @@ pub fn handle_status_request(
         Some(data) => {
             // Validate it's valid JSON by attempting to deserialize
             let _status: JobStatus = serde_json::from_slice(&data).map_err(|e| {
-                crate::error::EdgePackagerError::Cache(format!("deserialize job status: {e}"))
+                crate::error::EdgepackError::Cache(format!("deserialize job status: {e}"))
             })?;
 
             Ok(HttpResponse::ok_with_cache(

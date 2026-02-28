@@ -3,7 +3,7 @@ use crate::config::AppConfig;
 use crate::drm::scheme::EncryptionScheme;
 use crate::drm::speke::SpekeClient;
 use crate::drm::{ContentKey, DrmKeySet};
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::manifest::types::{
     ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo, SourceManifest,
 };
@@ -50,11 +50,11 @@ impl RepackagePipeline {
         // Step 2: Fetch the init segment and parse protection info
         let init_data = self.fetch_segment(&source.init_segment_url)?;
         let protection_info = init::parse_protection_info(&init_data)?
-            .ok_or_else(|| EdgePackagerError::Drm("source content is not encrypted".into()))?;
+            .ok_or_else(|| EdgepackError::Drm("source content is not encrypted".into()))?;
 
         // Detect source encryption scheme
         let source_scheme = EncryptionScheme::from_scheme_type(&protection_info.scheme_type)
-            .ok_or_else(|| EdgePackagerError::Drm(format!(
+            .ok_or_else(|| EdgepackError::Drm(format!(
                 "unsupported encryption scheme: {:?}",
                 std::str::from_utf8(&protection_info.scheme_type)
             )))?;
@@ -133,7 +133,7 @@ impl RepackagePipeline {
             // Save manifest state to Redis for coordination
             let manifest_state = progressive.manifest_state();
             let state_json = serde_json::to_vec(manifest_state)
-                .map_err(|e| EdgePackagerError::Cache(format!("serialize state: {e}")))?;
+                .map_err(|e| EdgepackError::Cache(format!("serialize state: {e}")))?;
             let key = CacheKeys::manifest_state(content_id, &format_str(format));
             self.cache.set(&key, &state_json, self.config.cache.job_state_ttl)?;
 
@@ -176,18 +176,18 @@ impl RepackagePipeline {
 
         // Store source manifest in Redis for continuation
         let source_json = serde_json::to_vec(&source)
-            .map_err(|e| EdgePackagerError::Cache(format!("serialize source manifest: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("serialize source manifest: {e}")))?;
         self.cache
             .set(&CacheKeys::source_manifest(content_id, &fmt), &source_json, ttl)?;
 
         // Step 2: Fetch init segment and parse protection info
         let init_data = self.fetch_segment(&source.init_segment_url)?;
         let protection_info = init::parse_protection_info(&init_data)?
-            .ok_or_else(|| EdgePackagerError::Drm("source content is not encrypted".into()))?;
+            .ok_or_else(|| EdgepackError::Drm("source content is not encrypted".into()))?;
 
         // Detect source encryption scheme
         let source_scheme = EncryptionScheme::from_scheme_type(&protection_info.scheme_type)
-            .ok_or_else(|| EdgePackagerError::Drm(format!(
+            .ok_or_else(|| EdgepackError::Drm(format!(
                 "unsupported encryption scheme: {:?}",
                 std::str::from_utf8(&protection_info.scheme_type)
             )))?;
@@ -231,7 +231,7 @@ impl RepackagePipeline {
             container_format,
         };
         let cont_json = serde_json::to_vec(&continuation)
-            .map_err(|e| EdgePackagerError::Cache(format!("serialize rewrite params: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("serialize rewrite params: {e}")))?;
         self.cache
             .set(&CacheKeys::rewrite_params(content_id, &fmt), &cont_json, ttl)?;
 
@@ -284,7 +284,7 @@ impl RepackagePipeline {
         // Save manifest state
         let manifest_state = progressive.manifest_state();
         let state_json = serde_json::to_vec(manifest_state)
-            .map_err(|e| EdgePackagerError::Cache(format!("serialize manifest state: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
         self.cache
             .set(&CacheKeys::manifest_state(content_id, &fmt), &state_json, ttl)?;
 
@@ -319,36 +319,36 @@ impl RepackagePipeline {
             .cache
             .get(&CacheKeys::source_manifest(content_id, &fmt))?
             .ok_or_else(|| {
-                EdgePackagerError::Cache(format!(
+                EdgepackError::Cache(format!(
                     "source manifest not found in cache for {content_id}/{fmt}"
                 ))
             })?;
         let source: SourceManifest = serde_json::from_slice(&source_data)
-            .map_err(|e| EdgePackagerError::Cache(format!("deserialize source manifest: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("deserialize source manifest: {e}")))?;
 
         // Load rewrite params
         let params_data = self
             .cache
             .get(&CacheKeys::rewrite_params(content_id, &fmt))?
             .ok_or_else(|| {
-                EdgePackagerError::Cache(format!(
+                EdgepackError::Cache(format!(
                     "rewrite params not found in cache for {content_id}/{fmt}"
                 ))
             })?;
         let continuation: ContinuationParams = serde_json::from_slice(&params_data)
-            .map_err(|e| EdgePackagerError::Cache(format!("deserialize rewrite params: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("deserialize rewrite params: {e}")))?;
 
         // Load current manifest state
         let state_data = self
             .cache
             .get(&CacheKeys::manifest_state(content_id, &fmt))?
             .ok_or_else(|| {
-                EdgePackagerError::Cache(format!(
+                EdgepackError::Cache(format!(
                     "manifest state not found in cache for {content_id}/{fmt}"
                 ))
             })?;
         let mut manifest_state: ManifestState = serde_json::from_slice(&state_data)
-            .map_err(|e| EdgePackagerError::Cache(format!("deserialize manifest state: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("deserialize manifest state: {e}")))?;
 
         let segments_done = manifest_state.segments.len();
         let total = source.segment_urls.len();
@@ -415,7 +415,7 @@ impl RepackagePipeline {
 
         // Save updated manifest state
         let state_json = serde_json::to_vec(&manifest_state)
-            .map_err(|e| EdgePackagerError::Cache(format!("serialize manifest state: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
         self.cache
             .set(&CacheKeys::manifest_state(content_id, &fmt), &state_json, ttl)?;
 
@@ -446,13 +446,13 @@ impl RepackagePipeline {
         let response = crate::http_client::get(url, &[])?;
 
         if response.status >= 400 {
-            return Err(EdgePackagerError::Http {
+            return Err(EdgepackError::Http {
                 status: response.status,
                 message: format!("failed to fetch source manifest: HTTP {}", response.status),
             });
         }
 
-        let text = String::from_utf8(response.body).map_err(|e| EdgePackagerError::Http {
+        let text = String::from_utf8(response.body).map_err(|e| EdgepackError::Http {
             status: 0,
             message: format!("source manifest is not valid UTF-8: {e}"),
         })?;
@@ -470,7 +470,7 @@ impl RepackagePipeline {
         let response = crate::http_client::get(url, &[])?;
 
         if response.status >= 400 {
-            return Err(EdgePackagerError::Http {
+            return Err(EdgepackError::Http {
                 status: response.status,
                 message: format!("failed to fetch segment: HTTP {}", response.status),
             });
@@ -522,7 +522,7 @@ impl RepackagePipeline {
             segments_total: total,
         };
         let json = serde_json::to_vec(&status)
-            .map_err(|e| EdgePackagerError::Cache(format!("serialize job state: {e}")))?;
+            .map_err(|e| EdgepackError::Cache(format!("serialize job state: {e}")))?;
         let key = CacheKeys::job_state(content_id, &format_str(format));
         self.cache.set(&key, &json, self.config.cache.job_state_ttl)
     }
@@ -551,7 +551,7 @@ fn find_key_for_kid(key_set: &DrmKeySet, kid: &[u8; 16]) -> Result<ContentKey> {
         .find(|k| &k.kid == kid)
         .cloned()
         .ok_or_else(|| {
-            EdgePackagerError::Drm(format!(
+            EdgepackError::Drm(format!(
                 "no key found for KID {:?}",
                 crate::drm::cpix::format_uuid(kid)
             ))
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn cleanup_swallows_delete_errors() {
-        use crate::error::EdgePackagerError;
+        use crate::error::EdgepackError;
 
         /// Cache backend where delete() always fails.
         struct FailingDeleteCache;
@@ -1137,7 +1137,7 @@ mod tests {
                 Ok(false)
             }
             fn delete(&self, _: &str) -> crate::error::Result<()> {
-                Err(EdgePackagerError::Cache("connection refused".into()))
+                Err(EdgepackError::Cache("connection refused".into()))
             }
         }
 

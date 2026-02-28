@@ -1,4 +1,4 @@
-//! Local sandbox for edge-packager.
+//! Local sandbox for edgepack.
 //!
 //! Provides a web UI and API server for testing the repackaging pipeline
 //! locally without deploying to a CDN edge. Uses reqwest for HTTP transport
@@ -17,16 +17,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use edge_packager::cache::memory::InMemoryCacheBackend;
-use edge_packager::cache::{CacheBackend, CacheKeys};
-use edge_packager::config::{
+use edgepack::cache::memory::InMemoryCacheBackend;
+use edgepack::cache::{CacheBackend, CacheKeys};
+use edgepack::config::{
     AppConfig, CacheConfig, DrmConfig, DrmSystemIds, RedisBackendType, RedisConfig, SpekeAuth,
 };
-use edge_packager::manifest;
-use edge_packager::manifest::types::ManifestState;
-use edge_packager::manifest::types::OutputFormat;
-use edge_packager::repackager::pipeline::RepackagePipeline;
-use edge_packager::repackager::{JobStatus, RepackageRequest};
+use edgepack::manifest;
+use edgepack::manifest::types::ManifestState;
+use edgepack::manifest::types::OutputFormat;
+use edgepack::repackager::pipeline::RepackagePipeline;
+use edgepack::repackager::{JobStatus, RepackageRequest};
 
 // ─── Application State ─────────────────────────────────────────────────
 
@@ -128,8 +128,8 @@ async fn handle_repackage(
     }
 
     let target_scheme = match payload.target_scheme.as_str() {
-        "cenc" => edge_packager::drm::scheme::EncryptionScheme::Cenc,
-        "cbcs" => edge_packager::drm::scheme::EncryptionScheme::Cbcs,
+        "cenc" => edgepack::drm::scheme::EncryptionScheme::Cenc,
+        "cbcs" => edgepack::drm::scheme::EncryptionScheme::Cbcs,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -142,9 +142,9 @@ async fn handle_repackage(
     };
 
     let container_format = match payload.container_format.as_str() {
-        "cmaf" => edge_packager::media::container::ContainerFormat::Cmaf,
-        "fmp4" => edge_packager::media::container::ContainerFormat::Fmp4,
-        "iso" => edge_packager::media::container::ContainerFormat::Iso,
+        "cmaf" => edgepack::media::container::ContainerFormat::Cmaf,
+        "fmp4" => edgepack::media::container::ContainerFormat::Fmp4,
+        "iso" => edgepack::media::container::ContainerFormat::Iso,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -156,7 +156,7 @@ async fn handle_repackage(
         }
     };
 
-    let speke_url = match edge_packager::url::Url::parse(&payload.speke_url) {
+    let speke_url = match edgepack::url::Url::parse(&payload.speke_url) {
         Ok(u) => u,
         Err(e) => {
             return (
@@ -267,8 +267,8 @@ async fn handle_repackage(
     tokio::task::spawn_blocking(move || {
         // Wrap cache with encryption layer so sensitive data (DRM keys, SPEKE
         // responses, rewrite params) is never stored in plaintext.
-        let enc_key = edge_packager::cache::encrypted::derive_key("edge-packager-sandbox");
-        let encrypted_cache = edge_packager::cache::encrypted::EncryptedCacheBackend::new(
+        let enc_key = edgepack::cache::encrypted::derive_key("edgepack-sandbox");
+        let encrypted_cache = edgepack::cache::encrypted::EncryptedCacheBackend::new(
             Box::new(cache.clone()),
             &enc_key,
         );
@@ -595,7 +595,7 @@ async fn main() {
         .expect("failed to bind to port 3333");
 
     eprintln!();
-    eprintln!("  edge-packager sandbox running on http://localhost:3333");
+    eprintln!("  edgepack sandbox running on http://localhost:3333");
     eprintln!();
 
     axum::serve(listener, app)
@@ -610,7 +610,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>edge-packager sandbox</title>
+<title>edgepack sandbox</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -790,7 +790,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-  <h1>edge-packager sandbox</h1>
+  <h1>edgepack sandbox</h1>
   <p class="subtitle">Local repackaging tool &mdash; configurable encryption &amp; container format</p>
 
   <div class="card">

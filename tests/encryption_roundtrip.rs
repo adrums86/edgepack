@@ -6,12 +6,12 @@
 //! 3. Re-encrypt plaintext with CENC (CTR mode)
 //! 4. Decrypt CENC ciphertext back to verify it matches original plaintext
 //!
-//! This is the core cryptographic operation of the edge-packager.
+//! This is the core cryptographic operation of the edgepack.
 
 mod common;
 
-use edge_packager::drm::cbcs::CbcsDecryptor;
-use edge_packager::drm::cenc::{self, CencEncryptor};
+use edgepack::drm::cbcs::CbcsDecryptor;
+use edgepack::drm::cenc::{self, CencEncryptor};
 
 /// Helper: encrypt data with AES-128-CBC for creating CBCS test ciphertext.
 fn cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {

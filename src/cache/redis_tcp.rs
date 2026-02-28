@@ -1,5 +1,5 @@
 use crate::cache::CacheBackend;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 
 /// TCP-based Redis backend for runtimes that support socket connections.
 ///
@@ -24,25 +24,25 @@ impl RedisTcpBackend {
 
 impl CacheBackend for RedisTcpBackend {
     fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
-        Err(EdgePackagerError::Cache(
+        Err(EdgepackError::Cache(
             "TCP Redis backend not yet implemented — use HTTP backend".into(),
         ))
     }
 
     fn set(&self, _key: &str, _value: &[u8], _ttl_seconds: u64) -> Result<()> {
-        Err(EdgePackagerError::Cache(
+        Err(EdgepackError::Cache(
             "TCP Redis backend not yet implemented — use HTTP backend".into(),
         ))
     }
 
     fn exists(&self, _key: &str) -> Result<bool> {
-        Err(EdgePackagerError::Cache(
+        Err(EdgepackError::Cache(
             "TCP Redis backend not yet implemented — use HTTP backend".into(),
         ))
     }
 
     fn delete(&self, _key: &str) -> Result<()> {
-        Err(EdgePackagerError::Cache(
+        Err(EdgepackError::Cache(
             "TCP Redis backend not yet implemented — use HTTP backend".into(),
         ))
     }

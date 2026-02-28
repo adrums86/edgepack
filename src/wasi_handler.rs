@@ -17,7 +17,7 @@
 
 use crate::cache;
 use crate::config::AppConfig;
-use crate::error::EdgePackagerError;
+use crate::error::EdgepackError;
 use crate::handler::{self, HandlerContext, HttpMethod, HttpRequest, HttpResponse};
 
 use wasi::http::types::{
@@ -40,7 +40,7 @@ impl wasi::exports::http::incoming_handler::Guest for Component {
 wasi::http::proxy::export!(Component);
 
 /// Inner handler that does the actual work, returning a `Result` for clean error handling.
-fn handle_inner(request: IncomingRequest) -> Result<HttpResponse, EdgePackagerError> {
+fn handle_inner(request: IncomingRequest) -> Result<HttpResponse, EdgepackError> {
     // 1. Parse incoming request into our HttpRequest type
     let http_req = parse_incoming_request(request)?;
 
@@ -61,7 +61,7 @@ fn handle_inner(request: IncomingRequest) -> Result<HttpResponse, EdgePackagerEr
 }
 
 /// Convert a WASI `IncomingRequest` to our library's `HttpRequest`.
-fn parse_incoming_request(request: IncomingRequest) -> Result<HttpRequest, EdgePackagerError> {
+fn parse_incoming_request(request: IncomingRequest) -> Result<HttpRequest, EdgepackError> {
     // Method
     let method = match request.method() {
         wasi::http::types::Method::Get => HttpMethod::Get,
@@ -95,7 +95,7 @@ fn parse_incoming_request(request: IncomingRequest) -> Result<HttpRequest, EdgeP
 }
 
 /// Read the full body from an `IncomingRequest`.
-fn read_incoming_body(request: &IncomingRequest) -> Result<Option<Vec<u8>>, EdgePackagerError> {
+fn read_incoming_body(request: &IncomingRequest) -> Result<Option<Vec<u8>>, EdgepackError> {
     let body = match request.consume() {
         Ok(b) => b,
         Err(_) => return Ok(None),
@@ -129,11 +129,11 @@ fn read_incoming_body(request: &IncomingRequest) -> Result<Option<Vec<u8>>, Edge
 }
 
 /// Convert a library error into an HTTP error response.
-fn error_to_http_response(err: &EdgePackagerError) -> HttpResponse {
+fn error_to_http_response(err: &EdgepackError) -> HttpResponse {
     let (status, message) = match err {
-        EdgePackagerError::NotFound(msg) => (404, msg.clone()),
-        EdgePackagerError::InvalidInput(msg) => (400, msg.clone()),
-        EdgePackagerError::Config(msg) => (
+        EdgepackError::NotFound(msg) => (404, msg.clone()),
+        EdgepackError::InvalidInput(msg) => (400, msg.clone()),
+        EdgepackError::Config(msg) => (
             500,
             format!("configuration error: {msg}"),
         ),

@@ -1,7 +1,7 @@
 use crate::drm::sample_cryptor::{create_decryptor, create_encryptor};
 use crate::drm::scheme::EncryptionScheme;
 use crate::drm::ContentKey;
-use crate::error::{EdgePackagerError, Result};
+use crate::error::{EdgepackError, Result};
 use crate::media::box_type;
 use crate::media::cmaf::{
     self, iterate_boxes, parse_senc, parse_trun, BoxHeader, SencEntry, TrackRunBox,
@@ -62,9 +62,9 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
     }
 
     let (moof_header, moof_bytes) =
-        moof_data.ok_or_else(|| EdgePackagerError::SegmentRewrite("no moof box found".into()))?;
+        moof_data.ok_or_else(|| EdgepackError::SegmentRewrite("no moof box found".into()))?;
     let (mdat_header, mdat_bytes) =
-        mdat_data.ok_or_else(|| EdgePackagerError::SegmentRewrite("no mdat box found".into()))?;
+        mdat_data.ok_or_else(|| EdgepackError::SegmentRewrite("no mdat box found".into()))?;
 
     // Parse moof to extract senc and trun
     let (senc_box, trun_box) = parse_moof_encryption_info(moof_bytes, &moof_header, params.source_iv_size)?;
@@ -78,7 +78,7 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
 
     // Create scheme-appropriate decryptor
     let source_key_bytes: [u8; 16] = params.source_key.key.clone().try_into().map_err(|_| {
-        EdgePackagerError::Encryption("source key must be 16 bytes".into())
+        EdgepackError::Encryption("source key must be 16 bytes".into())
     })?;
     let decryptor = create_decryptor(params.source_scheme, source_key_bytes, params.source_pattern);
 
@@ -87,7 +87,7 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
     for (i, entry) in senc_box.entries.iter().enumerate() {
         let sample_size = sample_sizes.get(i).copied().unwrap_or(0) as usize;
         if sample_offset + sample_size > decrypted_data.len() {
-            return Err(EdgePackagerError::SegmentRewrite(format!(
+            return Err(EdgepackError::SegmentRewrite(format!(
                 "sample {i} extends beyond mdat (offset={sample_offset}, size={sample_size}, mdat={})",
                 decrypted_data.len()
             )));
@@ -101,7 +101,7 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
         } else if let Some(ref constant) = params.constant_iv {
             constant.clone()
         } else {
-            return Err(EdgePackagerError::SegmentRewrite(
+            return Err(EdgepackError::SegmentRewrite(
                 format!("no IV for sample {i}: senc entry has no IV and no constant IV configured")
             ));
         };
@@ -125,7 +125,7 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
 
     // Create scheme-appropriate encryptor
     let target_key_bytes: [u8; 16] = params.target_key.key.clone().try_into().map_err(|_| {
-        EdgePackagerError::Encryption("target key must be 16 bytes".into())
+        EdgepackError::Encryption("target key must be 16 bytes".into())
     })?;
     let encryptor = create_encryptor(params.target_scheme, target_key_bytes, params.target_pattern);
 
@@ -211,10 +211,10 @@ fn parse_moof_encryption_info(
     }
 
     let senc = senc.ok_or_else(|| {
-        EdgePackagerError::SegmentRewrite("no senc box found in moof/traf".into())
+        EdgepackError::SegmentRewrite("no senc box found in moof/traf".into())
     })?;
     let trun = trun.ok_or_else(|| {
-        EdgePackagerError::SegmentRewrite("no trun box found in moof/traf".into())
+        EdgepackError::SegmentRewrite("no trun box found in moof/traf".into())
     })?;
 
     Ok((senc, trun))
@@ -226,7 +226,7 @@ fn extract_sample_sizes(trun: &TrackRunBox) -> Result<Vec<u32>> {
         .iter()
         .map(|e| {
             e.sample_size.ok_or_else(|| {
-                EdgePackagerError::SegmentRewrite(
+                EdgepackError::SegmentRewrite(
                     "trun missing sample_size (flag 0x0200 not set)".into(),
                 )
             })

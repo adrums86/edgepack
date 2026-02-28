@@ -10,19 +10,19 @@
 
 mod common;
 
-use edge_packager::manifest::types::{
+use edgepack::manifest::types::{
     ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat,
 };
-use edge_packager::manifest;
-use edge_packager::media::container::ContainerFormat;
-use edge_packager::repackager::progressive::ProgressiveOutput;
+use edgepack::manifest;
+use edgepack::media::container::ContainerFormat;
+use edgepack::repackager::progressive::ProgressiveOutput;
 
 // ─── ProgressiveOutput State Machine ────────────────────────────────
 
 #[test]
 fn progressive_output_hls_full_lifecycle() {
     let drm_info = ManifestDrmInfo {
-        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        encryption_scheme: edgepack::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgIARIQ".into()),
         playready_pssh: Some("AAAARHBzc2gBAAAAmgTweZhAQoarkuZb4IhflQAAAAE=".into()),
         playready_pro: None,
@@ -106,7 +106,7 @@ fn progressive_output_hls_full_lifecycle() {
 #[test]
 fn progressive_output_dash_full_lifecycle() {
     let drm_info = ManifestDrmInfo {
-        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        encryption_scheme: edgepack::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("WVPSSH".into()),
         playready_pssh: Some("PRPSSH".into()),
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
@@ -402,10 +402,10 @@ fn segment_cache_control_custom_max_age() {
 
 #[test]
 fn progressive_output_hls_iso_lifecycle() {
-    use edge_packager::media::container::ContainerFormat;
+    use edgepack::media::container::ContainerFormat;
 
     let drm_info = ManifestDrmInfo {
-        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        encryption_scheme: edgepack::drm::scheme::EncryptionScheme::Cenc,
         widevine_pssh: Some("dGVzdA==".into()),
         playready_pssh: None,
         playready_pro: None,
@@ -440,7 +440,7 @@ fn progressive_output_hls_iso_lifecycle() {
 
 #[test]
 fn dash_manifest_iso_segment_template() {
-    use edge_packager::media::container::ContainerFormat;
+    use edgepack::media::container::ContainerFormat;
 
     let mut state = common::make_dash_manifest_state(2, ManifestPhase::Complete);
     state.container_format = ContainerFormat::Iso;
@@ -462,7 +462,7 @@ fn dash_manifest_iso_segment_template() {
 
 #[test]
 fn dash_manifest_iso_profiles_no_cmaf() {
-    use edge_packager::media::container::ContainerFormat;
+    use edgepack::media::container::ContainerFormat;
 
     let mut state = common::make_dash_manifest_state(1, ManifestPhase::Live);
     state.container_format = ContainerFormat::Iso;

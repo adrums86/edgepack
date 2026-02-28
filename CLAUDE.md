@@ -1,10 +1,10 @@
-# CLAUDE.md — Agent Context for edge-packager
+# CLAUDE.md — Agent Context for edgepack
 
 This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edge-packager** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. The target encryption scheme and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys.
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. The target encryption scheme and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys.
 
 ## Build Commands
 
@@ -34,7 +34,7 @@ The WASM target requires `rustup target add wasm32-wasip2`. The `.cargo/config.t
 ```
 src/
 ├── lib.rs              Module root (re-exports all submodules)
-├── error.rs            EdgePackagerError enum + Result<T> alias
+├── error.rs            EdgepackError enum + Result<T> alias
 ├── config.rs           AppConfig loaded from env vars
 ├── url.rs              Lightweight URL parser (replaces `url` crate — saves ~200 KB in WASM)
 ├── http_client.rs      Shared outgoing HTTP client (WASI wasi:http/outgoing-handler)
@@ -132,7 +132,7 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 ## Error Handling
 
-All modules use `crate::error::Result<T>` which aliases `std::result::Result<T, EdgePackagerError>`. The `EdgePackagerError` enum has specific variants for each subsystem (Cache, Drm, Speke, Cpix, Encryption, MediaParse, SegmentRewrite, Manifest, Http, Config, InvalidInput, NotFound, Io). Use `thiserror` derive macros. Propagation is via `?` operator throughout.
+All modules use `crate::error::Result<T>` which aliases `std::result::Result<T, EdgepackError>`. The `EdgepackError` enum has specific variants for each subsystem (Cache, Drm, Speke, Cpix, Encryption, MediaParse, SegmentRewrite, Manifest, Http, Config, InvalidInput, NotFound, Io). Use `thiserror` derive macros. Propagation is via `?` operator throughout.
 
 ## Runtime Implementation
 
@@ -224,7 +224,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (all 7 CMAF/ISOBMFF extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a), all route dispatching
 - **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
-- **Error variants**: Display output for every EdgePackagerError variant
+- **Error variants**: Display output for every EdgepackError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
@@ -330,7 +330,7 @@ Sensitive cache entries are protected with encryption at rest and explicit clean
 - **Key derivation**: `derive_key(token)` uses AES-128-ECB as a PRF — encrypts two distinct 16-byte constant blocks with the first 16 bytes of the Redis token to produce 32 bytes of key material. No SHA-256 dependency needed.
 - **Wire format**: `nonce (12 bytes) || ciphertext || tag (16 bytes)` — standard AES-GCM output.
 - **Key sensitivity**: `is_sensitive_key(key)` matches keys ending in `:keys`, `:speke`, or `:rewrite_params`.
-- **Wiring**: `create_backend()` in `cache/mod.rs` automatically wraps the inner backend with `EncryptedCacheBackend`. The sandbox uses `derive_key("edge-packager-sandbox")` since it has no real Redis token.
+- **Wiring**: `create_backend()` in `cache/mod.rs` automatically wraps the inner backend with `EncryptedCacheBackend`. The sandbox uses `derive_key("edgepack-sandbox")` since it has no real Redis token.
 
 ### Post-Processing Cleanup (`pipeline.rs`)
 
