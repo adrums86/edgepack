@@ -736,6 +736,16 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
   <p class="subtitle">Local repackaging tool &mdash; configurable encryption &amp; container format</p>
 
   <div class="card">
+    <label for="source-preset">Test Stream Presets</label>
+    <select id="source-preset">
+      <option value="">Custom URL...</option>
+      <option value="https://storage.googleapis.com/shaka-demo-assets/angel-one-hls/playlist_v-0240p-0400k-libx264.mp4.m3u8">Shaka Angel One HLS (240p, 15 seg)</option>
+      <option value="https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd">Shaka Angel One DASH (multi-res)</option>
+      <option value="https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel-fmp4.ism/tears-of-steel-fmp4-video_eng=401000.m3u8">Unified Tears of Steel HLS fMP4 (184 seg)</option>
+      <option value="https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8">Apple Advanced Stream fMP4 HLS</option>
+      <option value="https://livesim2.dashif.org/vod/testpic_2s/Manifest.mpd">DASH-IF Testpic DASH (2s seg, 1hr)</option>
+    </select>
+
     <label for="source-url">Source Manifest URL or Local Path
       <span id="format-hint" class="format-hint">HLS</span>
     </label>
@@ -804,11 +814,20 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
 
 <script>
 const sourceInput = document.getElementById('source-url');
+const sourcePreset = document.getElementById('source-preset');
 const formatHint = document.getElementById('format-hint');
 const authType = document.getElementById('speke-auth-type');
 const authLabel = document.getElementById('auth-value-label');
 const authValue = document.getElementById('speke-auth-value');
 const apiKeyRow = document.getElementById('api-key-header-row');
+
+sourcePreset.addEventListener('change', () => {
+  const url = sourcePreset.value;
+  if (url) {
+    sourceInput.value = url;
+    sourceInput.dispatchEvent(new Event('input'));
+  }
+});
 
 sourceInput.addEventListener('input', () => {
   const v = sourceInput.value.toLowerCase();
