@@ -7,6 +7,7 @@ pub mod http_client;
 pub mod manifest;
 pub mod media;
 pub mod repackager;
+pub mod url;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasi_handler;

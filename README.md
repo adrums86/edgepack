@@ -35,11 +35,11 @@ The project is configured to build for `wasm32-wasip2` by default (via `.cargo/c
 # Development build
 cargo build
 
-# Release build (size-optimised with LTO)
+# Release build (size-optimised: opt-level=z, LTO, stripped, codegen-units=1, panic=abort)
 cargo build --release
 ```
 
-Output WASM binary:
+Output WASM binary (~495 KB):
 ```
 target/wasm32-wasip2/release/edge_packager.wasm
 ```
@@ -64,7 +64,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **526 tests** (452 unit tests + 74 integration tests) covering every module. To run tests for a specific module:
+The project includes **541 tests** (466 unit tests + 75 integration tests) covering every module, plus a binary size guard ensuring the release WASM stays under 600 KB. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -80,12 +80,13 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
 ```
 
-#### Unit Test Coverage (452 tests)
+#### Unit Test Coverage (466 tests)
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
 | `error` | 16 | Error display strings, Result alias |
 | `config` | 11 | Defaults, serde roundtrips, env var loading |
+| `url` | 14 | URL parsing (scheme, host, port, path, query), join (absolute, relative, protocol-relative, `..`/`.` normalization), serde roundtrip, authority extraction |
 | `cache` | 44 | CacheKeys formatting, backend factory, Upstash JSON response parsing, in-memory cache ops, encrypted backend (AES-256-GCM roundtrip, tamper detection, key sensitivity patterns, key derivation) |
 | `drm` | 100 | EncryptionScheme enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags), SampleDecryptor/SampleEncryptor traits (factory dispatch, CBCS/CENC roundtrips), system IDs, CPIX XML roundtrips, CBCS decrypt + encrypt, CENC encrypt + decrypt, SPEKE client, auth headers |
 | `media` | 85 | FourCC types, ISOBMFF box parsing/building/iteration, ContainerFormat enum (extensions, brands, ftyp building, DASH profiles, serde roundtrips, display), init segment rewriting (CBCS and CENC target schemes, tenc pattern encoding, PSSH filtering, ftyp brand rewriting per container format), segment rewriting (scheme-aware decrypt/re-encrypt), IV padding |
@@ -94,7 +95,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryptio
 | `handler` | 52 | HTTP routing, path parsing, format validation, segment number parsing (.cmfv and .m4s), webhook validation (target_scheme, container_format, CBCS/CENC parsing, invalid scheme/format rejection), response construction, continue endpoint |
 | `http_client` | 5 | Response construction, native stub errors |
 
-#### Integration Test Coverage (74 tests)
+#### Integration Test Coverage (75 tests)
 
 Integration tests live in the `tests/` directory and exercise cross-module workflows with synthetic CMAF fixtures — no external services or network required.
 
@@ -104,6 +105,7 @@ Integration tests live in the `tests/` directory and exercise cross-module workf
 | `isobmff_integration` | 18 | Synthetic init segment parsing and rewriting (scheme-aware: CBCS→CENC with configurable target, container-format-aware ftyp rewriting), PSSH box generation (Widevine+PlayReady, FairPlay exclusion for CENC), senc box roundtrip (with/without subsamples), media segment decrypt→re-encrypt→verify, error handling for malformed segments |
 | `manifest_integration` | 20 | Progressive output lifecycle (HLS+DASH), manifest phase transitions, DRM signaling in manifests (scheme-aware: Widevine/PlayReady key URIs, dynamic METHOD selection, ContentProtection with scheme-specific value, cenc:pssh, mspr:pro), cache-control headers per phase, ManifestState serde roundtrip, cross-format consistency |
 | `handler_integration` | 28 | HTTP routing for all endpoints (health, manifest, init, segment with .cmfv and .m4s extensions, status, webhook), webhook payload validation (valid/invalid JSON, missing fields), HttpResponse helpers (ok, accepted, error, cache headers), unknown routes (404), method filtering |
+| `wasm_binary_size` | 1 | Release WASM binary stays under 600 KB (guards against dependency bloat) |
 
 All integration tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data (ftyp, moov, sinf, schm, tenc, pssh, moof, traf, trun, senc, mdat) programmatically in Rust — no external test media files needed.
 
@@ -326,12 +328,11 @@ The init segment's `ftyp` box is rewritten at output to match the target contain
 | `serde`, `serde_json` | Serialization for config, Redis, webhooks |
 | `base64` | Key encoding in CPIX, PSSH data in manifests |
 | `uuid` | Content Key ID (KID) handling |
-| `url` | URL parsing |
 | `thiserror` | Error type derivation |
 | `log` | Logging facade |
 | `wasi` | WASI Preview 2 bindings (wasm32 target only) |
 
-All dependencies are selected for WASM compatibility (no system calls, no async runtime).
+URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `url` crate, saving ~200 KB of ICU/IDNA Unicode tables in the WASM binary. All dependencies are selected for WASM compatibility (no system calls, no async runtime).
 
 ### Sandbox-Only Dependencies
 

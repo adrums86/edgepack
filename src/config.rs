@@ -1,6 +1,6 @@
 use crate::error::{EdgePackagerError, Result};
+use crate::url::Url;
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 /// Top-level application configuration, typically loaded from environment variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]

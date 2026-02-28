@@ -42,7 +42,7 @@ fn test_context() -> HandlerContext {
                 backend: RedisBackendType::Http,
             },
             drm: DrmConfig {
-                speke_url: url::Url::parse("https://drm.example.com/speke").unwrap(),
+                speke_url: edge_packager::url::Url::parse("https://drm.example.com/speke").unwrap(),
                 speke_auth: SpekeAuth::Bearer("test-bearer-token".into()),
                 system_ids: DrmSystemIds::default(),
             },

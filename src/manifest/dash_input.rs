@@ -9,7 +9,7 @@ use crate::error::{EdgePackagerError, Result};
 use crate::manifest::types::SourceManifest;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use url::Url;
+use crate::url::Url;
 
 /// Parse a DASH MPD manifest into a `SourceManifest`.
 ///

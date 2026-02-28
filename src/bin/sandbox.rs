@@ -155,7 +155,7 @@ async fn handle_repackage(
         }
     };
 
-    let speke_url = match url::Url::parse(&payload.speke_url) {
+    let speke_url = match edge_packager::url::Url::parse(&payload.speke_url) {
         Ok(u) => u,
         Err(e) => {
             return (

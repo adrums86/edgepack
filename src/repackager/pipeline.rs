@@ -1059,7 +1059,7 @@ mod tests {
                 backend: RedisBackendType::Http,
             },
             drm: DrmConfig {
-                speke_url: url::Url::parse("https://speke.test/v2").unwrap(),
+                speke_url: crate::url::Url::parse("https://speke.test/v2").unwrap(),
                 speke_auth: SpekeAuth::Bearer("test".into()),
                 system_ids: DrmSystemIds::default(),
             },
