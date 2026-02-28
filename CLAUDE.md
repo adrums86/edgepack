@@ -22,7 +22,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}')
 cargo check
 
 # Build and run the local sandbox (native binary with web UI)
-cargo run --bin sandbox --features sandbox
+cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | awk '{print $2}')
 ```
 
 **Important**: `cargo test` without `--target` will try to execute the WASM binary directly, which fails with a permission error. Always pass the native host target flag.
@@ -165,7 +165,7 @@ All sandbox dependencies are gated behind `cfg(not(target_arch = "wasm32"))` —
 ### Build & Run
 
 ```bash
-cargo run --bin sandbox --features sandbox
+cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | awk '{print $2}')
 # Web UI at http://localhost:3333
 ```
 

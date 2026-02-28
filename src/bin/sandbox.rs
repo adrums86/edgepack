@@ -4,7 +4,7 @@
 //! locally without deploying to a CDN edge. Uses reqwest for HTTP transport
 //! and an in-memory cache backend instead of Redis.
 //!
-//! Run with: `cargo run --bin sandbox --features sandbox`
+//! Run with: `cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | awk '{print $2}')`
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -54,10 +54,22 @@ struct RepackagePayload {
     #[serde(default)]
     speke_api_key_header: String,
     output_format: String,
+    #[serde(default = "default_target_scheme")]
+    target_scheme: String,
+    #[serde(default = "default_container_format")]
+    container_format: String,
 }
 
 fn default_speke_auth_type() -> String {
     "bearer".into()
+}
+
+fn default_target_scheme() -> String {
+    "cenc".into()
+}
+
+fn default_container_format() -> String {
+    "cmaf".into()
 }
 
 #[derive(Serialize)]
@@ -65,6 +77,7 @@ struct RepackageResponse {
     content_id: String,
     format: String,
     message: String,
+    container_format: String,
 }
 
 #[derive(Serialize)]
@@ -98,6 +111,34 @@ async fn handle_repackage(
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
                     error: "output_format must be 'hls' or 'dash'".into(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let target_scheme = match payload.target_scheme.as_str() {
+        "cenc" => edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        "cbcs" => edge_packager::drm::scheme::EncryptionScheme::Cbcs,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "target_scheme must be 'cenc' or 'cbcs'".into(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let container_format = match payload.container_format.as_str() {
+        "cmaf" => edge_packager::media::container::ContainerFormat::Cmaf,
+        "fmp4" => edge_packager::media::container::ContainerFormat::Fmp4,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "container_format must be 'cmaf' or 'fmp4'".into(),
                 }),
             )
                 .into_response();
@@ -186,12 +227,13 @@ async fn handle_repackage(
         cache: CacheConfig::default(),
     };
 
+    let container_format_str = payload.container_format.clone();
     let request = RepackageRequest {
         content_id: content_id.clone(),
         source_url,
         output_format,
-        target_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
-        container_format: edge_packager::media::container::ContainerFormat::Cmaf,
+        target_scheme,
+        container_format,
         key_ids: vec![],
     };
 
@@ -245,6 +287,7 @@ async fn handle_repackage(
             content_id,
             format: fmt_str.into(),
             message: "repackaging started".into(),
+            container_format: container_format_str,
         }),
     )
         .into_response()
@@ -727,7 +770,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>edge-packager sandbox</h1>
-  <p class="subtitle">Local repackaging tool &mdash; CBCS &rarr; CENC</p>
+  <p class="subtitle">Local repackaging tool &mdash; configurable encryption &amp; container format</p>
 
   <div class="card">
     <label for="source-url">Source Manifest URL or Local Path
@@ -757,6 +800,18 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
     <div class="radio-group">
       <label><input type="radio" name="output-format" value="hls" checked> HLS (.m3u8)</label>
       <label><input type="radio" name="output-format" value="dash"> DASH (.mpd)</label>
+    </div>
+
+    <label>Target Encryption Scheme</label>
+    <div class="radio-group">
+      <label><input type="radio" name="target-scheme" value="cenc" checked> CENC (AES-CTR)</label>
+      <label><input type="radio" name="target-scheme" value="cbcs"> CBCS (AES-CBC)</label>
+    </div>
+
+    <label>Container Format</label>
+    <div class="radio-group">
+      <label><input type="radio" name="container-format" value="cmaf" checked> CMAF (.cmfv)</label>
+      <label><input type="radio" name="container-format" value="fmp4"> fMP4 (.m4s)</label>
     </div>
 
     <button id="submit-btn" onclick="startRepackage()">Repackage</button>
@@ -825,6 +880,8 @@ async function startRepackage() {
   btn.textContent = 'Starting...';
 
   const outputFormat = document.querySelector('input[name="output-format"]:checked').value;
+  const targetScheme = document.querySelector('input[name="target-scheme"]:checked').value;
+  const containerFormat = document.querySelector('input[name="container-format"]:checked').value;
 
   const body = {
     source_url: sourceInput.value,
@@ -833,6 +890,8 @@ async function startRepackage() {
     speke_auth_value: authValue.value,
     speke_api_key_header: document.getElementById('api-key-header').value,
     output_format: outputFormat,
+    target_scheme: targetScheme,
+    container_format: containerFormat,
   };
 
   try {
@@ -861,7 +920,8 @@ async function startRepackage() {
     document.getElementById('output-section').classList.add('hidden');
 
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => pollStatus(data.content_id, data.format), 1000);
+    const storedContainerFormat = data.container_format || 'cmaf';
+    pollTimer = setInterval(() => pollStatus(data.content_id, data.format, storedContainerFormat), 1000);
   } catch (e) {
     alert('Request failed: ' + e.message);
     btn.disabled = false;
@@ -869,7 +929,7 @@ async function startRepackage() {
   }
 }
 
-async function pollStatus(contentId, format) {
+async function pollStatus(contentId, format, containerFormat) {
   try {
     const resp = await fetch(`/api/status/${contentId}/${format}`);
     if (!resp.ok) return;
@@ -909,10 +969,11 @@ async function pollStatus(contentId, format) {
 
         const base = `/api/output/${contentId}/${format}`;
         const ext = format === 'hls' ? 'm3u8' : 'mpd';
+        const segExt = containerFormat === 'fmp4' ? '.m4s' : '.cmfv';
         linksEl.innerHTML += `<a href="${base}/manifest.${ext}" target="_blank">manifest.${ext}</a>`;
         linksEl.innerHTML += `<a href="${base}/init.mp4" target="_blank">init.mp4</a>`;
         for (let i = 0; i < data.segments_completed; i++) {
-          linksEl.innerHTML += `<a href="${base}/segment_${i}.cmfv" target="_blank">segment_${i}.cmfv</a>`;
+          linksEl.innerHTML += `<a href="${base}/segment_${i}${segExt}" target="_blank">segment_${i}${segExt}</a>`;
         }
 
         document.getElementById('output-section').classList.remove('hidden');

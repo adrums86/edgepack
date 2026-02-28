@@ -352,7 +352,7 @@ The sandbox lets you test the full repackaging pipeline locally without deployin
 ### Running
 
 ```bash
-cargo run --bin sandbox --features sandbox
+cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | awk '{print $2}')
 ```
 
 The web UI is available at **http://localhost:3333**.
