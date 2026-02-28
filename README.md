@@ -1,4 +1,4 @@
-<img width="360" height="240" alt="edgepack_logo" src="edgepack.png" style="mask-image: radial-gradient(circle, black 60%, transparent 20%); -webkit-mask-image: radial-gradient(circle, black 60%, transparent 85%);" alt="Faded Image"/>
+<img width="360" height="240" alt="edgepack_logo" src="edgepack.png" />
 
 
 # edgepack
