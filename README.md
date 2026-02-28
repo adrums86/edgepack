@@ -1,5 +1,6 @@
-# edgepack
 <img width="512" height="403" alt="edgepack_logo" src="https://github.com/user-attachments/assets/dc17d631-efb2-41e6-9b6e-cea634c03988" />
+
+# edgepack
 
 A Rust application compiled to WebAssembly for CDN edge environments. It repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC) and container formats (CMAF ↔ fMP4), producing progressive output manifests and segments cached at the CDN for maximum duration. The target encryption scheme and container format are configurable per request, supporting all encryption scheme combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) with automatic source scheme detection, and output as either CMAF or fragmented MP4.
 
