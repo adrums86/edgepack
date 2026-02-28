@@ -117,6 +117,16 @@ async fn handle_repackage(
         }
     };
 
+    if payload.target_scheme == "none" {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: "Clear (unencrypted) output is planned for Phase 3. Currently only 'cenc' and 'cbcs' target schemes are supported.".into(),
+            }),
+        )
+            .into_response();
+    }
+
     let target_scheme = match payload.target_scheme.as_str() {
         "cenc" => edge_packager::drm::scheme::EncryptionScheme::Cenc,
         "cbcs" => edge_packager::drm::scheme::EncryptionScheme::Cbcs,
@@ -124,7 +134,7 @@ async fn handle_repackage(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "target_scheme must be 'cenc' or 'cbcs'".into(),
+                    error: "target_scheme must be 'cenc', 'cbcs', or 'none'".into(),
                 }),
             )
                 .into_response();
@@ -778,23 +788,26 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
     </label>
     <input type="text" id="source-url" placeholder="https://cdn.example.com/master.m3u8 or ./path/to/manifest.mpd">
 
-    <label for="speke-url">SPEKE License Server URL</label>
-    <input type="text" id="speke-url" placeholder="https://drm-provider.example.com/speke/v2">
+    <div id="speke-section">
+      <label for="speke-url">SPEKE License Server URL</label>
+      <input type="text" id="speke-url" placeholder="https://drm-provider.example.com/speke/v2">
 
-    <label for="speke-auth-type">SPEKE Authentication</label>
-    <select id="speke-auth-type">
-      <option value="bearer">Bearer Token</option>
-      <option value="api_key">API Key</option>
-      <option value="basic">Basic Auth</option>
-    </select>
+      <label for="speke-auth-type">SPEKE Authentication</label>
+      <select id="speke-auth-type">
+        <option value="bearer">Bearer Token</option>
+        <option value="api_key">API Key</option>
+        <option value="basic">Basic Auth</option>
+      </select>
 
-    <label id="auth-value-label" for="speke-auth-value">Bearer Token</label>
-    <input type="text" id="speke-auth-value" placeholder="your-token-here">
+      <label id="auth-value-label" for="speke-auth-value">Bearer Token</label>
+      <input type="text" id="speke-auth-value" placeholder="your-token-here">
 
-    <div id="api-key-header-row" class="hidden">
-      <label for="api-key-header">API Key Header Name</label>
-      <input type="text" id="api-key-header" placeholder="x-api-key" value="x-api-key">
+      <div id="api-key-header-row" class="hidden">
+        <label for="api-key-header">API Key Header Name</label>
+        <input type="text" id="api-key-header" placeholder="x-api-key" value="x-api-key">
+      </div>
     </div>
+    <p id="clear-hint" class="hidden" style="font-size:0.8rem;color:var(--text-muted);margin:0.25rem 0;">Source encryption is auto-detected. SPEKE fields hidden because target is clear (no encryption).</p>
 
     <label>Output Format</label>
     <div class="radio-group">
@@ -806,6 +819,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
     <div class="radio-group">
       <label><input type="radio" name="target-scheme" value="cenc" checked> CENC (AES-CTR)</label>
       <label><input type="radio" name="target-scheme" value="cbcs"> CBCS (AES-CBC)</label>
+      <label><input type="radio" name="target-scheme" value="none"> None (Clear)</label>
     </div>
 
     <label>Container Format</label>
@@ -870,6 +884,22 @@ authType.addEventListener('change', () => {
     authValue.placeholder = 'user:pass';
     apiKeyRow.classList.add('hidden');
   }
+});
+
+// Toggle SPEKE section visibility based on target encryption scheme
+const spekeSection = document.getElementById('speke-section');
+const clearHint = document.getElementById('clear-hint');
+document.querySelectorAll('input[name="target-scheme"]').forEach(radio => {
+  radio.addEventListener('change', () => {
+    const scheme = document.querySelector('input[name="target-scheme"]:checked').value;
+    if (scheme === 'none') {
+      spekeSection.classList.add('hidden');
+      clearHint.classList.remove('hidden');
+    } else {
+      spekeSection.classList.remove('hidden');
+      clearHint.classList.add('hidden');
+    }
+  });
 });
 
 let pollTimer = null;
