@@ -7,7 +7,7 @@
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgePackagerError, Result};
 use crate::manifest::types::SourceManifest;
-use url::Url;
+use crate::url::Url;
 
 /// Parse an HLS M3U8 media playlist into a `SourceManifest`.
 ///

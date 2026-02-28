@@ -99,7 +99,7 @@ impl SpekeClient {
 mod tests {
     use super::*;
     use crate::config::DrmSystemIds;
-    use url::Url;
+    use crate::url::Url;
 
     fn make_config(auth: SpekeAuth, widevine: bool, playready: bool) -> DrmConfig {
         DrmConfig {

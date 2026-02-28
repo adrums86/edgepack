@@ -81,7 +81,7 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
     use wasi::http::types::{Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, Scheme};
 
     // 1. Parse URL into components
-    let parsed = url::Url::parse(&req.url).map_err(|e| EdgePackagerError::Http {
+    let parsed = crate::url::Url::parse(&req.url).map_err(|e| EdgePackagerError::Http {
         status: 0,
         message: format!("invalid URL: {e}"),
     })?;

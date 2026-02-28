@@ -12,7 +12,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 # Development build (default target is wasm32-wasip2 via .cargo/config.toml)
 cargo build
 
-# Release build (optimised for size: opt-level=s, LTO, stripped)
+# Release build (optimised for size: opt-level=z, LTO, stripped, codegen-units=1, panic=abort)
 cargo build --release
 
 # Run unit tests (MUST specify native host target — tests cannot run in WASI)
@@ -36,6 +36,7 @@ src/
 ├── lib.rs              Module root (re-exports all submodules)
 ├── error.rs            EdgePackagerError enum + Result<T> alias
 ├── config.rs           AppConfig loaded from env vars
+├── url.rs              Lightweight URL parser (replaces `url` crate — saves ~200 KB in WASM)
 ├── http_client.rs      Shared outgoing HTTP client (WASI wasi:http/outgoing-handler)
 ├── wasi_handler.rs     WASI incoming handler bridge (wasm32 only)
 ├── bin/
@@ -187,7 +188,6 @@ Pipeline output is written to `sandbox/output/{content_id}/{format}/` and also s
 | `serde_json` | 1 | JSON for Redis, webhooks, job state |
 | `base64` | 0.22 | Key encoding in CPIX, PSSH in manifests |
 | `uuid` | 1 | Content Key IDs (KIDs) |
-| `url` | 2 | URL parsing for SPEKE endpoint, source URLs |
 | `thiserror` | 2 | Derive macro for error types |
 | `log` | 0.4 | Logging facade |
 | `wasi` | 0.14 | WASI Preview 2 bindings (wasm32 target only) |
@@ -197,13 +197,13 @@ Pipeline output is written to `sandbox/output/{content_id}/{format}/` and also s
 | `tower-http` | 0.6 | Static file serving for local paths (sandbox feature, non-wasm32 only) |
 | `tracing-subscriber` | 0.3 | Log output for sandbox (sandbox feature, non-wasm32 only) |
 
-Core crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements). Sandbox crates are gated behind `cfg(not(target_arch = "wasm32"))` and never appear in the WASM build.
+URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `url` crate, saving ~200 KB of ICU/IDNA Unicode tables in the WASM binary. Core crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements). Sandbox crates are gated behind `cfg(not(target_arch = "wasm32"))` and never appear in the WASM build.
 
 ## Tests
 
-The project has **526 tests** total: 452 unit tests and 74 integration tests. All run on the native host target.
+The project has **541 tests** total: 466 unit tests and 75 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
 
-### Unit Tests (452)
+### Unit Tests (466)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -218,13 +218,14 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion, container format threading through ContinuationParams
+- **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (.cmfv and .m4s), all route dispatching
 - **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, container_format parsing, invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgePackagerError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (74)
+### Integration Tests (75)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -235,7 +236,8 @@ tests/
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
 ├── manifest_integration.rs   20 tests: progressive output lifecycle, DRM signaling, cache headers
-└── handler_integration.rs    28 tests: HTTP routing (incl. .cmfv and .m4s segments), webhook validation, response helpers
+├── handler_integration.rs    28 tests: HTTP routing (incl. .cmfv and .m4s segments), webhook validation, response helpers
+└── wasm_binary_size.rs        1 test: release WASM binary stays under 600 KB size limit
 ```
 
 **Key fixtures in `tests/common/mod.rs`:**
@@ -368,7 +370,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Added ftyp brand rewriting in `src/media/init.rs` — 3 new tests
 - Wired `container_format` through `RepackageRequest`, `WebhookPayload`, `ManifestState`, `ContinuationParams`, pipeline, progressive output, and manifest renderers
 - Updated segment URI extensions dynamically, DASH profile signaling, and route handling for `.cmfv`/`.m4s`
-- Result: 526 tests total (452 unit + 74 integration), +31 from Phase 1
+- Result: 541 tests total (466 unit + 75 integration), including binary size guard test
 
 ### Phase 3: Unencrypted Input Support
 - Add `EncryptionScheme::None` variant for clear (unencrypted) content
