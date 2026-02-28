@@ -222,15 +222,17 @@ Segments never change once written. The CDN serves them without hitting the edge
 
 ### Redis (application state)
 
+Keys marked with † are only written by the split execution path (`execute_first()`/`execute_remaining()`) used in WASI production. The synchronous `execute()` path (sandbox) keeps output in memory and does not cache media data in Redis.
+
 | Key | TTL | Sensitive | Purpose |
 |-----|-----|-----------|---------|
 | `ep:{id}:keys` | 24h | **Yes** | Cached DRM content keys |
 | `ep:{id}:{fmt}:state` | 48h | No | Job state and progress |
-| `ep:{id}:{fmt}:manifest_state` | 48h | No | Progressive manifest state (segment list, phase) |
-| `ep:{id}:{fmt}:init` | 48h | No | Rewritten init segment binary data |
-| `ep:{id}:{fmt}:seg:{n}` | 48h | No | Rewritten media segment binary data |
-| `ep:{id}:{fmt}:source` | 48h | No | Source manifest metadata (segment URLs, durations) |
-| `ep:{id}:{fmt}:rewrite_params` | 48h | **Yes** | Continuation parameters (encryption keys, IV sizes, pattern) |
+| `ep:{id}:{fmt}:manifest_state` † | 48h | No | Progressive manifest state (segment list, phase) |
+| `ep:{id}:{fmt}:init` † | 48h | No | Rewritten init segment binary data |
+| `ep:{id}:{fmt}:seg:{n}` † | 48h | No | Rewritten media segment binary data |
+| `ep:{id}:{fmt}:source` † | 48h | No | Source manifest metadata (segment URLs, durations) |
+| `ep:{id}:{fmt}:rewrite_params` † | 48h | **Yes** | Continuation parameters (encryption keys, IV sizes, pattern) |
 | `ep:{id}:speke` | 24h | **Yes** | Cached SPEKE license server responses |
 
 ### Security Model
@@ -239,7 +241,7 @@ Sensitive cache entries (marked **Yes** above) are protected with two layers:
 
 1. **Encryption at rest** — All sensitive values are encrypted with AES-256-GCM before being stored in Redis. The encryption key is derived from the `REDIS_TOKEN` using AES-128-ECB as a PRF on two distinct constant blocks, producing 32 bytes of key material. Wire format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`. Non-sensitive keys pass through unencrypted.
 
-2. **Immediate cleanup** — As soon as the pipeline finishes processing all segments (whether via `execute()`, `execute_first()` for single-segment content, or `execute_remaining()` for the final segment), all sensitive cache entries are explicitly deleted. This ensures DRM keys, SPEKE responses, and rewrite parameters do not persist in Redis beyond the active processing window. Cleanup failures are intentionally swallowed so they cannot prevent the pipeline from reporting success.
+2. **Immediate cleanup** — As soon as the pipeline finishes processing all segments (whether via `execute()`, `execute_first()` for single-segment content, or `execute_remaining()` for the final segment), all sensitive cache entries (DRM keys, SPEKE responses, rewrite parameters, source manifest) are explicitly deleted. This ensures sensitive data does not persist in Redis beyond the active processing window. Cleanup failures are intentionally swallowed so they cannot prevent the pipeline from reporting success.
 
 ## Architecture
 
@@ -379,7 +381,7 @@ These are only included when building with `--features sandbox` and are gated be
 
 ## Local Sandbox
 
-The sandbox lets you test the full repackaging pipeline locally without deploying to a CDN edge. It reuses the same `RepackagePipeline` as the production WASM build, but with `reqwest` for HTTP transport and an in-memory cache instead of Redis.
+The sandbox lets you test the full repackaging pipeline locally without deploying to a CDN edge. It reuses the same `RepackagePipeline` as the production WASM build, but with `reqwest` for HTTP transport and an in-memory cache instead of Redis. The sandbox uses the synchronous `execute()` path which returns all output directly via `ProgressiveOutput` — output is written to disk from memory, not round-tripped through cache.
 
 ### Running
 
@@ -400,9 +402,9 @@ You can also use a local file path (e.g. `./content/master.m3u8`) — the sandbo
 
 1. The web UI collects source URL, SPEKE credentials, and output format
 2. The sandbox builds an `AppConfig` and `RepackageRequest`, then runs `RepackagePipeline::execute()` in a blocking thread
-3. The pipeline fetches the source manifest, gets DRM keys via SPEKE, and repackages all segments
+3. The pipeline fetches the source manifest, gets DRM keys via SPEKE, and repackages all segments — returning `(JobStatus, ProgressiveOutput)` with all output data in memory
 4. Progress is polled from the shared in-memory cache via `/api/status/{id}/{format}`
-5. On completion, output is written to disk at `sandbox/output/{content_id}/{format}/`
+5. On completion, output is written to disk directly from the `ProgressiveOutput` object at `sandbox/output/{content_id}/{format}/`
 
 ### Output Structure
 
@@ -424,7 +426,7 @@ Segment file extensions are determined by the `container_format` setting (`.cmfv
 | GET | `/` | Web UI |
 | POST | `/api/repackage` | Start repackaging job |
 | GET | `/api/status/{id}/{format}` | Poll job progress |
-| GET | `/api/output/{id}/{format}/{file}` | Serve output files |
+| GET | `/api/output/{id}/{format}/{file}` | Serve output files (from disk) |
 
 ## Project Status
 
@@ -433,7 +435,7 @@ The runtime is fully implemented and compiles to a functional WASM component:
 - **WASI HTTP transport**: Shared HTTP client (`http_client.rs`) uses `wasi:http/outgoing-handler` for all outbound requests (Redis, SPEKE, origin fetching). Native builds return a stub error to preserve test builds.
 - **WASI incoming handler**: `wasi_handler.rs` bridges `wasi:http/incoming-handler` to the library router. Converts WASI request/response types and maps errors to appropriate HTTP status codes.
 - **Source manifest parsing**: HLS M3U8 (`manifest/hls_input.rs`) and DASH MPD (`manifest/dash_input.rs`) input parsers extract segment URLs, durations, init segment references, live/VOD detection, and source encryption scheme (from `#EXT-X-KEY` METHOD in HLS or `<ContentProtection>` elements in DASH).
-- **Request handler wiring**: All GET handlers query Redis for cached segment data and manifest state. The webhook creates a `RepackagePipeline`, processes the first segment to produce a live manifest, and chains remaining processing via self-invocation.
+- **Request handler wiring**: All GET handlers query Redis for cached segment data and manifest state (written by the split execution path). The webhook creates a `RepackagePipeline`, processes the first segment to produce a live manifest, and chains remaining processing via self-invocation. The sandbox uses the synchronous `execute()` path which returns all output directly via `ProgressiveOutput` without caching media in Redis.
 - **Configurable encryption**: Target encryption scheme (CBCS, CENC, or None) is set per request. Source scheme auto-detected. Supports all nine combinations including clear content paths.
 - **Configurable container format**: Output container format (CMAF or fMP4) is set per request. Controls ftyp brands, segment extensions, and DASH profile signaling.
 

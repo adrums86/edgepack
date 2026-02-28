@@ -23,9 +23,9 @@ use edgepack::config::{
     AppConfig, CacheConfig, DrmConfig, DrmSystemIds, RedisBackendType, RedisConfig, SpekeAuth,
 };
 use edgepack::manifest;
-use edgepack::manifest::types::ManifestState;
 use edgepack::manifest::types::OutputFormat;
 use edgepack::repackager::pipeline::RepackagePipeline;
+use edgepack::repackager::progressive::ProgressiveOutput;
 use edgepack::repackager::{JobStatus, RepackageRequest};
 
 // ─── Application State ─────────────────────────────────────────────────
@@ -277,7 +277,7 @@ async fn handle_repackage(
         );
         let pipeline = RepackagePipeline::new(config, Box::new(encrypted_cache));
         match pipeline.execute(&request) {
-            Ok(status) => {
+            Ok((status, output)) => {
                 eprintln!(
                     "  Pipeline complete: {}/{} — {} segments",
                     status.content_id,
@@ -285,7 +285,7 @@ async fn handle_repackage(
                     status.segments_completed
                 );
                 // Write output to disk
-                if let Err(e) = write_output_to_disk(&cid, fmt, &cache) {
+                if let Err(e) = write_output_to_disk(&cid, fmt, &output) {
                     eprintln!("  Warning: failed to write output to disk: {e}");
                 }
             }
@@ -371,7 +371,6 @@ async fn handle_status(
 }
 
 async fn handle_output(
-    State(state): State<Arc<AppState>>,
     Path((content_id, format, file)): Path<(String, String, String)>,
 ) -> Response {
     let fmt = match format.as_str() {
@@ -381,57 +380,34 @@ async fn handle_output(
         }
     };
 
-    let output_format = match fmt {
-        "hls" => OutputFormat::Hls,
-        _ => OutputFormat::Dash,
+    let out_dir = PathBuf::from(format!("sandbox/output/{content_id}/{fmt}"));
+    let file_path = out_dir.join(&file);
+
+    // For bare "manifest" request, try both extensions
+    let path = if file == "manifest" {
+        let m3u8 = out_dir.join("manifest.m3u8");
+        let mpd = out_dir.join("manifest.mpd");
+        if m3u8.exists() {
+            m3u8
+        } else if mpd.exists() {
+            mpd
+        } else {
+            return (StatusCode::NOT_FOUND, "manifest not found").into_response();
+        }
+    } else {
+        file_path
     };
 
-    // Manifest
-    if file == "manifest" || file == format!("manifest.{}", output_format.manifest_extension()) {
-        let key = CacheKeys::manifest_state(&content_id, fmt);
-        match state.cache.get(&key) {
-            Ok(Some(data)) => match serde_json::from_slice::<ManifestState>(&data) {
-                Ok(ms) => match manifest::render_manifest(&ms) {
-                    Ok(rendered) => {
-                        let ct = output_format.content_type();
-                        ([(axum::http::header::CONTENT_TYPE, ct)], rendered).into_response()
-                    }
-                    Err(e) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, format!("render error: {e}"))
-                            .into_response()
-                    }
-                },
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("deserialize error: {e}"),
-                )
-                    .into_response(),
-            },
-            Ok(None) => (StatusCode::NOT_FOUND, "manifest not found").into_response(),
-            Err(e) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("cache error: {e}")).into_response()
-            }
-        }
-    }
-    // Init segment
-    else if file == "init.mp4" {
-        let key = CacheKeys::init_segment(&content_id, fmt);
-        serve_binary(&state.cache, &key, "video/mp4").await
-    }
-    // Media segment
-    else if let Some(num) = parse_segment_number(&file) {
-        let key = CacheKeys::media_segment(&content_id, fmt, num);
-        serve_binary(&state.cache, &key, "video/mp4").await
-    } else {
-        (StatusCode::NOT_FOUND, "unknown file").into_response()
-    }
-}
+    // Determine content type from the resolved path
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("m3u8") => "application/vnd.apple.mpegurl",
+        Some("mpd") => "application/dash+xml",
+        _ => "video/mp4",
+    };
 
-async fn serve_binary(cache: &InMemoryCacheBackend, key: &str, content_type: &str) -> Response {
-    match cache.get(key) {
-        Ok(Some(data)) => ([(axum::http::header::CONTENT_TYPE, content_type)], data).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("cache error: {e}")).into_response(),
+    match std::fs::read(&path) {
+        Ok(data) => ([(axum::http::header::CONTENT_TYPE, content_type)], data).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
@@ -451,24 +427,6 @@ fn is_local_path(s: &str) -> bool {
         || s.starts_with("./")
         || s.starts_with("../")
         || (!s.contains("://") && !s.starts_with("http"))
-}
-
-fn parse_segment_number(filename: &str) -> Option<u32> {
-    // All ISOBMFF (ISO 14496-12) and CMAF (ISO 23000-19) segment extensions.
-    const SEGMENT_EXTENSIONS: &[&str] = &[
-        ".cmfv", // CMAF video (ISO 23000-19)
-        ".cmfa", // CMAF audio (ISO 23000-19)
-        ".cmft", // CMAF text (ISO 23000-19)
-        ".cmfm", // CMAF multiplexed (ISO 23000-19)
-        ".m4s",  // fMP4 media segment (ISO 14496-12)
-        ".mp4",  // ISO BMFF segment (ISO 14496-12)
-        ".m4a",  // ISOBMFF audio segment (ISO 14496-12)
-    ];
-    let name = SEGMENT_EXTENSIONS
-        .iter()
-        .find_map(|ext| filename.strip_suffix(ext))?;
-    let num_str = name.strip_prefix("segment_")?;
-    num_str.parse().ok()
 }
 
 async fn start_local_file_server(path: &str) -> Result<String, String> {
@@ -507,7 +465,7 @@ async fn start_local_file_server(path: &str) -> Result<String, String> {
 fn write_output_to_disk(
     content_id: &str,
     format: OutputFormat,
-    cache: &InMemoryCacheBackend,
+    output: &ProgressiveOutput,
 ) -> Result<(), String> {
     let fmt_str = match format {
         OutputFormat::Hls => "hls",
@@ -519,50 +477,31 @@ fn write_output_to_disk(
         .map_err(|e| format!("create output dir: {e}"))?;
 
     // Write manifest
-    let manifest_key = CacheKeys::manifest_state(content_id, fmt_str);
-    if let Ok(Some(data)) = cache.get(&manifest_key) {
-        if let Ok(state) = serde_json::from_slice::<ManifestState>(&data) {
-            if let Ok(rendered) = manifest::render_manifest(&state) {
-                let ext = format.manifest_extension();
-                let manifest_path = out_dir.join(format!("manifest.{ext}"));
-                std::fs::write(&manifest_path, rendered)
-                    .map_err(|e| format!("write manifest: {e}"))?;
-                eprintln!("  Wrote {}", manifest_path.display());
-            }
-        }
+    let state = output.manifest_state();
+    if let Ok(rendered) = manifest::render_manifest(state) {
+        let ext = format.manifest_extension();
+        let manifest_path = out_dir.join(format!("manifest.{ext}"));
+        std::fs::write(&manifest_path, rendered)
+            .map_err(|e| format!("write manifest: {e}"))?;
+        eprintln!("  Wrote {}", manifest_path.display());
     }
 
     // Write init segment
-    let init_key = CacheKeys::init_segment(content_id, fmt_str);
-    if let Ok(Some(data)) = cache.get(&init_key) {
+    if let Some(data) = output.init_segment_data() {
         let init_path = out_dir.join("init.mp4");
-        std::fs::write(&init_path, &data).map_err(|e| format!("write init segment: {e}"))?;
+        std::fs::write(&init_path, data).map_err(|e| format!("write init segment: {e}"))?;
         eprintln!("  Wrote {} ({} bytes)", init_path.display(), data.len());
     }
 
     // Write media segments
-    // Determine extension from manifest state if available
-    let seg_ext = if let Ok(Some(state_data)) = cache.get(&manifest_key) {
-        if let Ok(state) = serde_json::from_slice::<ManifestState>(&state_data) {
-            state.container_format.video_segment_extension().to_string()
-        } else {
-            ".cmfv".to_string()
-        }
-    } else {
-        ".cmfv".to_string()
-    };
-
+    let seg_ext = state.container_format.video_segment_extension();
     let mut seg_num = 0u32;
-    loop {
-        let seg_key = CacheKeys::media_segment(content_id, fmt_str, seg_num);
-        match cache.get(&seg_key) {
-            Ok(Some(data)) => {
-                let seg_path = out_dir.join(format!("segment_{seg_num}{seg_ext}"));
-                std::fs::write(&seg_path, &data)
-                    .map_err(|e| format!("write segment {seg_num}: {e}"))?;
-                seg_num += 1;
-            }
-            _ => break,
+    for seg in &state.segments {
+        if let Some(data) = output.segment_data(seg.number) {
+            let seg_path = out_dir.join(format!("segment_{}{seg_ext}", seg.number));
+            std::fs::write(&seg_path, data)
+                .map_err(|e| format!("write segment {}: {e}", seg.number))?;
+            seg_num += 1;
         }
     }
     if seg_num > 0 {

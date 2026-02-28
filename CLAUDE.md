@@ -87,7 +87,7 @@ Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md).
 ### Two-Tier Caching
 
 - **CDN cache** (primary): HTTP `Cache-Control` headers on responses. Segments and finalised manifests use `max-age=31536000, immutable`. Live manifests use `max-age=1, s-maxage=1`.
-- **Redis** (application state): Stores DRM keys, job state, SPEKE response cache, and progressive manifest state. NOT used for storing media data.
+- **Redis** (application state): Stores DRM keys, job state, SPEKE response cache, progressive manifest state, and rewritten media data (init segments, media segments) for the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) does not cache media data in Redis — it returns output directly via `ProgressiveOutput`.
 
 ### Encryption Transform
 
@@ -147,19 +147,19 @@ All HTTP transport and request handling is fully implemented:
 2. **`wasi_handler.rs`**: WASI incoming handler bridge implementing `wasi:http/incoming-handler::Guest`. Converts WASI types ↔ library types and maps errors to HTTP status codes.
 3. **`cache/redis_http.rs` → `execute_command()`**: Uses `http_client::get()` to make Upstash REST API calls. Parses JSON responses via extracted `parse_upstash_response()`.
 4. **`drm/speke.rs` → `post_cpix()`**: Uses `http_client::post()` to POST CPIX XML to license server with auth headers.
-5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. Pipeline split into `execute_first()` (through first segment + live manifest) and `execute_remaining()` (one segment per invocation with self-invocation chaining).
+5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. Two execution modes: `execute()` processes all segments synchronously and returns `(JobStatus, ProgressiveOutput)` with all output data in memory (used by sandbox). `execute_first()` + `execute_remaining()` is the split execution model for WASI — caches init segments, media segments, and manifest state in Redis for serving via GET handlers, with self-invocation chaining.
 6. **`manifest/hls_input.rs` + `dash_input.rs`**: Source manifest input parsers extracting segment URLs, durations, init segment references, and live/VOD detection.
 7. **`handler/request.rs`**: All four GET handlers query Redis for cached segment data and manifest state via `HandlerContext`.
 8. **`handler/webhook.rs`**: Creates pipeline, calls `execute_first()`, fires self-invocation to `/webhook/repackage/continue`, returns 200 after first manifest publishes. Continue handler chains remaining segment processing.
 
 ## Local Sandbox
 
-The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache.
+The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `(JobStatus, ProgressiveOutput)` — output is written to disk directly from the `ProgressiveOutput` object, not round-tripped through cache.
 
 ### Architecture
 
 - **`http_client.rs`** has a three-way `#[cfg]` dispatch: `wasm32` → WASI HTTP, `sandbox` feature → `reqwest::blocking`, neither → stub error
-- **`cache/memory.rs`** implements `CacheBackend` using `Arc<RwLock<HashMap>>` (shared between pipeline thread and API server)
+- **`cache/memory.rs`** implements `CacheBackend` using `Arc<RwLock<HashMap>>` (shared between pipeline thread and API server; used for job state and DRM key caching, not for media output)
 - **`src/bin/sandbox.rs`** is a single-file Axum server with embedded HTML/CSS/JS UI
 
 ### Feature Gate
@@ -180,7 +180,7 @@ cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | aw
 
 ### Output
 
-Pipeline output is written to `sandbox/output/{content_id}/{format}/` and also served via the API at `/api/output/{id}/{format}/{file}`.
+Pipeline output is written to `sandbox/output/{content_id}/{format}/` and served via the API at `/api/output/{id}/{format}/{file}` (reads directly from disk, not from cache).
 
 ## Dependencies
 
@@ -308,15 +308,17 @@ When adding new functionality, follow the existing pattern:
 
 ## Redis Key Schema
 
+Keys marked with † are only written by the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) keeps output in memory via `ProgressiveOutput` and does not cache media data in Redis.
+
 | Key Pattern | TTL | Content |
 |-------------|-----|---------|
 | `ep:{content_id}:keys` | 24h | Serialized DRM content keys (JSON) |
 | `ep:{content_id}:{format}:state` | 48h | JobStatus JSON (state, progress) |
-| `ep:{content_id}:{format}:manifest_state` | 48h | ManifestState JSON (segments, phase) |
-| `ep:{content_id}:{format}:init` | 48h | Rewritten init segment binary data |
-| `ep:{content_id}:{format}:seg:{n}` | 48h | Rewritten media segment binary data |
-| `ep:{content_id}:{format}:source` | 48h | Source manifest metadata (segment URLs, durations, is_live) |
-| `ep:{content_id}:{format}:rewrite_params` | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
+| `ep:{content_id}:{format}:manifest_state` † | 48h | ManifestState JSON (segments, phase) |
+| `ep:{content_id}:{format}:init` † | 48h | Rewritten init segment binary data |
+| `ep:{content_id}:{format}:seg:{n}` † | 48h | Rewritten media segment binary data |
+| `ep:{content_id}:{format}:source` † | 48h | Source manifest metadata (segment URLs, durations, is_live) |
+| `ep:{content_id}:{format}:rewrite_params` † | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
 | `ep:{content_id}:speke` | 24h | Cached SPEKE response (avoids duplicate calls) |
 
 ## Cache Security
@@ -342,9 +344,9 @@ Sensitive cache entries are protected with encryption at rest and explicit clean
 
 ### Post-Processing Cleanup (`pipeline.rs`)
 
-`cleanup_sensitive_data()` explicitly deletes all four sensitive cache entries after the pipeline completes. It is called at three sites:
+`cleanup_sensitive_data()` explicitly deletes all sensitive cache entries (DRM keys, SPEKE response, rewrite params, source manifest) after the pipeline completes. It is called at three sites:
 
-1. **`execute()`** — after the segment loop completes
+1. **`execute()`** — after the segment loop completes (cleans up DRM keys and SPEKE response cached during key acquisition)
 2. **`execute_first()`** — inside the `if is_last` block (single-segment content)
 3. **`execute_remaining()`** — inside the `if is_last` block (final segment in chained processing)
 

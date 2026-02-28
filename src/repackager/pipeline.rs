@@ -37,7 +37,7 @@ impl RepackagePipeline {
     ///
     /// This is the original entry point. For WASI environments with request timeouts,
     /// prefer `execute_first()` + `execute_remaining()` for chunked processing.
-    pub fn execute(&self, request: &RepackageRequest) -> Result<JobStatus> {
+    pub fn execute(&self, request: &RepackageRequest) -> Result<(JobStatus, ProgressiveOutput)> {
         let content_id = &request.content_id;
         let format = request.output_format;
         let target_scheme = request.target_scheme;
@@ -123,7 +123,7 @@ impl RepackagePipeline {
         let mut progressive =
             ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
 
-        // Register init segment
+        // Register init segment with progressive output
         progressive.set_init_segment(new_init);
 
         // Step 6: Process each media segment
@@ -174,13 +174,6 @@ impl RepackagePipeline {
                 progressive.finalize();
             }
 
-            // Save manifest state to Redis for coordination
-            let manifest_state = progressive.manifest_state();
-            let state_json = serde_json::to_vec(manifest_state)
-                .map_err(|e| EdgepackError::Cache(format!("serialize state: {e}")))?;
-            let key = CacheKeys::manifest_state(content_id, &format_str(format));
-            self.cache.set(&key, &state_json, self.config.cache.job_state_ttl)?;
-
             self.update_job_state(
                 content_id,
                 format,
@@ -195,13 +188,14 @@ impl RepackagePipeline {
             self.cleanup_sensitive_data(content_id, format);
         }
 
-        Ok(JobStatus {
+        let status = JobStatus {
             content_id: content_id.clone(),
             format,
             state: JobState::Complete,
             segments_completed: source.segment_urls.len() as u32,
             segments_total: Some(source.segment_urls.len() as u32),
-        })
+        };
+        Ok((status, progressive))
     }
 
     /// Execute the pipeline through the first segment, producing a live manifest.
