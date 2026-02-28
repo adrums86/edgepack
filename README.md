@@ -1,4 +1,5 @@
-<img width="512" height="403" alt="edgepack_logo" src="https://github.com/user-attachments/assets/dc17d631-efb2-41e6-9b6e-cea634c03988" />
+<img width="360" height="240" alt="edgepack_logo" src="edgepack.png" style="mask-image: radial-gradient(circle, black 60%, transparent 20%); -webkit-mask-image: radial-gradient(circle, black 60%, transparent 85%);" alt="Faded Image"/>
+
 
 # edgepack
 
