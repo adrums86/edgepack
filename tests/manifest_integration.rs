@@ -397,3 +397,83 @@ fn segment_cache_control_custom_max_age() {
     let cc = ProgressiveOutput::segment_cache_control(86400);
     assert_eq!(cc, "public, max-age=86400, immutable");
 }
+
+// ─── ISO BMFF (.mp4) Container Format ───────────────────────────────
+
+#[test]
+fn progressive_output_hls_iso_lifecycle() {
+    use edge_packager::media::container::ContainerFormat;
+
+    let drm_info = ManifestDrmInfo {
+        encryption_scheme: edge_packager::drm::scheme::EncryptionScheme::Cenc,
+        widevine_pssh: Some("dGVzdA==".into()),
+        playready_pssh: None,
+        playready_pro: None,
+        fairplay_key_uri: None,
+        default_kid: "00112233445566778899aabbccddeeff".into(),
+    };
+
+    let mut po = ProgressiveOutput::new(
+        "iso-test".into(),
+        OutputFormat::Hls,
+        "/repackage/iso-test/hls/".into(),
+        drm_info,
+        ContainerFormat::Iso,
+    );
+    po.set_init_segment(vec![0x00; 256]);
+    let manifest = po.add_segment(0, vec![0xAA; 50_000], 6.006);
+    assert!(manifest.is_some());
+    let m3u8 = manifest.unwrap();
+    assert!(
+        m3u8.contains("/repackage/iso-test/hls/segment_0.mp4"),
+        "HLS manifest should reference .mp4 segment"
+    );
+    assert!(
+        !m3u8.contains(".cmfv"),
+        "HLS manifest should not reference .cmfv when using ISO format"
+    );
+    assert!(
+        !m3u8.contains(".m4s"),
+        "HLS manifest should not reference .m4s when using ISO format"
+    );
+}
+
+#[test]
+fn dash_manifest_iso_segment_template() {
+    use edge_packager::media::container::ContainerFormat;
+
+    let mut state = common::make_dash_manifest_state(2, ManifestPhase::Complete);
+    state.container_format = ContainerFormat::Iso;
+    // Update segment URIs to match ISO format
+    for seg in &mut state.segments {
+        seg.uri = seg.uri.replace(".cmfv", ".mp4");
+    }
+
+    let mpd = manifest::render_manifest(&state).unwrap();
+    assert!(
+        mpd.contains("segment_$Number$.mp4"),
+        "DASH template should use .mp4 extension for ISO format"
+    );
+    assert!(
+        !mpd.contains(".cmfv"),
+        "DASH template should not contain .cmfv"
+    );
+}
+
+#[test]
+fn dash_manifest_iso_profiles_no_cmaf() {
+    use edge_packager::media::container::ContainerFormat;
+
+    let mut state = common::make_dash_manifest_state(1, ManifestPhase::Live);
+    state.container_format = ContainerFormat::Iso;
+
+    let mpd = manifest::render_manifest(&state).unwrap();
+    assert!(
+        mpd.contains("urn:mpeg:dash:profile:isoff-live:2011"),
+        "ISO format should use isoff-live profile"
+    );
+    assert!(
+        !mpd.contains("cmaf:2019"),
+        "ISO format should not include CMAF profile"
+    );
+}

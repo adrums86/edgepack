@@ -369,6 +369,40 @@ mod tests {
     }
 
     #[test]
+    fn segment_uri_format_fmp4() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/repackage/c1/hls/".into(),
+            make_drm_info(),
+            ContainerFormat::Fmp4,
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        assert_eq!(
+            po.manifest_state().segments[0].uri,
+            "/repackage/c1/hls/segment_0.m4s"
+        );
+    }
+
+    #[test]
+    fn segment_uri_format_iso() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/repackage/c1/hls/".into(),
+            make_drm_info(),
+            ContainerFormat::Iso,
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(3, vec![0xAA; 50], 6.0);
+        assert_eq!(
+            po.manifest_state().segments[0].uri,
+            "/repackage/c1/hls/segment_3.mp4"
+        );
+    }
+
+    #[test]
     fn manifest_cache_control_awaiting() {
         let po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), make_drm_info(), ContainerFormat::default());
         assert_eq!(po.manifest_cache_control(31536000, 1), "no-cache");

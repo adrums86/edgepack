@@ -101,7 +101,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     )
     .ok_or_else(|| {
         EdgePackagerError::InvalidInput(format!(
-            "invalid container_format: {} (expected 'cmaf' or 'fmp4')",
+            "invalid container_format: {} (expected 'cmaf', 'fmp4', or 'iso')",
             payload.container_format
         ))
     })?;
@@ -428,6 +428,35 @@ mod tests {
         let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","container_format":"fmp4"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.container_format, "fmp4");
+    }
+
+    #[test]
+    fn webhook_payload_iso_container_format() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","container_format":"iso"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.container_format, "iso");
+    }
+
+    #[test]
+    fn webhook_iso_container_format_accepted() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "container_format": "iso"
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let resp = handle_repackage_webhook(&req, &ctx);
+        // On native targets, pipeline fails (no HTTP client), so webhook returns 500 or Ok.
+        // The key assertion is that it does NOT fail with "invalid container_format".
+        match resp {
+            Ok(r) => assert!(r.status == 200 || r.status == 500),
+            Err(e) => assert!(
+                !e.to_string().contains("invalid container_format"),
+                "iso should be accepted as valid container format, got: {e}"
+            ),
+        }
     }
 
     #[test]

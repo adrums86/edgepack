@@ -18,16 +18,20 @@ pub enum ContainerFormat {
     /// fMP4: Fragmented MP4 (ISO 14496-12).
     /// Uses `iso6` compatible brands only, `.m4s` segment extensions.
     Fmp4,
+    /// ISO BMFF: ISO Base Media File Format (ISO 14496-12).
+    /// Uses `iso6` compatible brands only, `.mp4` segment extensions.
+    Iso,
 }
 
 impl ContainerFormat {
     /// Segment file extension for this container format (video default).
     ///
-    /// Returns `".cmfv"` for CMAF, `".m4s"` for fMP4.
+    /// Returns `".cmfv"` for CMAF, `".m4s"` for fMP4, `".mp4"` for ISO BMFF.
     pub fn segment_extension(&self) -> &'static str {
         match self {
             ContainerFormat::Cmaf => ".cmfv",
             ContainerFormat::Fmp4 => ".m4s",
+            ContainerFormat::Iso => ".mp4",
         }
     }
 
@@ -36,6 +40,7 @@ impl ContainerFormat {
         match self {
             ContainerFormat::Cmaf => ".cmfv",
             ContainerFormat::Fmp4 => ".m4s",
+            ContainerFormat::Iso => ".mp4",
         }
     }
 
@@ -44,6 +49,7 @@ impl ContainerFormat {
         match self {
             ContainerFormat::Cmaf => ".cmfa",
             ContainerFormat::Fmp4 => ".m4s",
+            ContainerFormat::Iso => ".mp4",
         }
     }
 
@@ -63,11 +69,11 @@ impl ContainerFormat {
 
     /// Compatible brands for the ftyp box.
     ///
-    /// CMAF includes `cmfc` brand; fMP4 does not.
+    /// CMAF includes `cmfc` brand; fMP4 and ISO BMFF do not.
     pub fn compatible_brands(&self) -> &'static [&'static [u8; 4]] {
         match self {
             ContainerFormat::Cmaf => &[b"isom", b"iso6", b"cmfc"],
-            ContainerFormat::Fmp4 => &[b"isom", b"iso6"],
+            ContainerFormat::Fmp4 | ContainerFormat::Iso => &[b"isom", b"iso6"],
         }
     }
 
@@ -89,23 +95,26 @@ impl ContainerFormat {
 
     /// DASH MPD profiles attribute value.
     ///
-    /// CMAF includes the CMAF profile; fMP4 uses only the DASH live profile.
+    /// CMAF includes the CMAF profile; fMP4 and ISO BMFF use only the DASH live profile.
     pub fn dash_profiles(&self) -> &'static str {
         match self {
             ContainerFormat::Cmaf => {
                 "urn:mpeg:dash:profile:isoff-live:2011,urn:mpeg:dash:profile:cmaf:2019"
             }
-            ContainerFormat::Fmp4 => "urn:mpeg:dash:profile:isoff-live:2011",
+            ContainerFormat::Fmp4 | ContainerFormat::Iso => {
+                "urn:mpeg:dash:profile:isoff-live:2011"
+            }
         }
     }
 
     /// Parse a string value to a ContainerFormat.
     ///
-    /// Accepts `"cmaf"` or `"fmp4"`. Returns `None` for unrecognized values.
+    /// Accepts `"cmaf"`, `"fmp4"`, or `"iso"`. Returns `None` for unrecognized values.
     pub fn from_str_value(s: &str) -> Option<Self> {
         match s {
             "cmaf" => Some(ContainerFormat::Cmaf),
             "fmp4" => Some(ContainerFormat::Fmp4),
+            "iso" => Some(ContainerFormat::Iso),
             _ => None,
         }
     }
@@ -115,6 +124,7 @@ impl ContainerFormat {
         match self {
             ContainerFormat::Cmaf => "cmaf",
             ContainerFormat::Fmp4 => "fmp4",
+            ContainerFormat::Iso => "iso",
         }
     }
 }
@@ -241,9 +251,57 @@ mod tests {
     }
 
     #[test]
+    fn segment_extension_iso() {
+        assert_eq!(ContainerFormat::Iso.segment_extension(), ".mp4");
+    }
+
+    #[test]
+    fn video_segment_extension_iso() {
+        assert_eq!(ContainerFormat::Iso.video_segment_extension(), ".mp4");
+    }
+
+    #[test]
+    fn audio_segment_extension_iso() {
+        assert_eq!(ContainerFormat::Iso.audio_segment_extension(), ".mp4");
+    }
+
+    #[test]
+    fn init_extension_iso() {
+        assert_eq!(ContainerFormat::Iso.init_extension(), ".mp4");
+    }
+
+    #[test]
+    fn compatible_brands_iso_no_cmfc() {
+        let brands = ContainerFormat::Iso.compatible_brands();
+        assert_eq!(brands.len(), 2);
+        assert!(!brands.contains(&&b"cmfc"));
+        assert!(brands.contains(&&b"isom"));
+        assert!(brands.contains(&&b"iso6"));
+    }
+
+    #[test]
+    fn build_ftyp_iso() {
+        let ftyp = ContainerFormat::Iso.build_ftyp();
+        // header(8) + major(4) + minor(4) + 2 brands(8) = 24 (same as fmp4)
+        assert_eq!(ftyp.len(), 24);
+        assert_eq!(&ftyp[4..8], b"ftyp");
+        assert_eq!(&ftyp[8..12], b"isom");
+        let brands_data = &ftyp[16..];
+        assert!(!brands_data.chunks(4).any(|b| b == b"cmfc"));
+    }
+
+    #[test]
+    fn dash_profiles_iso_no_cmaf() {
+        let profiles = ContainerFormat::Iso.dash_profiles();
+        assert!(!profiles.contains("cmaf"));
+        assert!(profiles.contains("isoff-live:2011"));
+    }
+
+    #[test]
     fn from_str_value_valid() {
         assert_eq!(ContainerFormat::from_str_value("cmaf"), Some(ContainerFormat::Cmaf));
         assert_eq!(ContainerFormat::from_str_value("fmp4"), Some(ContainerFormat::Fmp4));
+        assert_eq!(ContainerFormat::from_str_value("iso"), Some(ContainerFormat::Iso));
     }
 
     #[test]
@@ -257,12 +315,14 @@ mod tests {
     fn as_str_values() {
         assert_eq!(ContainerFormat::Cmaf.as_str(), "cmaf");
         assert_eq!(ContainerFormat::Fmp4.as_str(), "fmp4");
+        assert_eq!(ContainerFormat::Iso.as_str(), "iso");
     }
 
     #[test]
     fn display_impl() {
         assert_eq!(format!("{}", ContainerFormat::Cmaf), "cmaf");
         assert_eq!(format!("{}", ContainerFormat::Fmp4), "fmp4");
+        assert_eq!(format!("{}", ContainerFormat::Iso), "iso");
     }
 
     #[test]
@@ -287,15 +347,27 @@ mod tests {
     }
 
     #[test]
+    fn serde_roundtrip_iso() {
+        let fmt = ContainerFormat::Iso;
+        let json = serde_json::to_string(&fmt).unwrap();
+        let parsed: ContainerFormat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, fmt);
+    }
+
+    #[test]
     fn equality_and_hash() {
         use std::collections::HashSet;
         assert_eq!(ContainerFormat::Cmaf, ContainerFormat::Cmaf);
         assert_eq!(ContainerFormat::Fmp4, ContainerFormat::Fmp4);
+        assert_eq!(ContainerFormat::Iso, ContainerFormat::Iso);
         assert_ne!(ContainerFormat::Cmaf, ContainerFormat::Fmp4);
+        assert_ne!(ContainerFormat::Cmaf, ContainerFormat::Iso);
+        assert_ne!(ContainerFormat::Fmp4, ContainerFormat::Iso);
 
         let mut set = HashSet::new();
         set.insert(ContainerFormat::Cmaf);
         set.insert(ContainerFormat::Fmp4);
-        assert_eq!(set.len(), 2);
+        set.insert(ContainerFormat::Iso);
+        assert_eq!(set.len(), 3);
     }
 }

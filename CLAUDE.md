@@ -107,14 +107,16 @@ Init segments require rewriting `sinf`/`schm`/`tenc`/`pssh` boxes and `ftyp` bra
 
 ### Container Format
 
-The output container format is configurable via `ContainerFormat` enum (`Cmaf` or `Fmp4`):
+The output container format is configurable via `ContainerFormat` enum (`Cmaf`, `Fmp4`, or `Iso`):
 - **CMAF** (default): Compatible brands include `cmfc`, segment extensions are `.cmfv`/`.cmfa`, DASH profile includes `cmaf:2019`
 - **fMP4**: No `cmfc` brand, segment extension is `.m4s`, DASH profile is `isoff-live:2011` only
-- Both formats use `.mp4` for init segments and `video/mp4`/`audio/mp4` MIME types
+- **ISO BMFF**: No `cmfc` brand, segment extension is `.mp4`, DASH profile is `isoff-live:2011` only (same brands/profiles as fMP4, different extension)
+- All formats use `.mp4` for init segments and `video/mp4`/`audio/mp4` MIME types
 - The `ftyp` box in init segments is rewritten to match the target format's brands
 - `ContainerFormat` flows through `RepackageRequest` → `ContinuationParams` → `ManifestState` → `ProgressiveOutput`
 - Segment URIs are built dynamically using `container_format.video_segment_extension()`
 - DASH renderer uses `container_format.dash_profiles()` for MPD `@profiles` attribute
+- Route handler accepts all three extensions (`.cmfv`, `.m4s`, `.mp4`) for media segment requests
 
 ### Progressive Manifest Output
 
@@ -201,15 +203,15 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **541 tests** total: 466 unit tests and 75 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
+The project has **560 tests** total: 480 unit tests and 80 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
 
-### Unit Tests (466)
+### Unit Tests (480)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 - **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads, encryption schemes, container formats, continuation params)
 - **Encryption scheme abstraction**: `EncryptionScheme` enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags), `SampleDecryptor`/`SampleEncryptor` trait dispatch via factory functions
-- **Container format abstraction**: `ContainerFormat` enum (extensions, brands, ftyp box building, DASH profile strings, serde roundtrips, display, from_str_value parsing)
+- **Container format abstraction**: `ContainerFormat` enum with three variants (Cmaf, Fmp4, Iso) — extensions, brands, ftyp box building, DASH profile strings, serde roundtrips, display, from_str_value parsing
 - **Encryption correctness**: CBCS decrypt + encrypt, CENC encrypt + decrypt, scheme-agnostic roundtrips through factory functions
 - **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
 - **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not)
@@ -219,13 +221,13 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion, container format threading through ContinuationParams
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
-- **HTTP routing**: Path parsing, format validation, segment number extraction (.cmfv and .m4s), all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, container_format parsing, invalid scheme/format rejection, serde roundtrips
+- **HTTP routing**: Path parsing, format validation, segment number extraction (.cmfv, .m4s, and .mp4), all route dispatching
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgePackagerError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (75)
+### Integration Tests (80)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -235,8 +237,8 @@ tests/
 │   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
-├── manifest_integration.rs   20 tests: progressive output lifecycle, DRM signaling, cache headers
-├── handler_integration.rs    28 tests: HTTP routing (incl. .cmfv and .m4s segments), webhook validation, response helpers
+├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
+├── handler_integration.rs    30 tests: HTTP routing (incl. .cmfv, .m4s, and .mp4 segments), webhook validation, response helpers
 └── wasm_binary_size.rs        1 test: release WASM binary stays under 600 KB size limit
 ```
 
@@ -276,6 +278,7 @@ When adding new functionality, follow the existing pattern:
 | GET | `/repackage/{id}/{format}/init.mp4` | `request::handle_init_segment_request` | Serve repackaged init segment |
 | GET | `/repackage/{id}/{format}/segment_{n}.cmfv` | `request::handle_media_segment_request` | Serve repackaged CMAF media segment |
 | GET | `/repackage/{id}/{format}/segment_{n}.m4s` | `request::handle_media_segment_request` | Serve repackaged fMP4 media segment |
+| GET | `/repackage/{id}/{format}/segment_{n}.mp4` | `request::handle_media_segment_request` | Serve repackaged ISO BMFF media segment |
 | POST | `/webhook/repackage` | `webhook::handle_repackage_webhook` | Trigger proactive repackaging (returns 200 after first manifest) |
 | POST | `/webhook/repackage/continue` | `webhook::handle_continue` | Internal self-invocation to process remaining segments |
 | GET | `/status/{id}/{format}` | `request::handle_status_request` | Query job progress |

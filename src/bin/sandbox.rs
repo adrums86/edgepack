@@ -144,11 +144,12 @@ async fn handle_repackage(
     let container_format = match payload.container_format.as_str() {
         "cmaf" => edge_packager::media::container::ContainerFormat::Cmaf,
         "fmp4" => edge_packager::media::container::ContainerFormat::Fmp4,
+        "iso" => edge_packager::media::container::ContainerFormat::Iso,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "container_format must be 'cmaf' or 'fmp4'".into(),
+                    error: "container_format must be 'cmaf', 'fmp4', or 'iso'".into(),
                 }),
             )
                 .into_response();
@@ -452,7 +453,8 @@ fn is_local_path(s: &str) -> bool {
 fn parse_segment_number(filename: &str) -> Option<u32> {
     let name = filename
         .strip_suffix(".cmfv")
-        .or_else(|| filename.strip_suffix(".m4s"))?;
+        .or_else(|| filename.strip_suffix(".m4s"))
+        .or_else(|| filename.strip_suffix(".mp4"))?;
     let num_str = name.strip_prefix("segment_")?;
     num_str.parse().ok()
 }
@@ -826,6 +828,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
     <div class="radio-group">
       <label><input type="radio" name="container-format" value="cmaf" checked> CMAF (.cmfv)</label>
       <label><input type="radio" name="container-format" value="fmp4"> fMP4 (.m4s)</label>
+      <label><input type="radio" name="container-format" value="iso"> ISO BMFF (.mp4)</label>
     </div>
 
     <button id="submit-btn" onclick="startRepackage()">Repackage</button>
@@ -999,7 +1002,7 @@ async function pollStatus(contentId, format, containerFormat) {
 
         const base = `/api/output/${contentId}/${format}`;
         const ext = format === 'hls' ? 'm3u8' : 'mpd';
-        const segExt = containerFormat === 'fmp4' ? '.m4s' : '.cmfv';
+        const segExt = containerFormat === 'fmp4' ? '.m4s' : containerFormat === 'iso' ? '.mp4' : '.cmfv';
         linksEl.innerHTML += `<a href="${base}/manifest.${ext}" target="_blank">manifest.${ext}</a>`;
         linksEl.innerHTML += `<a href="${base}/init.mp4" target="_blank">init.mp4</a>`;
         for (let i = 0; i < data.segments_completed; i++) {
