@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. The target encryption scheme and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys.
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. The target encryption scheme and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
 
 ## Build Commands
 
@@ -49,7 +49,7 @@ src/
 │   └── redis_tcp.rs    TCP Redis stub (forward compatibility)
 ├── drm/                DRM key acquisition and encryption
 │   ├── mod.rs          ContentKey, DrmSystemData, DrmKeySet types + system ID constants
-│   ├── scheme.rs       EncryptionScheme enum (Cbcs/Cenc) + scheme-specific helpers
+│   ├── scheme.rs       EncryptionScheme enum (Cbcs/Cenc/None) + scheme-specific helpers
 │   ├── sample_cryptor.rs  SampleDecryptor/SampleEncryptor traits + factory functions
 │   ├── speke.rs        SPEKE 2.0 HTTP client
 │   ├── cpix.rs         CPIX XML request builder + response parser
@@ -91,19 +91,24 @@ Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md).
 
 ### Encryption Transform
 
-The core transform is scheme-configurable on CMAF segments (source and target schemes determined at runtime):
-1. Parse `senc` box → get per-sample IVs and subsample maps
-2. Decrypt `mdat` using source scheme (`create_decryptor()` dispatches to CBCS or CENC)
-3. Re-encrypt `mdat` using target scheme (`create_encryptor()` dispatches to CBCS or CENC)
-4. Rewrite `senc` box with new IVs (size depends on target scheme: 16 bytes for CBCS, 8 bytes for CENC)
-5. Rebuild `moof` + `mdat`
+The core transform is scheme-configurable on CMAF segments (source and target schemes determined at runtime). Four dispatch paths based on `(source_encrypted, target_encrypted)`:
 
-Init segments require rewriting `sinf`/`schm`/`tenc`/`pssh` boxes and `ftyp` brands. The `schm` box type and `tenc` parameters (IV size, pattern) are set based on the target `EncryptionScheme`. PSSH boxes are filtered per target scheme (FairPlay included for CBCS output, excluded for CENC output). The `ftyp` box is rewritten with compatible brands matching the target `ContainerFormat` (CMAF includes `cmfc`, fMP4 does not).
+- **Encrypted → Encrypted**: Parse `senc` → decrypt `mdat` with source scheme → re-encrypt with target scheme → rewrite `senc` → rebuild `moof` + `mdat`
+- **Clear → Encrypted**: Parse `trun` for sample sizes → encrypt `mdat` with target scheme → inject new `senc` box → rebuild `moof` + `mdat`
+- **Encrypted → Clear**: Parse `senc` + `trun` → decrypt `mdat` with source scheme → strip `senc` box → rebuild `moof` + `mdat`
+- **Clear → Clear**: Byte-for-byte pass-through (no transformation)
+
+Init segments have a corresponding four-way dispatch:
+- **Encrypted → Encrypted**: Rewrite `sinf`/`schm`/`tenc`/`pssh` boxes and `ftyp` brands
+- **Clear → Encrypted**: Inject `sinf` (frma + schm + tenc) into stsd, rename sample entries (`avc1`→`encv`, `mp4a`→`enca`), add PSSH boxes, rewrite `ftyp`
+- **Encrypted → Clear**: Strip `sinf` from stsd, restore original sample entry names from `frma`, remove PSSH boxes, rewrite `ftyp`
+- **Clear → Clear**: Rewrite `ftyp` only (format conversion)
 
 **Scheme-specific behaviour:**
 - **CBCS**: AES-128-CBC, pattern encryption (1:9 video, 0:0 audio), 16-byte IVs, supports FairPlay
 - **CENC**: AES-128-CTR, full encryption (no pattern), 8-byte IVs, Widevine + PlayReady only
-- Source scheme auto-detected from init segment `schm` box or manifest DRM signaling
+- **None**: Clear/unencrypted content — no encryption, no DRM, 0-byte IVs, no PSSH boxes
+- Source scheme auto-detected from init segment `schm` box or manifest DRM signaling (absence of encryption info → `None`)
 
 ### Container Format
 
@@ -204,31 +209,31 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **566 tests** total: 484 unit tests and 82 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
+The project has **614 tests** total: 522 unit tests and 92 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
 
-### Unit Tests (484)
+### Unit Tests (522)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 - **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads, encryption schemes, container formats, continuation params)
-- **Encryption scheme abstraction**: `EncryptionScheme` enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags), `SampleDecryptor`/`SampleEncryptor` trait dispatch via factory functions
+- **Encryption scheme abstraction**: `EncryptionScheme` enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags, `is_encrypted()` for None variant), `SampleDecryptor`/`SampleEncryptor` trait dispatch via factory functions
 - **Container format abstraction**: `ContainerFormat` enum with three variants (Cmaf, Fmp4, Iso) — extensions, brands, ftyp box building, DASH profile strings, serde roundtrips, display, from_str_value parsing
 - **Encryption correctness**: CBCS decrypt + encrypt, CENC encrypt + decrypt, scheme-agnostic roundtrips through factory functions
 - **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
-- **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not)
-- **Segment rewriting**: Scheme-aware decrypt/re-encrypt with configurable source/target scheme and pattern
+- **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not), clear→encrypted sinf injection (`create_protection_info`), encrypted→clear sinf stripping (`strip_protection_info`), clear→clear ftyp-only rewrite (`rewrite_ftyp_only`)
+- **Segment rewriting**: Four-way dispatch (encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear pass-through), scheme-aware decrypt/re-encrypt with optional source/target keys
 - **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering
 - **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion, container format threading through ContinuationParams
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (all 7 CMAF/ISOBMFF extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a), all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing (cenc/cbcs/none), container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgepackError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (82)
+### Integration Tests (92)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -236,6 +241,7 @@ Located in the `tests/` directory. These exercise cross-module workflows using s
 tests/
 ├── common/
 │   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
+├── clear_content.rs           10 tests: clear→CENC/CBCS, encrypted→clear, clear→clear (init + segment), roundtrips
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
@@ -246,6 +252,8 @@ tests/
 **Key fixtures in `tests/common/mod.rs`:**
 - `build_cbcs_init_segment()` — builds a synthetic CBCS init segment (ftyp + moov with stsd→encv→sinf→frma/schm/schi/tenc + pssh)
 - `build_cbcs_media_segment(sample_count, sample_size)` — builds a CBCS-encrypted moof+mdat with configurable samples; returns `(segment_bytes, plaintext_samples)` for verification
+- `build_clear_init_segment()` — builds a synthetic clear init segment (ftyp + moov with stsd→avc1, no sinf, no PSSH)
+- `build_clear_media_segment(sample_count, sample_size)` — builds a clear moof+mdat (trun, no senc) with plaintext samples
 - `make_drm_key_set()` / `make_drm_key_set_with_fairplay()` — builds DrmKeySet with system-specific PSSH data
 - `make_hls_manifest_state()` / `make_dash_manifest_state()` — builds ManifestState with DRM info and segments
 - Test constants: `TEST_SOURCE_KEY`, `TEST_TARGET_KEY`, `TEST_KID`, `TEST_IV` (all `[u8; 16]`)
@@ -365,7 +373,7 @@ FairPlay is recognised in both input and output. For CENC target output, FairPla
 
 ## Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1 and 2 are complete. Remaining phases (3–6):
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–3 are complete. Remaining phases (4–6):
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -374,15 +382,17 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Updated segment URI extensions dynamically, DASH profile signaling, and route handling for `.cmfv`/`.m4s`
 - Result: 541 tests total (466 unit + 75 integration), including binary size guard test
 
-### Phase 3: Unencrypted Input Support
-- Add `EncryptionScheme::None` variant for clear (unencrypted) content
-- Update source detection (`hls_input.rs`, `dash_input.rs`) to identify unencrypted sources
-- Add `create_protection_info()` in `init.rs` to inject sinf/schm/tenc into clear init segments (clear→encrypted)
-- Skip decryption in `segment.rs` when source is `None`; encrypt-only path for clear→encrypted
-- Clear→clear pass-through for format-only conversion (no encryption/decryption)
-- Conditional SPEKE key acquisition — skip when both source and target are unencrypted
-- Update sandbox UI with "None (Clear)" target scheme and conditional SPEKE visibility
-- Estimated: ~300 new LOC, ~180 modified LOC, ~25 new tests
+### ~~Phase 3: Unencrypted Input Support~~ ✅ Complete
+- Added `EncryptionScheme::None` variant with `is_encrypted()` method and all match arms in `scheme.rs`
+- Added panic arms in `sample_cryptor.rs` factory functions for None (should never be called)
+- Accepted `"none"` target_scheme in `webhook.rs`, enabled sandbox for clear content
+- Added `create_protection_info()` in `init.rs` — inject sinf/schm/tenc/pssh into clear init segments (clear→encrypted)
+- Added `strip_protection_info()` in `init.rs` — remove sinf/pssh and restore original sample entries (encrypted→clear)
+- Added `rewrite_ftyp_only()` in `init.rs` — format-only conversion for clear→clear
+- Added four-way segment dispatch in `segment.rs` with optional source/target keys
+- Updated pipeline with conditional SPEKE, four-way init/segment dispatch, optional DRM info
+- Updated `ProgressiveOutput::new()` to accept `Option<ManifestDrmInfo>`
+- Result: 614 tests total (522 unit + 92 integration), including 10 new clear_content integration tests
 
 ### Phase 4: Dual-Scheme Output
 - Multi-rendition: `target_schemes: Vec<EncryptionScheme>` producing separate segment sets per scheme

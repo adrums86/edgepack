@@ -88,9 +88,10 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     let target_scheme = match payload.target_scheme.as_str() {
         "cenc" => EncryptionScheme::Cenc,
         "cbcs" => EncryptionScheme::Cbcs,
+        "none" => EncryptionScheme::None,
         other => {
             return Err(EdgepackError::InvalidInput(format!(
-                "invalid target_scheme: {other} (expected 'cenc' or 'cbcs')"
+                "invalid target_scheme: {other} (expected 'cenc', 'cbcs', or 'none')"
             )));
         }
     };
@@ -472,6 +473,35 @@ mod tests {
         let result = handle_repackage_webhook(&req, &ctx);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid container_format"));
+    }
+
+    #[test]
+    fn webhook_payload_none_target_scheme() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","target_scheme":"none"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.target_scheme, "none");
+    }
+
+    #[test]
+    fn webhook_none_target_scheme_accepted() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "target_scheme": "none"
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let resp = handle_repackage_webhook(&req, &ctx);
+        // On native targets, pipeline fails (no HTTP client), so webhook returns 500 or Ok.
+        // The key assertion is that it does NOT fail with "invalid target_scheme".
+        match resp {
+            Ok(r) => assert!(r.status == 200 || r.status == 500),
+            Err(e) => assert!(
+                !e.to_string().contains("invalid target_scheme"),
+                "none should be accepted as valid target scheme, got: {e}"
+            ),
+        }
     }
 
     #[test]

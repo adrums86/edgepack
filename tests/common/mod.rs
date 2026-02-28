@@ -359,6 +359,111 @@ fn build_trun_box(sample_sizes: &[u32]) -> Vec<u8> {
     trun
 }
 
+// ─── Clear Content Fixture Builders ─────────────────────────────────
+
+/// Build a minimal clear init segment: ftyp + moov { trak { mdia { minf { stbl { stsd { avc1 } } } } } }
+///
+/// This is unencrypted — no sinf, no PSSH boxes.
+pub fn build_clear_init_segment() -> Vec<u8> {
+    let mut data = Vec::new();
+
+    // ftyp box
+    let ftyp_payload = b"isom\x00\x00\x02\x00isomiso6cmfc";
+    let ftyp_size = 8 + ftyp_payload.len() as u32;
+    cmaf::write_box_header(&mut data, ftyp_size, b"ftyp");
+    data.extend_from_slice(ftyp_payload);
+
+    // Build moov children
+    let mut moov_children = Vec::new();
+
+    // mvhd (minimal)
+    let mut mvhd = Vec::new();
+    cmaf::write_full_box_header(&mut mvhd, 120, b"mvhd", 1, 0);
+    mvhd.resize(120, 0);
+    moov_children.extend_from_slice(&mvhd);
+
+    // Clear sample entry: avc1 with 24-byte prefix (no sinf)
+    let entry_prefix = [0u8; 24];
+    let entry_size = 8 + entry_prefix.len() as u32;
+    let mut entry = Vec::new();
+    cmaf::write_box_header(&mut entry, entry_size, b"avc1");
+    entry.extend_from_slice(&entry_prefix);
+
+    let stsd = build_stsd(&entry);
+    let stbl = wrap_box(b"stbl", &stsd);
+    let minf = wrap_box(b"minf", &stbl);
+    let mdia = wrap_box(b"mdia", &minf);
+    let trak = wrap_box(b"trak", &mdia);
+    moov_children.extend_from_slice(&trak);
+
+    // No PSSH boxes for clear content
+
+    let moov_size = 8 + moov_children.len() as u32;
+    cmaf::write_box_header(&mut data, moov_size, b"moov");
+    data.extend_from_slice(&moov_children);
+
+    data
+}
+
+/// Build a minimal clear media segment (moof + mdat) with unencrypted data.
+///
+/// The moof contains trun but no senc (since content is clear).
+pub fn build_clear_media_segment(
+    sample_count: usize,
+    sample_size: usize,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    // Generate plaintext samples
+    let mut plaintext_samples = Vec::with_capacity(sample_count);
+    for i in 0..sample_count {
+        let mut sample = vec![0u8; sample_size];
+        for (j, byte) in sample.iter_mut().enumerate() {
+            *byte = ((i * sample_size + j) & 0xFF) as u8;
+        }
+        plaintext_samples.push(sample);
+    }
+
+    // Build trun entries with sample sizes
+    let trun = build_trun_box(
+        &plaintext_samples
+            .iter()
+            .map(|s| s.len() as u32)
+            .collect::<Vec<_>>(),
+    );
+
+    // Build mfhd
+    let mut mfhd = Vec::new();
+    cmaf::write_full_box_header(&mut mfhd, 16, b"mfhd", 0, 0);
+    mfhd.extend_from_slice(&1u32.to_be_bytes());
+
+    // Build traf (no senc for clear content)
+    let mut traf_children = Vec::new();
+    let mut tfhd = Vec::new();
+    cmaf::write_full_box_header(&mut tfhd, 16, b"tfhd", 0, 0x020000);
+    tfhd.extend_from_slice(&1u32.to_be_bytes());
+    traf_children.extend_from_slice(&tfhd);
+    traf_children.extend_from_slice(&trun);
+    let traf = wrap_box(b"traf", &traf_children);
+
+    // Build moof
+    let mut moof_children = Vec::new();
+    moof_children.extend_from_slice(&mfhd);
+    moof_children.extend_from_slice(&traf);
+    let moof = wrap_box(b"moof", &moof_children);
+
+    // Build mdat (plaintext)
+    let mut mdat_payload = Vec::new();
+    for sample in &plaintext_samples {
+        mdat_payload.extend_from_slice(sample);
+    }
+    let mdat = wrap_box(b"mdat", &mdat_payload);
+
+    let mut segment = Vec::with_capacity(moof.len() + mdat.len());
+    segment.extend_from_slice(&moof);
+    segment.extend_from_slice(&mdat);
+
+    (segment, plaintext_samples)
+}
+
 // ─── Manifest Fixtures ──────────────────────────────────────────────
 
 /// Build a ManifestState configured for HLS with segments and DRM info.

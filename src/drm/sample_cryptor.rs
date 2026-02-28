@@ -116,6 +116,9 @@ pub fn create_decryptor(
         EncryptionScheme::Cenc => {
             Box::new(CencDecryptor::new(key))
         }
+        EncryptionScheme::None => {
+            panic!("create_decryptor called with EncryptionScheme::None; clear content should skip decryption")
+        }
     }
 }
 
@@ -135,6 +138,9 @@ pub fn create_encryptor(
         }
         EncryptionScheme::Cenc => {
             Box::new(CencEncryptor::new(key))
+        }
+        EncryptionScheme::None => {
+            panic!("create_encryptor called with EncryptionScheme::None; clear content should skip encryption")
         }
     }
 }

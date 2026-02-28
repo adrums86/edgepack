@@ -519,6 +519,487 @@ pub fn parse_protection_info(init_data: &[u8]) -> Result<Option<ProtectionScheme
     Ok(None)
 }
 
+/// Rewrite only the ftyp box for container format conversion (clear-to-clear path).
+///
+/// All other boxes are passed through unchanged. This is used when both source
+/// and target are unencrypted and only the container format needs updating.
+pub fn rewrite_ftyp_only(
+    init_data: &[u8],
+    container_format: ContainerFormat,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(init_data.len());
+
+    for box_result in iterate_boxes(init_data) {
+        let header = box_result?;
+        let box_end = (header.offset + header.size) as usize;
+        let box_data = &init_data[header.offset as usize..box_end.min(init_data.len())];
+
+        match &header.box_type {
+            t if t == &box_type::FTYP => {
+                output.extend_from_slice(&container_format.build_ftyp());
+            }
+            _ => {
+                output.extend_from_slice(box_data);
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Inject protection info into a clear init segment for clear-to-encrypted transform.
+///
+/// This transforms a clear init segment into an encrypted one by:
+/// 1. Rewriting ftyp with container-format-specific brands
+/// 2. Renaming sample entries (avc1→encv, mp4a→enca, etc.)
+/// 3. Injecting sinf/frma/schm/schi/tenc into each sample entry
+/// 4. Adding PSSH boxes to moov
+pub fn create_protection_info(
+    init_data: &[u8],
+    key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
+    target_iv_size: u8,
+    target_pattern: (u8, u8),
+    container_format: ContainerFormat,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(init_data.len() + 256);
+
+    for box_result in iterate_boxes(init_data) {
+        let header = box_result?;
+        let box_end = (header.offset + header.size) as usize;
+        let box_data = &init_data[header.offset as usize..box_end.min(init_data.len())];
+
+        match &header.box_type {
+            t if t == &box_type::FTYP => {
+                output.extend_from_slice(&container_format.build_ftyp());
+            }
+            t if t == &box_type::MOOV => {
+                output.extend_from_slice(&inject_protection_moov(
+                    box_data, &header, key_set, target_scheme, target_iv_size, target_pattern,
+                )?);
+            }
+            _ => {
+                output.extend_from_slice(box_data);
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Rewrite moov for clear-to-encrypted: recurse into trak, add PSSH boxes.
+fn inject_protection_moov(
+    moov_data: &[u8],
+    moov_header: &BoxHeader,
+    key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
+    target_iv_size: u8,
+    target_pattern: (u8, u8),
+) -> Result<Vec<u8>> {
+    let payload = &moov_data[moov_header.header_size as usize..];
+    let mut children = Vec::new();
+
+    for box_result in iterate_boxes(payload) {
+        let header = box_result?;
+        let box_end = (header.offset + header.size) as usize;
+        let box_data = &payload[header.offset as usize..box_end.min(payload.len())];
+
+        match &header.box_type {
+            t if t == &box_type::TRAK => {
+                children.extend_from_slice(&inject_protection_container(
+                    box_data, &header, &box_type::TRAK,
+                    key_set, target_scheme, target_iv_size, target_pattern,
+                )?);
+            }
+            _ => {
+                children.extend_from_slice(box_data);
+            }
+        }
+    }
+
+    // Add PSSH boxes
+    children.extend_from_slice(&build_pssh_boxes(key_set, target_scheme)?);
+
+    let total_size = 8 + children.len() as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, &box_type::MOOV);
+    output.extend_from_slice(&children);
+    Ok(output)
+}
+
+/// Generic container box rewriting for clear-to-encrypted — recurses into children.
+fn inject_protection_container(
+    box_data: &[u8],
+    header: &BoxHeader,
+    box_type_code: &[u8; 4],
+    key_set: &DrmKeySet,
+    target_scheme: EncryptionScheme,
+    target_iv_size: u8,
+    target_pattern: (u8, u8),
+) -> Result<Vec<u8>> {
+    let payload = &box_data[header.header_size as usize..];
+    let mut children = Vec::new();
+
+    for child_result in iterate_boxes(payload) {
+        let child = child_result?;
+        let child_end = (child.offset + child.size) as usize;
+        let child_data = &payload[child.offset as usize..child_end.min(payload.len())];
+
+        match &child.box_type {
+            t if t == &box_type::MDIA || t == &box_type::MINF || t == &box_type::STBL => {
+                children.extend_from_slice(&inject_protection_container(
+                    child_data, &child, &child.box_type,
+                    key_set, target_scheme, target_iv_size, target_pattern,
+                )?);
+            }
+            t if t == &box_type::STSD => {
+                children.extend_from_slice(&inject_protection_stsd(
+                    child_data, &child, key_set, target_iv_size, target_pattern, target_scheme,
+                )?);
+            }
+            _ => {
+                children.extend_from_slice(child_data);
+            }
+        }
+    }
+
+    let total_size = 8 + children.len() as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, box_type_code);
+    output.extend_from_slice(&children);
+    Ok(output)
+}
+
+/// Rewrite stsd for clear-to-encrypted: rename sample entries and inject sinf.
+fn inject_protection_stsd(
+    stsd_data: &[u8],
+    stsd_header: &BoxHeader,
+    key_set: &DrmKeySet,
+    target_iv_size: u8,
+    target_pattern: (u8, u8),
+    target_scheme: EncryptionScheme,
+) -> Result<Vec<u8>> {
+    let payload = &stsd_data[stsd_header.header_size as usize..];
+    if payload.len() < 8 {
+        return Ok(stsd_data.to_vec());
+    }
+
+    let version_flags = &payload[..4];
+    let entry_count = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+
+    let mut entries_output = Vec::new();
+    let mut offset = 8usize;
+
+    for _ in 0..entry_count {
+        if offset + 8 > payload.len() {
+            break;
+        }
+        let entry_header = read_box_header(payload, offset as u64)?;
+        let entry_end = (entry_header.offset + entry_header.size) as usize;
+        let entry_data = &payload[offset..entry_end.min(payload.len())];
+
+        // Determine the encrypted sample entry type
+        let original_format = entry_header.box_type;
+        if let Some(encrypted_type) = encrypted_sample_entry_type(&original_format) {
+            // Build sinf box
+            let kid = if let Some(key) = key_set.keys.first() {
+                key.kid
+            } else {
+                [0u8; 16]
+            };
+            let sinf = build_sinf(&original_format, target_scheme, &kid, target_iv_size, target_pattern);
+
+            // Rewrite: change box type to encrypted variant, append sinf
+            let entry_payload = &entry_data[entry_header.header_size as usize..];
+            let new_size = entry_header.header_size as u32 + entry_payload.len() as u32 + sinf.len() as u32;
+            let mut new_entry = Vec::with_capacity(new_size as usize);
+            cmaf::write_box_header(&mut new_entry, new_size, &encrypted_type);
+            new_entry.extend_from_slice(entry_payload);
+            new_entry.extend_from_slice(&sinf);
+            entries_output.extend_from_slice(&new_entry);
+        } else {
+            // Unknown codec — pass through unchanged
+            entries_output.extend_from_slice(entry_data);
+        }
+
+        offset = entry_end;
+    }
+
+    let inner_size = 4 + 4 + entries_output.len();
+    let total_size = 8 + inner_size as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, &box_type::STSD);
+    output.extend_from_slice(version_flags);
+    output.extend_from_slice(&entry_count.to_be_bytes());
+    output.extend_from_slice(&entries_output);
+    Ok(output)
+}
+
+/// Build a complete sinf box for injecting into a clear sample entry.
+///
+/// Structure: sinf { frma(original_format), schm(target_scheme), schi { tenc(kid, iv_size, pattern) } }
+fn build_sinf(
+    original_format: &[u8; 4],
+    target_scheme: EncryptionScheme,
+    kid: &[u8; 16],
+    iv_size: u8,
+    pattern: (u8, u8),
+) -> Vec<u8> {
+    let mut children = Vec::new();
+
+    // frma: original format
+    let frma_size: u32 = 12;
+    cmaf::write_box_header(&mut children, frma_size, &box_type::FRMA);
+    children.extend_from_slice(original_format);
+
+    // schm: target encryption scheme
+    children.extend_from_slice(&build_schm(target_scheme));
+
+    // schi { tenc }
+    let tenc_data = build_tenc(kid, iv_size, pattern);
+    let schi_size = 8 + tenc_data.len() as u32;
+    cmaf::write_box_header(&mut children, schi_size, &box_type::SCHI);
+    children.extend_from_slice(&tenc_data);
+
+    let total_size = 8 + children.len() as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, &box_type::SINF);
+    output.extend_from_slice(&children);
+    output
+}
+
+/// Map a clear sample entry FourCC to its encrypted equivalent.
+///
+/// Returns None if the FourCC is already encrypted or unrecognized.
+fn encrypted_sample_entry_type(fourcc: &[u8; 4]) -> Option<[u8; 4]> {
+    match fourcc {
+        b"avc1" | b"avc3" | b"hvc1" | b"hev1" | b"vp09" | b"av01" => Some(*b"encv"),
+        b"mp4a" | b"ac-3" | b"ec-3" | b"Opus" | b"fLaC" => Some(*b"enca"),
+        _ => None,
+    }
+}
+
+/// Map an encrypted sample entry FourCC back to its clear equivalent using frma data.
+///
+/// Returns None if the FourCC is not an encrypted sample entry.
+fn is_encrypted_sample_entry(fourcc: &[u8; 4]) -> bool {
+    matches!(fourcc, b"encv" | b"enca" | b"enct" | b"encs")
+}
+
+/// Strip protection info from an encrypted init segment for encrypted-to-clear transform.
+///
+/// This transforms an encrypted init segment into a clear one by:
+/// 1. Rewriting ftyp with container-format-specific brands
+/// 2. Restoring sample entry names from sinf/frma (encv→avc1, enca→mp4a, etc.)
+/// 3. Removing sinf boxes from sample entries
+/// 4. Removing PSSH boxes from moov
+pub fn strip_protection_info(
+    init_data: &[u8],
+    container_format: ContainerFormat,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(init_data.len());
+
+    for box_result in iterate_boxes(init_data) {
+        let header = box_result?;
+        let box_end = (header.offset + header.size) as usize;
+        let box_data = &init_data[header.offset as usize..box_end.min(init_data.len())];
+
+        match &header.box_type {
+            t if t == &box_type::FTYP => {
+                output.extend_from_slice(&container_format.build_ftyp());
+            }
+            t if t == &box_type::MOOV => {
+                output.extend_from_slice(&strip_protection_moov(box_data, &header)?);
+            }
+            _ => {
+                output.extend_from_slice(box_data);
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Rewrite moov for encrypted-to-clear: recurse into trak, remove PSSH boxes.
+fn strip_protection_moov(
+    moov_data: &[u8],
+    moov_header: &BoxHeader,
+) -> Result<Vec<u8>> {
+    let payload = &moov_data[moov_header.header_size as usize..];
+    let mut children = Vec::new();
+
+    for box_result in iterate_boxes(payload) {
+        let header = box_result?;
+        let box_end = (header.offset + header.size) as usize;
+        let box_data = &payload[header.offset as usize..box_end.min(payload.len())];
+
+        match &header.box_type {
+            t if t == &box_type::TRAK => {
+                children.extend_from_slice(&strip_protection_container(
+                    box_data, &header, &box_type::TRAK,
+                )?);
+            }
+            t if t == &box_type::PSSH => {
+                // Remove all PSSH boxes
+            }
+            _ => {
+                children.extend_from_slice(box_data);
+            }
+        }
+    }
+
+    let total_size = 8 + children.len() as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, &box_type::MOOV);
+    output.extend_from_slice(&children);
+    Ok(output)
+}
+
+/// Generic container box rewriting for encrypted-to-clear — recurses into children.
+fn strip_protection_container(
+    box_data: &[u8],
+    header: &BoxHeader,
+    box_type_code: &[u8; 4],
+) -> Result<Vec<u8>> {
+    let payload = &box_data[header.header_size as usize..];
+    let mut children = Vec::new();
+
+    for child_result in iterate_boxes(payload) {
+        let child = child_result?;
+        let child_end = (child.offset + child.size) as usize;
+        let child_data = &payload[child.offset as usize..child_end.min(payload.len())];
+
+        match &child.box_type {
+            t if t == &box_type::MDIA || t == &box_type::MINF || t == &box_type::STBL => {
+                children.extend_from_slice(&strip_protection_container(
+                    child_data, &child, &child.box_type,
+                )?);
+            }
+            t if t == &box_type::STSD => {
+                children.extend_from_slice(&strip_protection_stsd(child_data, &child)?);
+            }
+            _ => {
+                children.extend_from_slice(child_data);
+            }
+        }
+    }
+
+    let total_size = 8 + children.len() as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, box_type_code);
+    output.extend_from_slice(&children);
+    Ok(output)
+}
+
+/// Rewrite stsd for encrypted-to-clear: restore sample entry names, remove sinf.
+fn strip_protection_stsd(
+    stsd_data: &[u8],
+    stsd_header: &BoxHeader,
+) -> Result<Vec<u8>> {
+    let payload = &stsd_data[stsd_header.header_size as usize..];
+    if payload.len() < 8 {
+        return Ok(stsd_data.to_vec());
+    }
+
+    let version_flags = &payload[..4];
+    let entry_count = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+
+    let mut entries_output = Vec::new();
+    let mut offset = 8usize;
+
+    for _ in 0..entry_count {
+        if offset + 8 > payload.len() {
+            break;
+        }
+        let entry_header = read_box_header(payload, offset as u64)?;
+        let entry_end = (entry_header.offset + entry_header.size) as usize;
+        let entry_data = &payload[offset..entry_end.min(payload.len())];
+
+        if is_encrypted_sample_entry(&entry_header.box_type) {
+            // Find sinf to get original_format, then strip sinf and rename
+            let entry_payload = &entry_data[entry_header.header_size as usize..];
+            let (original_format, payload_without_sinf) = extract_frma_and_strip_sinf(entry_payload);
+
+            let restored_type = original_format.unwrap_or(entry_header.box_type);
+            let new_size = entry_header.header_size as u32 + payload_without_sinf.len() as u32;
+            let mut new_entry = Vec::with_capacity(new_size as usize);
+            cmaf::write_box_header(&mut new_entry, new_size, &restored_type);
+            new_entry.extend_from_slice(&payload_without_sinf);
+            entries_output.extend_from_slice(&new_entry);
+        } else {
+            entries_output.extend_from_slice(entry_data);
+        }
+
+        offset = entry_end;
+    }
+
+    let inner_size = 4 + 4 + entries_output.len();
+    let total_size = 8 + inner_size as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, &box_type::STSD);
+    output.extend_from_slice(version_flags);
+    output.extend_from_slice(&entry_count.to_be_bytes());
+    output.extend_from_slice(&entries_output);
+    Ok(output)
+}
+
+/// Extract the original format from sinf/frma and return payload with sinf removed.
+fn extract_frma_and_strip_sinf(entry_payload: &[u8]) -> (Option<[u8; 4]>, Vec<u8>) {
+    let mut original_format: Option<[u8; 4]> = None;
+    let mut output = Vec::new();
+    let mut pos = 0;
+
+    while pos + 8 <= entry_payload.len() {
+        if &entry_payload[pos + 4..pos + 8] == &box_type::SINF {
+            let sinf_size = u32::from_be_bytes([
+                entry_payload[pos], entry_payload[pos + 1],
+                entry_payload[pos + 2], entry_payload[pos + 3],
+            ]) as usize;
+
+            if sinf_size >= 8 && pos + sinf_size <= entry_payload.len() {
+                // Parse sinf to find frma
+                let sinf_payload = &entry_payload[pos + 8..pos + sinf_size];
+                if let Some(format) = find_frma_in_sinf(sinf_payload) {
+                    original_format = Some(format);
+                }
+                // Skip the sinf box entirely
+                pos += sinf_size;
+                continue;
+            }
+        }
+
+        // Not a sinf — copy byte by byte
+        output.push(entry_payload[pos]);
+        pos += 1;
+    }
+
+    // Copy remaining bytes
+    if pos < entry_payload.len() {
+        output.extend_from_slice(&entry_payload[pos..]);
+    }
+
+    (original_format, output)
+}
+
+/// Find frma box inside sinf payload and return the original format FourCC.
+fn find_frma_in_sinf(sinf_payload: &[u8]) -> Option<[u8; 4]> {
+    for box_result in iterate_boxes(sinf_payload) {
+        if let Ok(header) = box_result {
+            if header.box_type == box_type::FRMA {
+                let box_end = (header.offset + header.size) as usize;
+                let box_data = &sinf_payload[header.offset as usize..box_end.min(sinf_payload.len())];
+                let payload = &box_data[header.header_size as usize..];
+                if payload.len() >= 4 {
+                    let mut format = [0u8; 4];
+                    format.copy_from_slice(&payload[..4]);
+                    return Some(format);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +1294,334 @@ mod tests {
         assert_eq!(&result[4..8], b"moov");
         let has_pssh = result.windows(4).any(|w| w == b"pssh");
         assert!(has_pssh);
+    }
+
+    // --- Helper: build a minimal clear init segment ---
+
+    /// Build a minimal clear init segment: ftyp + moov { trak { mdia { minf { stbl { stsd { avc1 } } } } } }
+    fn build_clear_init(codec: &[u8; 4]) -> Vec<u8> {
+        let mut data = Vec::new();
+
+        // ftyp
+        cmaf::write_box_header(&mut data, 16, b"ftyp");
+        data.extend_from_slice(b"isom\x00\x00\x02\x00");
+
+        // Build sample entry: codec with 8 bytes of payload
+        let entry_payload = [0u8; 8];
+        let entry_size = 8 + entry_payload.len() as u32;
+        let mut entry = Vec::new();
+        cmaf::write_box_header(&mut entry, entry_size, codec);
+        entry.extend_from_slice(&entry_payload);
+
+        // stsd (full box): header(8) + version_flags(4) + entry_count(4) + entries
+        let stsd_size = 8 + 4 + 4 + entry.len() as u32;
+        let mut stsd = Vec::new();
+        cmaf::write_box_header(&mut stsd, stsd_size, b"stsd");
+        stsd.extend_from_slice(&[0u8; 4]); // version + flags
+        stsd.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+        stsd.extend_from_slice(&entry);
+
+        // Nest: stbl { stsd }
+        let stbl_size = 8 + stsd.len() as u32;
+        let mut stbl = Vec::new();
+        cmaf::write_box_header(&mut stbl, stbl_size, b"stbl");
+        stbl.extend_from_slice(&stsd);
+
+        // minf { stbl }
+        let minf_size = 8 + stbl.len() as u32;
+        let mut minf = Vec::new();
+        cmaf::write_box_header(&mut minf, minf_size, b"minf");
+        minf.extend_from_slice(&stbl);
+
+        // mdia { minf }
+        let mdia_size = 8 + minf.len() as u32;
+        let mut mdia = Vec::new();
+        cmaf::write_box_header(&mut mdia, mdia_size, b"mdia");
+        mdia.extend_from_slice(&minf);
+
+        // trak { mdia }
+        let trak_size = 8 + mdia.len() as u32;
+        let mut trak = Vec::new();
+        cmaf::write_box_header(&mut trak, trak_size, b"trak");
+        trak.extend_from_slice(&mdia);
+
+        // moov { trak }
+        let moov_size = 8 + trak.len() as u32;
+        cmaf::write_box_header(&mut data, moov_size, b"moov");
+        data.extend_from_slice(&trak);
+
+        data
+    }
+
+    /// Build a minimal encrypted init segment: ftyp + moov { trak { mdia { minf { stbl { stsd { encv { sinf } } } } } }, pssh }
+    fn build_encrypted_init(encrypted_type: &[u8; 4], original_format: &[u8; 4]) -> Vec<u8> {
+        let mut data = Vec::new();
+
+        // ftyp
+        cmaf::write_box_header(&mut data, 16, b"ftyp");
+        data.extend_from_slice(b"isom\x00\x00\x02\x00");
+
+        // Build sinf: frma + schm + schi { tenc }
+        let sinf = build_sinf(original_format, EncryptionScheme::Cenc, &[0x01; 16], 8, (0, 0));
+
+        // Sample entry: encrypted_type with 8 bytes of codec payload + sinf
+        let entry_payload_base = [0u8; 8];
+        let entry_size = 8 + entry_payload_base.len() as u32 + sinf.len() as u32;
+        let mut entry = Vec::new();
+        cmaf::write_box_header(&mut entry, entry_size, encrypted_type);
+        entry.extend_from_slice(&entry_payload_base);
+        entry.extend_from_slice(&sinf);
+
+        // stsd (full box)
+        let stsd_size = 8 + 4 + 4 + entry.len() as u32;
+        let mut stsd = Vec::new();
+        cmaf::write_box_header(&mut stsd, stsd_size, b"stsd");
+        stsd.extend_from_slice(&[0u8; 4]);
+        stsd.extend_from_slice(&1u32.to_be_bytes());
+        stsd.extend_from_slice(&entry);
+
+        // Nest: stbl { stsd }
+        let stbl_size = 8 + stsd.len() as u32;
+        let mut stbl = Vec::new();
+        cmaf::write_box_header(&mut stbl, stbl_size, b"stbl");
+        stbl.extend_from_slice(&stsd);
+
+        let minf_size = 8 + stbl.len() as u32;
+        let mut minf = Vec::new();
+        cmaf::write_box_header(&mut minf, minf_size, b"minf");
+        minf.extend_from_slice(&stbl);
+
+        let mdia_size = 8 + minf.len() as u32;
+        let mut mdia = Vec::new();
+        cmaf::write_box_header(&mut mdia, mdia_size, b"mdia");
+        mdia.extend_from_slice(&minf);
+
+        let trak_size = 8 + mdia.len() as u32;
+        let mut trak = Vec::new();
+        cmaf::write_box_header(&mut trak, trak_size, b"trak");
+        trak.extend_from_slice(&mdia);
+
+        // PSSH box (minimal)
+        let mut pssh = Vec::new();
+        cmaf::write_box_header(&mut pssh, 20, b"pssh");
+        pssh.extend_from_slice(&[0u8; 12]); // version + flags + system_id partial
+
+        // moov { trak, pssh }
+        let moov_size = 8 + trak.len() as u32 + pssh.len() as u32;
+        cmaf::write_box_header(&mut data, moov_size, b"moov");
+        data.extend_from_slice(&trak);
+        data.extend_from_slice(&pssh);
+
+        data
+    }
+
+    // --- Tests for new Phase 3 functions ---
+
+    #[test]
+    fn encrypted_sample_entry_type_video_codecs() {
+        assert_eq!(encrypted_sample_entry_type(b"avc1"), Some(*b"encv"));
+        assert_eq!(encrypted_sample_entry_type(b"avc3"), Some(*b"encv"));
+        assert_eq!(encrypted_sample_entry_type(b"hvc1"), Some(*b"encv"));
+        assert_eq!(encrypted_sample_entry_type(b"hev1"), Some(*b"encv"));
+        assert_eq!(encrypted_sample_entry_type(b"vp09"), Some(*b"encv"));
+        assert_eq!(encrypted_sample_entry_type(b"av01"), Some(*b"encv"));
+    }
+
+    #[test]
+    fn encrypted_sample_entry_type_audio_codecs() {
+        assert_eq!(encrypted_sample_entry_type(b"mp4a"), Some(*b"enca"));
+        assert_eq!(encrypted_sample_entry_type(b"ac-3"), Some(*b"enca"));
+        assert_eq!(encrypted_sample_entry_type(b"ec-3"), Some(*b"enca"));
+        assert_eq!(encrypted_sample_entry_type(b"Opus"), Some(*b"enca"));
+        assert_eq!(encrypted_sample_entry_type(b"fLaC"), Some(*b"enca"));
+    }
+
+    #[test]
+    fn encrypted_sample_entry_type_unknown_returns_none() {
+        assert_eq!(encrypted_sample_entry_type(b"encv"), None);
+        assert_eq!(encrypted_sample_entry_type(b"enca"), None);
+        assert_eq!(encrypted_sample_entry_type(b"abcd"), None);
+    }
+
+    #[test]
+    fn is_encrypted_sample_entry_recognizes_types() {
+        assert!(is_encrypted_sample_entry(b"encv"));
+        assert!(is_encrypted_sample_entry(b"enca"));
+        assert!(is_encrypted_sample_entry(b"enct"));
+        assert!(is_encrypted_sample_entry(b"encs"));
+        assert!(!is_encrypted_sample_entry(b"avc1"));
+        assert!(!is_encrypted_sample_entry(b"mp4a"));
+    }
+
+    #[test]
+    fn build_sinf_produces_valid_box() {
+        let sinf = build_sinf(b"avc1", EncryptionScheme::Cenc, &[0x01; 16], 8, (0, 0));
+        assert_eq!(&sinf[4..8], b"sinf");
+        // Should contain frma, schm, schi
+        assert!(sinf.windows(4).any(|w| w == b"frma"));
+        assert!(sinf.windows(4).any(|w| w == b"schm"));
+        assert!(sinf.windows(4).any(|w| w == b"schi"));
+        assert!(sinf.windows(4).any(|w| w == b"tenc"));
+        // frma should contain original format "avc1"
+        let frma_pos = sinf.windows(4).position(|w| w == b"frma").unwrap();
+        assert_eq!(&sinf[frma_pos + 4..frma_pos + 8], b"avc1");
+    }
+
+    #[test]
+    fn build_sinf_cbcs_has_pattern() {
+        let sinf = build_sinf(b"mp4a", EncryptionScheme::Cbcs, &[0x02; 16], 16, (1, 9));
+        assert!(sinf.windows(4).any(|w| w == b"cbcs"));
+    }
+
+    #[test]
+    fn find_frma_in_sinf_extracts_format() {
+        // Build a sinf payload with frma box
+        let mut sinf_payload = Vec::new();
+        cmaf::write_box_header(&mut sinf_payload, 12, b"frma");
+        sinf_payload.extend_from_slice(b"avc1");
+
+        let result = find_frma_in_sinf(&sinf_payload);
+        assert_eq!(result, Some(*b"avc1"));
+    }
+
+    #[test]
+    fn find_frma_in_sinf_returns_none_for_empty() {
+        assert_eq!(find_frma_in_sinf(&[]), None);
+    }
+
+    #[test]
+    fn rewrite_ftyp_only_preserves_moov() {
+        let init = build_clear_init(b"avc1");
+        let result = rewrite_ftyp_only(&init, ContainerFormat::Cmaf).unwrap();
+        // Should have ftyp and moov
+        assert!(result.windows(4).any(|w| w == b"ftyp"));
+        assert!(result.windows(4).any(|w| w == b"moov"));
+        // Moov content should be the same (stsd with avc1)
+        assert!(result.windows(4).any(|w| w == b"avc1"));
+        // Should NOT have sinf or pssh (clear content stays clear)
+        assert!(!result.windows(4).any(|w| w == b"sinf"));
+        assert!(!result.windows(4).any(|w| w == b"pssh"));
+    }
+
+    #[test]
+    fn rewrite_ftyp_only_cmaf_has_cmfc() {
+        let init = build_clear_init(b"avc1");
+        let result = rewrite_ftyp_only(&init, ContainerFormat::Cmaf).unwrap();
+        assert!(result.windows(4).any(|w| w == b"cmfc"));
+    }
+
+    #[test]
+    fn create_protection_info_injects_sinf_and_pssh() {
+        let init = build_clear_init(b"avc1");
+        let key_set = make_key_set();
+        let result = create_protection_info(
+            &init, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+        ).unwrap();
+
+        // Should have sinf injected
+        assert!(result.windows(4).any(|w| w == b"sinf"));
+        assert!(result.windows(4).any(|w| w == b"frma"));
+        assert!(result.windows(4).any(|w| w == b"schm"));
+        assert!(result.windows(4).any(|w| w == b"tenc"));
+        // Should have PSSH boxes
+        assert!(result.windows(4).any(|w| w == b"pssh"));
+        // Sample entry should be renamed to encv
+        assert!(result.windows(4).any(|w| w == b"encv"));
+        // Original avc1 should only appear inside frma, not as a sample entry type
+        // (frma contains it, but the entry type itself should be encv)
+    }
+
+    #[test]
+    fn create_protection_info_audio_enca() {
+        let init = build_clear_init(b"mp4a");
+        let key_set = make_key_set();
+        let result = create_protection_info(
+            &init, &key_set, EncryptionScheme::Cbcs, 16, (0, 0), ContainerFormat::Cmaf,
+        ).unwrap();
+
+        assert!(result.windows(4).any(|w| w == b"enca"));
+        assert!(result.windows(4).any(|w| w == b"sinf"));
+        assert!(result.windows(4).any(|w| w == b"cbcs"));
+    }
+
+    #[test]
+    fn create_protection_info_cenc_has_cenc_scheme() {
+        let init = build_clear_init(b"avc1");
+        let key_set = make_key_set();
+        let result = create_protection_info(
+            &init, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+        ).unwrap();
+
+        // schm box should contain "cenc"
+        assert!(result.windows(4).any(|w| w == b"cenc"));
+    }
+
+    #[test]
+    fn strip_protection_info_removes_sinf_and_pssh() {
+        let init = build_encrypted_init(b"encv", b"avc1");
+        let result = strip_protection_info(&init, ContainerFormat::Cmaf).unwrap();
+
+        // sinf should be removed
+        assert!(!result.windows(4).any(|w| w == b"sinf"));
+        // PSSH should be removed
+        assert!(!result.windows(4).any(|w| w == b"pssh"));
+        // Sample entry should be restored to avc1
+        assert!(result.windows(4).any(|w| w == b"avc1"));
+        // encv should no longer appear
+        assert!(!result.windows(4).any(|w| w == b"encv"));
+    }
+
+    #[test]
+    fn strip_protection_info_audio_enca() {
+        let init = build_encrypted_init(b"enca", b"mp4a");
+        let result = strip_protection_info(&init, ContainerFormat::Cmaf).unwrap();
+
+        assert!(!result.windows(4).any(|w| w == b"sinf"));
+        assert!(result.windows(4).any(|w| w == b"mp4a"));
+        assert!(!result.windows(4).any(|w| w == b"enca"));
+    }
+
+    #[test]
+    fn create_then_strip_roundtrip() {
+        // Clear → Encrypted → Clear should restore original structure
+        let init = build_clear_init(b"avc1");
+        let key_set = make_key_set();
+
+        let encrypted = create_protection_info(
+            &init, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+        ).unwrap();
+
+        // Verify encryption was applied
+        assert!(encrypted.windows(4).any(|w| w == b"encv"));
+        assert!(encrypted.windows(4).any(|w| w == b"sinf"));
+
+        let clear = strip_protection_info(&encrypted, ContainerFormat::Cmaf).unwrap();
+
+        // Verify decryption info was stripped
+        assert!(clear.windows(4).any(|w| w == b"avc1"));
+        assert!(!clear.windows(4).any(|w| w == b"encv"));
+        assert!(!clear.windows(4).any(|w| w == b"sinf"));
+        assert!(!clear.windows(4).any(|w| w == b"pssh"));
+    }
+
+    #[test]
+    fn rewrite_ftyp_only_empty_data() {
+        let result = rewrite_ftyp_only(&[], ContainerFormat::Cmaf).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn create_protection_info_empty_data() {
+        let key_set = make_key_set();
+        let result = create_protection_info(
+            &[], &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+        ).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn strip_protection_info_empty_data() {
+        let result = strip_protection_info(&[], ContainerFormat::Cmaf).unwrap();
+        assert!(result.is_empty());
     }
 }

@@ -14,14 +14,25 @@ pub enum EncryptionScheme {
     /// CENC: AES-128-CTR full encryption.
     /// Used by Widevine and PlayReady. No pattern — all bytes encrypted.
     Cenc,
+    /// None: unencrypted/clear content. No encryption or decryption is applied.
+    None,
 }
 
 impl EncryptionScheme {
+    /// Whether this scheme involves encryption (as opposed to clear/unencrypted content).
+    pub fn is_encrypted(&self) -> bool {
+        !matches!(self, EncryptionScheme::None)
+    }
+
     /// Returns the 4-byte scheme type code used in ISOBMFF schm boxes.
+    ///
+    /// Callers must check `is_encrypted()` before using this value — `None` returns
+    /// zeroed bytes as a defensive fallback since clear content has no schm box.
     pub fn scheme_type_bytes(&self) -> [u8; 4] {
         match self {
             EncryptionScheme::Cbcs => *b"cbcs",
             EncryptionScheme::Cenc => *b"cenc",
+            EncryptionScheme::None => [0u8; 4],
         }
     }
 
@@ -40,6 +51,7 @@ impl EncryptionScheme {
         match self {
             EncryptionScheme::Cbcs => "cbcs",
             EncryptionScheme::Cenc => "cenc",
+            EncryptionScheme::None => "none",
         }
     }
 
@@ -47,10 +59,12 @@ impl EncryptionScheme {
     ///
     /// - CBCS: `SAMPLE-AES` (AES-128-CBC pattern encryption)
     /// - CENC: `SAMPLE-AES-CTR` (AES-128-CTR full encryption)
+    /// - None: `NONE` (defensive; never rendered since drm_info will be None for clear output)
     pub fn hls_method_string(&self) -> &'static str {
         match self {
             EncryptionScheme::Cbcs => "SAMPLE-AES",
             EncryptionScheme::Cenc => "SAMPLE-AES-CTR",
+            EncryptionScheme::None => "NONE",
         }
     }
 
@@ -58,10 +72,12 @@ impl EncryptionScheme {
     ///
     /// - CBCS: 16 bytes (CBC requires 16-byte IVs)
     /// - CENC: 8 bytes (CTR counter block, upper 8 bytes of 16-byte nonce)
+    /// - None: 0 (clear content has no IVs)
     pub fn default_iv_size(&self) -> u8 {
         match self {
             EncryptionScheme::Cbcs => 16,
             EncryptionScheme::Cenc => 8,
+            EncryptionScheme::None => 0,
         }
     }
 
@@ -69,10 +85,11 @@ impl EncryptionScheme {
     ///
     /// - CBCS: (1, 9) — encrypt 1 of every 10 blocks
     /// - CENC: (0, 0) — no pattern, full encryption
+    /// - None: (0, 0) — no pattern (no encryption)
     pub fn default_video_pattern(&self) -> (u8, u8) {
         match self {
             EncryptionScheme::Cbcs => (1, 9),
-            EncryptionScheme::Cenc => (0, 0),
+            EncryptionScheme::Cenc | EncryptionScheme::None => (0, 0),
         }
     }
 
@@ -85,10 +102,7 @@ impl EncryptionScheme {
 
     /// Whether this scheme uses pattern encryption (as opposed to full encryption).
     pub fn uses_pattern(&self) -> bool {
-        match self {
-            EncryptionScheme::Cbcs => true,
-            EncryptionScheme::Cenc => false,
-        }
+        matches!(self, EncryptionScheme::Cbcs)
     }
 
     /// Whether FairPlay DRM is applicable for this scheme.
@@ -222,8 +236,9 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(EncryptionScheme::Cbcs);
         set.insert(EncryptionScheme::Cenc);
+        set.insert(EncryptionScheme::None);
         set.insert(EncryptionScheme::Cbcs); // duplicate
-        assert_eq!(set.len(), 2);
+        assert_eq!(set.len(), 3);
     }
 
     #[test]
@@ -233,5 +248,73 @@ mod tests {
             let parsed = EncryptionScheme::from_scheme_type(&bytes).unwrap();
             assert_eq!(parsed, scheme);
         }
+    }
+
+    // --- EncryptionScheme::None tests ---
+
+    #[test]
+    fn is_encrypted() {
+        assert!(EncryptionScheme::Cbcs.is_encrypted());
+        assert!(EncryptionScheme::Cenc.is_encrypted());
+        assert!(!EncryptionScheme::None.is_encrypted());
+    }
+
+    #[test]
+    fn scheme_type_bytes_none() {
+        assert_eq!(EncryptionScheme::None.scheme_type_bytes(), [0u8; 4]);
+    }
+
+    #[test]
+    fn scheme_type_str_none() {
+        assert_eq!(EncryptionScheme::None.scheme_type_str(), "none");
+    }
+
+    #[test]
+    fn hls_method_string_none() {
+        assert_eq!(EncryptionScheme::None.hls_method_string(), "NONE");
+    }
+
+    #[test]
+    fn display_impl_none() {
+        assert_eq!(format!("{}", EncryptionScheme::None), "none");
+    }
+
+    #[test]
+    fn default_iv_size_none() {
+        assert_eq!(EncryptionScheme::None.default_iv_size(), 0);
+    }
+
+    #[test]
+    fn default_video_pattern_none() {
+        assert_eq!(EncryptionScheme::None.default_video_pattern(), (0, 0));
+    }
+
+    #[test]
+    fn default_audio_pattern_none() {
+        assert_eq!(EncryptionScheme::None.default_audio_pattern(), (0, 0));
+    }
+
+    #[test]
+    fn uses_pattern_none() {
+        assert!(!EncryptionScheme::None.uses_pattern());
+    }
+
+    #[test]
+    fn supports_fairplay_none() {
+        assert!(!EncryptionScheme::None.supports_fairplay());
+    }
+
+    #[test]
+    fn serde_roundtrip_none() {
+        let scheme = EncryptionScheme::None;
+        let json = serde_json::to_string(&scheme).unwrap();
+        let parsed: EncryptionScheme = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, scheme);
+    }
+
+    #[test]
+    fn from_scheme_type_does_not_return_none() {
+        // None is never parsed from bytes — clear content has no schm box
+        assert_eq!(EncryptionScheme::from_scheme_type(&[0u8; 4]), Option::None);
     }
 }

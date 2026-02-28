@@ -34,7 +34,7 @@ fn progressive_output_hls_full_lifecycle() {
         "lifecycle-test".into(),
         OutputFormat::Hls,
         "/repackage/lifecycle-test/hls/".into(),
-        drm_info,
+        Some(drm_info),
         ContainerFormat::default(),
     );
 
@@ -118,7 +118,7 @@ fn progressive_output_dash_full_lifecycle() {
         "dash-lifecycle".into(),
         OutputFormat::Dash,
         "/repackage/dash-lifecycle/dash/".into(),
-        drm_info,
+        Some(drm_info),
         ContainerFormat::default(),
     );
 
@@ -417,7 +417,7 @@ fn progressive_output_hls_iso_lifecycle() {
         "iso-test".into(),
         OutputFormat::Hls,
         "/repackage/iso-test/hls/".into(),
-        drm_info,
+        Some(drm_info),
         ContainerFormat::Iso,
     );
     po.set_init_segment(vec![0x00; 256]);

@@ -29,11 +29,11 @@ impl ProgressiveOutput {
         content_id: String,
         format: OutputFormat,
         base_url: String,
-        drm_info: ManifestDrmInfo,
+        drm_info: Option<ManifestDrmInfo>,
         container_format: ContainerFormat,
     ) -> Self {
         let mut state = ManifestState::new(content_id, format, base_url, container_format);
-        state.drm_info = Some(drm_info);
+        state.drm_info = drm_info;
 
         Self {
             state,
@@ -173,7 +173,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/base/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         assert_eq!(po.manifest_state().phase, ManifestPhase::AwaitingFirstSegment);
@@ -188,7 +188,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/base/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00, 0x01, 0x02]);
@@ -206,7 +206,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/base/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -224,7 +224,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/base/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -241,7 +241,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/base/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -259,7 +259,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/base/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -275,7 +275,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Dash,
             "/base/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -291,7 +291,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         assert!(po.current_manifest().is_none());
@@ -303,7 +303,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -317,7 +317,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -337,7 +337,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -357,7 +357,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/repackage/c1/hls/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::default(),
         );
         po.set_init_segment(vec![0x00]);
@@ -374,7 +374,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/repackage/c1/hls/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::Fmp4,
         );
         po.set_init_segment(vec![0x00]);
@@ -391,7 +391,7 @@ mod tests {
             "c1".into(),
             OutputFormat::Hls,
             "/repackage/c1/hls/".into(),
-            make_drm_info(),
+            Some(make_drm_info()),
             ContainerFormat::Iso,
         );
         po.set_init_segment(vec![0x00]);
@@ -404,13 +404,13 @@ mod tests {
 
     #[test]
     fn manifest_cache_control_awaiting() {
-        let po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), make_drm_info(), ContainerFormat::default());
+        let po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
         assert_eq!(po.manifest_cache_control(31536000, 1), "no-cache");
     }
 
     #[test]
     fn manifest_cache_control_live() {
-        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), make_drm_info(), ContainerFormat::default());
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
         po.set_init_segment(vec![0x00]);
         po.add_segment(0, vec![0xAA; 50], 6.0);
         assert_eq!(
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn manifest_cache_control_complete() {
-        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), make_drm_info(), ContainerFormat::default());
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
         po.set_init_segment(vec![0x00]);
         po.add_segment(0, vec![0xAA; 50], 6.0);
         po.finalize();

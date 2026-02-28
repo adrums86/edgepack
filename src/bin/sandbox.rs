@@ -117,19 +117,10 @@ async fn handle_repackage(
         }
     };
 
-    if payload.target_scheme == "none" {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(ErrorResponse {
-                error: "Clear (unencrypted) output is planned for Phase 3. Currently only 'cenc' and 'cbcs' target schemes are supported.".into(),
-            }),
-        )
-            .into_response();
-    }
-
     let target_scheme = match payload.target_scheme.as_str() {
         "cenc" => edgepack::drm::scheme::EncryptionScheme::Cenc,
         "cbcs" => edgepack::drm::scheme::EncryptionScheme::Cbcs,
+        "none" => edgepack::drm::scheme::EncryptionScheme::None,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -156,46 +147,58 @@ async fn handle_repackage(
         }
     };
 
-    let speke_url = match edgepack::url::Url::parse(&payload.speke_url) {
-        Ok(u) => u,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("invalid speke_url: {e}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    let speke_auth = match payload.speke_auth_type.as_str() {
-        "bearer" => SpekeAuth::Bearer(payload.speke_auth_value.clone()),
-        "api_key" => SpekeAuth::ApiKey {
-            header: if payload.speke_api_key_header.is_empty() {
-                "x-api-key".into()
-            } else {
-                payload.speke_api_key_header.clone()
-            },
-            value: payload.speke_auth_value.clone(),
-        },
-        "basic" => {
-            let parts: Vec<&str> = payload.speke_auth_value.splitn(2, ':').collect();
-            if parts.len() != 2 {
+    // SPEKE configuration — only needed when target scheme requires encryption.
+    // For clear (None) output, use a dummy SPEKE config since it won't be called.
+    let (speke_url, speke_auth) = if target_scheme.is_encrypted() {
+        let url = match edgepack::url::Url::parse(&payload.speke_url) {
+            Ok(u) => u,
+            Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
-                        error: "basic auth value must be 'username:password'".into(),
+                        error: format!("invalid speke_url: {e}"),
                     }),
                 )
                     .into_response();
             }
-            SpekeAuth::Basic {
-                username: parts[0].into(),
-                password: parts[1].into(),
+        };
+
+        let auth = match payload.speke_auth_type.as_str() {
+            "bearer" => SpekeAuth::Bearer(payload.speke_auth_value.clone()),
+            "api_key" => SpekeAuth::ApiKey {
+                header: if payload.speke_api_key_header.is_empty() {
+                    "x-api-key".into()
+                } else {
+                    payload.speke_api_key_header.clone()
+                },
+                value: payload.speke_auth_value.clone(),
+            },
+            "basic" => {
+                let parts: Vec<&str> = payload.speke_auth_value.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "basic auth value must be 'username:password'".into(),
+                        }),
+                    )
+                        .into_response();
+                }
+                SpekeAuth::Basic {
+                    username: parts[0].into(),
+                    password: parts[1].into(),
+                }
             }
-        }
-        _ => SpekeAuth::Bearer(payload.speke_auth_value.clone()),
+            _ => SpekeAuth::Bearer(payload.speke_auth_value.clone()),
+        };
+
+        (url, auth)
+    } else {
+        // Dummy SPEKE config for clear output — pipeline will skip SPEKE calls
+        (
+            edgepack::url::Url::parse("https://unused.local/speke").unwrap(),
+            SpekeAuth::Bearer("unused".into()),
+        )
     };
 
     // Generate a content_id from the source URL

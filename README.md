@@ -3,7 +3,7 @@
 
 # edgepack
 
-A Rust application compiled to WebAssembly for CDN edge environments. It repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC) and container formats (CMAF ↔ fMP4), producing progressive output manifests and segments cached at the CDN for maximum duration. The target encryption scheme and container format are configurable per request, supporting all encryption scheme combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) with automatic source scheme detection, and output as either CMAF or fragmented MP4.
+A Rust application compiled to WebAssembly for CDN edge environments. It repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive output manifests and segments cached at the CDN for maximum duration. The target encryption scheme and container format are configurable per request, supporting all encryption scheme combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4.
 
 ## What It Does
 
@@ -67,7 +67,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **566 tests** (484 unit tests + 82 integration tests) covering every module, plus a binary size guard ensuring the release WASM stays under 600 KB. To run tests for a specific module:
+The project includes **614 tests** (522 unit tests + 92 integration tests) covering every module, plus a binary size guard ensuring the release WASM stays under 600 KB. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -83,7 +83,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
 ```
 
-#### Unit Test Coverage (484 tests)
+#### Unit Test Coverage (522 tests)
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
@@ -91,19 +91,20 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryptio
 | `config` | 11 | Defaults, serde roundtrips, env var loading |
 | `url` | 14 | URL parsing (scheme, host, port, path, query), join (absolute, relative, protocol-relative, `..`/`.` normalization), serde roundtrip, authority extraction |
 | `cache` | 44 | CacheKeys formatting, backend factory, Upstash JSON response parsing, in-memory cache ops, encrypted backend (AES-256-GCM roundtrip, tamper detection, key sensitivity patterns, key derivation) |
-| `drm` | 100 | EncryptionScheme enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags), SampleDecryptor/SampleEncryptor traits (factory dispatch, CBCS/CENC roundtrips), system IDs, CPIX XML roundtrips, CBCS decrypt + encrypt, CENC encrypt + decrypt, SPEKE client, auth headers |
-| `media` | 91 | FourCC types, ISOBMFF box parsing/building/iteration, ContainerFormat enum (3 variants: CMAF/fMP4/ISO, video/audio extensions, brands, ftyp building, DASH profiles, serde roundtrips, display), init segment rewriting (CBCS and CENC target schemes, tenc pattern encoding, PSSH filtering, ftyp brand rewriting per container format), segment rewriting (scheme-aware decrypt/re-encrypt), IV padding |
+| `drm` | 112 | EncryptionScheme enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags, `is_encrypted()`, None variant), SampleDecryptor/SampleEncryptor traits (factory dispatch, CBCS/CENC roundtrips), system IDs, CPIX XML roundtrips, CBCS decrypt + encrypt, CENC encrypt + decrypt, SPEKE client, auth headers |
+| `media` | 115 | FourCC types, ISOBMFF box parsing/building/iteration, ContainerFormat enum (3 variants: CMAF/fMP4/ISO, video/audio extensions, brands, ftyp building, DASH profiles, serde roundtrips, display), init segment rewriting (CBCS and CENC target schemes, tenc pattern encoding, PSSH filtering, ftyp brand rewriting per container format, sinf injection for clear→encrypted, sinf stripping for encrypted→clear, ftyp-only rewrite for clear→clear), segment rewriting (four-way dispatch: encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear pass-through), IV padding |
 | `manifest` | 93 | HLS/DASH rendering for all lifecycle phases, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc for DASH), FairPlay key URI rendering, variant streams, ISO 8601 duration, KID formatting, HLS M3U8 input parsing (source scheme detection from EXT-X-KEY), DASH MPD input parsing (source scheme detection from ContentProtection) |
 | `repackager` | 48 | Job types/serde, progressive output state machine (CMAF/fMP4/ISO segment URIs), cache-control headers, key set caching, continuation params (scheme-aware serde roundtrip, container format), pipeline execution, manifest DRM info building (CBCS/CENC target scheme, FairPlay inclusion/exclusion), sensitive data cleanup |
-| `handler` | 62 | HTTP routing, path parsing, format validation, segment number parsing (all 7 CMAF/ISOBMFF extensions), webhook validation (target_scheme, container_format incl. ISO, CBCS/CENC parsing, invalid scheme/format rejection), response construction, continue endpoint |
+| `handler` | 64 | HTTP routing, path parsing, format validation, segment number parsing (all 7 CMAF/ISOBMFF extensions), webhook validation (target_scheme incl. none, container_format incl. ISO, CBCS/CENC/None parsing, invalid scheme/format rejection), response construction, continue endpoint |
 | `http_client` | 5 | Response construction, native stub errors |
 
-#### Integration Test Coverage (82 tests)
+#### Integration Test Coverage (92 tests)
 
 Integration tests live in the `tests/` directory and exercise cross-module workflows with synthetic CMAF fixtures — no external services or network required.
 
 | Test Suite | Tests | What's Covered |
 |------------|-------|----------------|
+| `clear_content` | 10 | Clear→CENC/CBCS init and segment transforms, encrypted→clear init and segment stripping, clear→clear pass-through, roundtrip (clear→encrypted→clear) for both init and segment |
 | `encryption_roundtrip` | 8 | Full CBCS→plaintext→CENC pipeline: full-sample, pattern (1:9), subsample (NAL unit), multi-sample IV uniqueness, audio (0:0 pattern), cross-segment IV isolation |
 | `isobmff_integration` | 18 | Synthetic init segment parsing and rewriting (scheme-aware: CBCS→CENC with configurable target, container-format-aware ftyp rewriting), PSSH box generation (Widevine+PlayReady, FairPlay exclusion for CENC), senc box roundtrip (with/without subsamples), media segment decrypt→re-encrypt→verify, error handling for malformed segments |
 | `manifest_integration` | 23 | Progressive output lifecycle (HLS+DASH, all container formats incl. ISO), manifest phase transitions, DRM signaling in manifests (scheme-aware: Widevine/PlayReady key URIs, dynamic METHOD selection, ContentProtection with scheme-specific value, cenc:pssh, mspr:pro), cache-control headers per phase, ManifestState serde roundtrip, cross-format consistency, ISO BMFF DASH profiles |
@@ -186,7 +187,7 @@ Returns `200 OK` as soon as the first segment and live manifest are published (c
 }
 ```
 
-- `target_scheme` — `cenc` (default) or `cbcs`. Determines the output encryption scheme.
+- `target_scheme` — `cenc` (default), `cbcs`, or `none`. Determines the output encryption scheme. Use `none` for decryption-only (encrypted→clear) or format-only conversion (clear→clear).
 - `container_format` — `cmaf` (default), `fmp4`, or `iso`. Determines the output container format. CMAF uses `.cmfv`/`.cmfa` extensions and includes the `cmfc` compatible brand; fMP4 uses `.m4s` extensions; ISO BMFF uses `.mp4` extensions.
 
 Remaining segments are processed asynchronously via self-invocation chaining. Each invocation processes one segment and chains the next via an internal `POST /webhook/repackage/continue` endpoint.
@@ -294,12 +295,13 @@ All diagrams use Mermaid syntax and can be imported into Confluence (Mermaid mac
 
 ## Supported Encryption Schemes
 
-The target encryption scheme is configurable per request via the `target_scheme` field (default: `cenc`). The source scheme is auto-detected from the init segment's `schm` box or from manifest DRM signaling (`#EXT-X-KEY` in HLS, `<ContentProtection>` in DASH).
+The target encryption scheme is configurable per request via the `target_scheme` field (default: `cenc`). The source scheme is auto-detected from the init segment's `schm` box or from manifest DRM signaling (`#EXT-X-KEY` in HLS, `<ContentProtection>` in DASH). Absence of encryption info indicates `None` (clear content).
 
 | Scheme | Mode | Pattern | IV Size | DRM Systems |
 |--------|------|---------|---------|-------------|
 | CBCS | AES-128-CBC | 1:9 (video), 0:0 (audio) | 16 bytes | FairPlay, Widevine, PlayReady |
 | CENC | AES-128-CTR | None (full encryption) | 8 bytes | Widevine, PlayReady |
+| None | Clear (no encryption) | N/A | 0 bytes | N/A |
 
 ### Supported Transforms
 
@@ -309,6 +311,11 @@ The target encryption scheme is configurable per request via the `target_scheme`
 | CENC → CBCS | CTR full → CBC pattern encryption (Widevine/PlayReady → FairPlay/Widevine/PlayReady) |
 | CBCS → CBCS | Re-encrypt with different key, same scheme |
 | CENC → CENC | Re-encrypt with different key, same scheme |
+| Clear → CENC | Encrypt clear content with CTR full encryption |
+| Clear → CBCS | Encrypt clear content with CBC pattern encryption |
+| CBCS → Clear | Decrypt CBCS content to clear (strip DRM) |
+| CENC → Clear | Decrypt CENC content to clear (strip DRM) |
+| Clear → Clear | Format-only conversion (no encryption/decryption) |
 
 ## Supported Container Formats
 
@@ -427,12 +434,12 @@ The runtime is fully implemented and compiles to a functional WASM component:
 - **WASI incoming handler**: `wasi_handler.rs` bridges `wasi:http/incoming-handler` to the library router. Converts WASI request/response types and maps errors to appropriate HTTP status codes.
 - **Source manifest parsing**: HLS M3U8 (`manifest/hls_input.rs`) and DASH MPD (`manifest/dash_input.rs`) input parsers extract segment URLs, durations, init segment references, live/VOD detection, and source encryption scheme (from `#EXT-X-KEY` METHOD in HLS or `<ContentProtection>` elements in DASH).
 - **Request handler wiring**: All GET handlers query Redis for cached segment data and manifest state. The webhook creates a `RepackagePipeline`, processes the first segment to produce a live manifest, and chains remaining processing via self-invocation.
-- **Configurable encryption**: Target encryption scheme (CBCS or CENC) is set per request. Source scheme auto-detected.
+- **Configurable encryption**: Target encryption scheme (CBCS, CENC, or None) is set per request. Source scheme auto-detected. Supports all nine combinations including clear content paths.
 - **Configurable container format**: Output container format (CMAF or fMP4) is set per request. Controls ftyp brands, segment extensions, and DASH profile signaling.
 
 ## Roadmap
 
-Phase 1 (encryption scheme generalization) and Phase 2 (container format flexibility) are complete. The following phases are planned next:
+Phases 1–3 are complete. The following phases are planned next:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 
@@ -443,17 +450,17 @@ Phase 1 (encryption scheme generalization) and Phase 2 (container format flexibi
 - [x] Updated route handler to accept both `.cmfv` and `.m4s` segment file extensions
 - [x] Updated DASH renderer with dynamic profile string and segment template extension
 
-### Phase 3: Unencrypted Input Support
+### ~~Phase 3: Unencrypted Input Support~~ ✅ Complete
 
-- [ ] Add `EncryptionScheme::None` variant — represents clear (unencrypted) content
-- [ ] Update source scheme detection in `hls_input.rs` and `dash_input.rs` to identify unencrypted sources (no `#EXT-X-KEY` / no `<ContentProtection>`)
-- [ ] Add `create_protection_info()` in `src/media/init.rs` — inject sinf/schm/tenc boxes into init segments that lack them (clear → encrypted path)
-- [ ] Update `src/media/segment.rs` — skip decryption when source scheme is `None`; encrypt-only path for clear → encrypted
-- [ ] Support clear → clear pass-through (format conversion only, no encryption/decryption)
-- [ ] Make SPEKE key acquisition conditional — skip when both source and target are unencrypted
-- [ ] Update `RepackageRequest` to accept `None` target scheme for decrypt-only or pass-through workflows
-- [ ] Update sandbox UI — add "None (Clear)" option for target encryption scheme, conditionally hide SPEKE fields when both source and target are clear
-- [ ] Add integration tests for clear→CENC, clear→CBCS, encrypted→clear, and clear→clear pipelines
+- [x] Added `EncryptionScheme::None` variant with `is_encrypted()` method and all match arms
+- [x] Added `create_protection_info()` in `src/media/init.rs` — inject sinf/schm/tenc/pssh into clear init segments (clear → encrypted)
+- [x] Added `strip_protection_info()` in `src/media/init.rs` — remove sinf/pssh and restore original sample entries (encrypted → clear)
+- [x] Added `rewrite_ftyp_only()` in `src/media/init.rs` — format-only conversion for clear → clear
+- [x] Added four-way segment dispatch in `src/media/segment.rs` with optional source/target keys
+- [x] Made SPEKE key acquisition conditional — skipped when both source and target are unencrypted
+- [x] Updated pipeline with four-way init/segment dispatch and optional DRM info
+- [x] Updated sandbox to accept "None (Clear)" target scheme with conditional SPEKE visibility
+- [x] Added 10 integration tests for clear→CENC, clear→CBCS, encrypted→clear, and clear→clear pipelines
 
 ### Phase 4: Dual-Scheme Output
 

@@ -244,16 +244,16 @@ fn rewrite_media_segment_basic_roundtrip() {
         common::build_cbcs_media_segment(2, 64, &common::TEST_SOURCE_KEY, 8);
 
     let params = SegmentRewriteParams {
-        source_key: ContentKey {
+        source_key: Some(ContentKey {
             kid: common::TEST_KID,
             key: common::TEST_SOURCE_KEY.to_vec(),
             iv: None,
-        },
-        target_key: ContentKey {
+        }),
+        target_key: Some(ContentKey {
             kid: common::TEST_KID,
             key: common::TEST_TARGET_KEY.to_vec(),
             iv: None,
-        },
+        }),
         source_scheme: EncryptionScheme::Cbcs,
         target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
@@ -294,16 +294,16 @@ fn rewrite_media_segment_mdat_is_encrypted() {
         common::build_cbcs_media_segment(1, 64, &common::TEST_SOURCE_KEY, 8);
 
     let params = SegmentRewriteParams {
-        source_key: ContentKey {
+        source_key: Some(ContentKey {
             kid: common::TEST_KID,
             key: common::TEST_SOURCE_KEY.to_vec(),
             iv: None,
-        },
-        target_key: ContentKey {
+        }),
+        target_key: Some(ContentKey {
             kid: common::TEST_KID,
             key: common::TEST_TARGET_KEY.to_vec(),
             iv: None,
-        },
+        }),
         source_scheme: EncryptionScheme::Cbcs,
         target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
@@ -344,16 +344,16 @@ fn rewrite_segment_multiple_samples() {
         common::build_cbcs_media_segment(sample_count, sample_size, &common::TEST_SOURCE_KEY, 8);
 
     let params = SegmentRewriteParams {
-        source_key: ContentKey {
+        source_key: Some(ContentKey {
             kid: common::TEST_KID,
             key: common::TEST_SOURCE_KEY.to_vec(),
             iv: None,
-        },
-        target_key: ContentKey {
+        }),
+        target_key: Some(ContentKey {
             kid: common::TEST_KID,
             key: common::TEST_TARGET_KEY.to_vec(),
             iv: None,
-        },
+        }),
         source_scheme: EncryptionScheme::Cbcs,
         target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
@@ -388,16 +388,16 @@ fn rewrite_segment_error_on_missing_moof() {
     let mdat = common::wrap_box(b"mdat", &[0u8; 64]);
 
     let params = SegmentRewriteParams {
-        source_key: ContentKey {
+        source_key: Some(ContentKey {
             kid: [0; 16],
             key: vec![0; 16],
             iv: None,
-        },
-        target_key: ContentKey {
+        }),
+        target_key: Some(ContentKey {
             kid: [0; 16],
             key: vec![0; 16],
             iv: None,
-        },
+        }),
         source_scheme: EncryptionScheme::Cbcs,
         target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,
@@ -422,16 +422,16 @@ fn rewrite_segment_error_on_missing_mdat() {
     let moof = common::wrap_box(b"moof", &[0u8; 64]);
 
     let params = SegmentRewriteParams {
-        source_key: ContentKey {
+        source_key: Some(ContentKey {
             kid: [0; 16],
             key: vec![0; 16],
             iv: None,
-        },
-        target_key: ContentKey {
+        }),
+        target_key: Some(ContentKey {
             kid: [0; 16],
             key: vec![0; 16],
             iv: None,
-        },
+        }),
         source_scheme: EncryptionScheme::Cbcs,
         target_scheme: EncryptionScheme::Cenc,
         source_iv_size: 8,

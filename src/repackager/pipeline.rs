@@ -40,6 +40,8 @@ impl RepackagePipeline {
     pub fn execute(&self, request: &RepackageRequest) -> Result<JobStatus> {
         let content_id = &request.content_id;
         let format = request.output_format;
+        let target_scheme = request.target_scheme;
+        let container_format = request.container_format;
 
         // Update job state: FetchingKeys
         self.update_job_state(content_id, format, JobState::FetchingKeys, 0, None)?;
@@ -49,46 +51,88 @@ impl RepackagePipeline {
 
         // Step 2: Fetch the init segment and parse protection info
         let init_data = self.fetch_segment(&source.init_segment_url)?;
-        let protection_info = init::parse_protection_info(&init_data)?
-            .ok_or_else(|| EdgepackError::Drm("source content is not encrypted".into()))?;
+        let protection_info = init::parse_protection_info(&init_data)?;
 
         // Detect source encryption scheme
-        let source_scheme = EncryptionScheme::from_scheme_type(&protection_info.scheme_type)
-            .ok_or_else(|| EdgepackError::Drm(format!(
-                "unsupported encryption scheme: {:?}",
-                std::str::from_utf8(&protection_info.scheme_type)
-            )))?;
+        let source_scheme = if let Some(ref info) = protection_info {
+            EncryptionScheme::from_scheme_type(&info.scheme_type)
+                .ok_or_else(|| EdgepackError::Drm(format!(
+                    "unsupported encryption scheme: {:?}",
+                    std::str::from_utf8(&info.scheme_type)
+                )))?
+        } else {
+            EncryptionScheme::None
+        };
 
-        let target_scheme = request.target_scheme;
         let target_iv_size = target_scheme.default_iv_size();
         let target_pattern = target_scheme.default_video_pattern();
-        let source_pattern = (
-            protection_info.tenc.default_crypt_byte_block,
-            protection_info.tenc.default_skip_byte_block,
-        );
+        let source_pattern = protection_info.as_ref().map(|info| (
+            info.tenc.default_crypt_byte_block,
+            info.tenc.default_skip_byte_block,
+        )).unwrap_or((0, 0));
 
-        // Step 3: Get content keys via SPEKE 2.0
-        let key_ids = vec![protection_info.tenc.default_kid];
-        let key_set = self.get_or_fetch_keys(content_id, &key_ids)?;
+        // Step 3: Conditional SPEKE — only needed when either side is encrypted
+        let needs_keys = source_scheme.is_encrypted() || target_scheme.is_encrypted();
+        let (key_set, source_key, target_key) = if needs_keys {
+            let key_ids = if let Some(ref info) = protection_info {
+                vec![info.tenc.default_kid]
+            } else {
+                // Clear-to-encrypted: derive KID from content_id
+                let kid = derive_kid_from_content_id(content_id);
+                vec![kid]
+            };
+            let ks = self.get_or_fetch_keys(content_id, &key_ids)?;
+            let kid = key_ids[0];
+            let key = find_key_for_kid(&ks, &kid)?;
+            let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
+            let tgt = if target_scheme.is_encrypted() { Some(key) } else { None };
+            (Some(ks), src, tgt)
+        } else {
+            (None, None, None)
+        };
 
-        // Step 4: Find source and target keys
-        let source_key = find_key_for_kid(&key_set, &protection_info.tenc.default_kid)?;
-        let target_key = source_key.clone(); // Same key, different encryption scheme
+        // Step 4: Rewrite init segment based on source/target encryption
+        let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
+            (true, true) => {
+                let ks = key_set.as_ref().unwrap();
+                init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+            }
+            (false, true) => {
+                let ks = key_set.as_ref().unwrap();
+                init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+            }
+            (true, false) => {
+                init::strip_protection_info(&init_data, container_format)?
+            }
+            (false, false) => {
+                init::rewrite_ftyp_only(&init_data, container_format)?
+            }
+        };
 
-        // Step 5: Rewrite init segment for target scheme
-        let container_format = request.container_format;
-        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern, container_format)?;
-
-        // Step 6: Set up progressive output
+        // Step 5: Set up progressive output
         let base_url = format!("/repackage/{content_id}/{}/", format_str(format));
-        let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid, target_scheme);
+        let drm_info = if target_scheme.is_encrypted() {
+            let ks = key_set.as_ref().unwrap();
+            let kid = protection_info.as_ref()
+                .map(|info| info.tenc.default_kid)
+                .unwrap_or_else(|| derive_kid_from_content_id(content_id));
+            Some(build_manifest_drm_info(ks, &kid, target_scheme))
+        } else {
+            None
+        };
         let mut progressive =
             ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
 
         // Register init segment
         progressive.set_init_segment(new_init);
 
-        // Step 7: Process each media segment
+        // Step 6: Process each media segment
+        let source_iv_size = protection_info.as_ref()
+            .map(|info| info.tenc.default_per_sample_iv_size)
+            .unwrap_or(0);
+        let constant_iv = protection_info.as_ref()
+            .and_then(|info| info.tenc.default_constant_iv.clone());
+
         self.update_job_state(
             content_id,
             format,
@@ -105,11 +149,11 @@ impl RepackagePipeline {
                 target_key: target_key.clone(),
                 source_scheme,
                 target_scheme,
-                source_iv_size: protection_info.tenc.default_per_sample_iv_size,
+                source_iv_size,
                 target_iv_size,
                 source_pattern,
                 target_pattern,
-                constant_iv: protection_info.tenc.default_constant_iv.clone(),
+                constant_iv: constant_iv.clone(),
                 segment_number: i as u32,
             };
 
@@ -146,8 +190,10 @@ impl RepackagePipeline {
             )?;
         }
 
-        // Clean up sensitive cache entries now that processing is complete
-        self.cleanup_sensitive_data(content_id, format);
+        // Clean up sensitive cache entries (skip if no keys were fetched)
+        if needs_keys {
+            self.cleanup_sensitive_data(content_id, format);
+        }
 
         Ok(JobStatus {
             content_id: content_id.clone(),
@@ -166,6 +212,8 @@ impl RepackagePipeline {
     pub fn execute_first(&self, request: &RepackageRequest) -> Result<JobStatus> {
         let content_id = &request.content_id;
         let format = request.output_format;
+        let target_scheme = request.target_scheme;
+        let container_format = request.container_format;
         let fmt = format_str(format);
         let ttl = self.config.cache.job_state_ttl;
 
@@ -182,52 +230,70 @@ impl RepackagePipeline {
 
         // Step 2: Fetch init segment and parse protection info
         let init_data = self.fetch_segment(&source.init_segment_url)?;
-        let protection_info = init::parse_protection_info(&init_data)?
-            .ok_or_else(|| EdgepackError::Drm("source content is not encrypted".into()))?;
+        let protection_info = init::parse_protection_info(&init_data)?;
 
         // Detect source encryption scheme
-        let source_scheme = EncryptionScheme::from_scheme_type(&protection_info.scheme_type)
-            .ok_or_else(|| EdgepackError::Drm(format!(
-                "unsupported encryption scheme: {:?}",
-                std::str::from_utf8(&protection_info.scheme_type)
-            )))?;
+        let source_scheme = if let Some(ref info) = protection_info {
+            EncryptionScheme::from_scheme_type(&info.scheme_type)
+                .ok_or_else(|| EdgepackError::Drm(format!(
+                    "unsupported encryption scheme: {:?}",
+                    std::str::from_utf8(&info.scheme_type)
+                )))?
+        } else {
+            EncryptionScheme::None
+        };
 
-        let target_scheme = request.target_scheme;
         let target_iv_size = target_scheme.default_iv_size();
         let target_pattern = target_scheme.default_video_pattern();
-        let source_pattern = (
-            protection_info.tenc.default_crypt_byte_block,
-            protection_info.tenc.default_skip_byte_block,
-        );
+        let source_pattern = protection_info.as_ref().map(|info| (
+            info.tenc.default_crypt_byte_block,
+            info.tenc.default_skip_byte_block,
+        )).unwrap_or((0, 0));
 
-        // Step 3: Get DRM keys
-        let key_ids = vec![protection_info.tenc.default_kid];
-        let key_set = self.get_or_fetch_keys(content_id, &key_ids)?;
+        // Step 3: Conditional SPEKE
+        let needs_keys = source_scheme.is_encrypted() || target_scheme.is_encrypted();
+        let (key_set, source_key, target_key) = if needs_keys {
+            let key_ids = if let Some(ref info) = protection_info {
+                vec![info.tenc.default_kid]
+            } else {
+                let kid = derive_kid_from_content_id(content_id);
+                vec![kid]
+            };
+            let ks = self.get_or_fetch_keys(content_id, &key_ids)?;
+            let kid = key_ids[0];
+            let key = find_key_for_kid(&ks, &kid)?;
+            let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
+            let tgt = if target_scheme.is_encrypted() { Some(key) } else { None };
+            (Some(ks), src, tgt)
+        } else {
+            (None, None, None)
+        };
 
         // Step 4: Build and store rewrite parameters for continuation
-        let source_key = find_key_for_kid(&key_set, &protection_info.tenc.default_kid)?;
-        let target_key = source_key.clone();
-
-        let container_format = request.container_format;
+        let source_iv_size = protection_info.as_ref()
+            .map(|info| info.tenc.default_per_sample_iv_size)
+            .unwrap_or(0);
+        let constant_iv = protection_info.as_ref()
+            .and_then(|info| info.tenc.default_constant_iv.clone());
 
         let continuation = ContinuationParams {
-            source_key: CachedKey {
-                kid: source_key.kid.to_vec(),
-                key: source_key.key.clone(),
-                iv: source_key.iv.clone(),
-            },
-            target_key: CachedKey {
-                kid: target_key.kid.to_vec(),
-                key: target_key.key.clone(),
-                iv: target_key.iv.clone(),
-            },
+            source_key: source_key.as_ref().map(|k| CachedKey {
+                kid: k.kid.to_vec(),
+                key: k.key.clone(),
+                iv: k.iv.clone(),
+            }),
+            target_key: target_key.as_ref().map(|k| CachedKey {
+                kid: k.kid.to_vec(),
+                key: k.key.clone(),
+                iv: k.iv.clone(),
+            }),
             source_scheme,
             target_scheme,
-            source_iv_size: protection_info.tenc.default_per_sample_iv_size,
+            source_iv_size,
             target_iv_size,
             source_pattern,
             target_pattern,
-            constant_iv: protection_info.tenc.default_constant_iv.clone(),
+            constant_iv: constant_iv.clone(),
             container_format,
         };
         let cont_json = serde_json::to_vec(&continuation)
@@ -235,8 +301,23 @@ impl RepackagePipeline {
         self.cache
             .set(&CacheKeys::rewrite_params(content_id, &fmt), &cont_json, ttl)?;
 
-        // Step 5: Rewrite init segment for target scheme
-        let new_init = init::rewrite_init_segment(&init_data, &key_set, target_scheme, target_iv_size, target_pattern, container_format)?;
+        // Step 5: Rewrite init segment
+        let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
+            (true, true) => {
+                let ks = key_set.as_ref().unwrap();
+                init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+            }
+            (false, true) => {
+                let ks = key_set.as_ref().unwrap();
+                init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+            }
+            (true, false) => {
+                init::strip_protection_info(&init_data, container_format)?
+            }
+            (false, false) => {
+                init::rewrite_ftyp_only(&init_data, container_format)?
+            }
+        };
 
         // Store init segment in Redis
         self.cache
@@ -244,7 +325,15 @@ impl RepackagePipeline {
 
         // Step 6: Set up progressive output
         let base_url = format!("/repackage/{content_id}/{fmt}/");
-        let drm_info = build_manifest_drm_info(&key_set, &protection_info.tenc.default_kid, target_scheme);
+        let drm_info = if target_scheme.is_encrypted() {
+            let ks = key_set.as_ref().unwrap();
+            let kid = protection_info.as_ref()
+                .map(|info| info.tenc.default_kid)
+                .unwrap_or_else(|| derive_kid_from_content_id(content_id));
+            Some(build_manifest_drm_info(ks, &kid, target_scheme))
+        } else {
+            None
+        };
         let mut progressive =
             ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
         progressive.set_init_segment(new_init);
@@ -258,11 +347,11 @@ impl RepackagePipeline {
             target_key,
             source_scheme,
             target_scheme,
-            source_iv_size: protection_info.tenc.default_per_sample_iv_size,
+            source_iv_size,
             target_iv_size,
             source_pattern,
             target_pattern,
-            constant_iv: protection_info.tenc.default_constant_iv.clone(),
+            constant_iv,
             segment_number: 0,
         };
         let new_segment = segment::rewrite_segment(&seg_data, &params)?;
@@ -289,8 +378,9 @@ impl RepackagePipeline {
             .set(&CacheKeys::manifest_state(content_id, &fmt), &state_json, ttl)?;
 
         let state = if is_last {
-            // Single-segment content: clean up immediately since execute_remaining() won't run
-            self.cleanup_sensitive_data(content_id, format);
+            if needs_keys {
+                self.cleanup_sensitive_data(content_id, format);
+            }
             JobState::Complete
         } else {
             JobState::Processing
@@ -368,8 +458,8 @@ impl RepackagePipeline {
         let i = segments_done;
         let seg_data = self.fetch_segment(&source.segment_urls[i])?;
 
-        let source_key = restore_content_key(&continuation.source_key);
-        let target_key = restore_content_key(&continuation.target_key);
+        let source_key = continuation.source_key.as_ref().map(restore_content_key);
+        let target_key = continuation.target_key.as_ref().map(restore_content_key);
 
         let params = SegmentRewriteParams {
             source_key,
@@ -420,9 +510,12 @@ impl RepackagePipeline {
             .set(&CacheKeys::manifest_state(content_id, &fmt), &state_json, ttl)?;
 
         let completed = (i + 1) as u32;
+        let needs_keys = continuation.source_scheme.is_encrypted() || continuation.target_scheme.is_encrypted();
         let state = if is_last {
-            // Final segment: clean up all sensitive cache data
-            self.cleanup_sensitive_data(content_id, format);
+            // Final segment: clean up sensitive cache data (only if keys were used)
+            if needs_keys {
+                self.cleanup_sensitive_data(content_id, format);
+            }
             JobState::Complete
         } else {
             JobState::Processing
@@ -630,6 +723,18 @@ fn format_str(format: OutputFormat) -> String {
     }
 }
 
+/// Derive a deterministic KID from a content_id for clear-to-encrypted transforms.
+///
+/// Uses the first 16 bytes of the content_id (or zero-pads if shorter).
+/// This provides a stable, deterministic KID without requiring SPEKE key IDs upfront.
+fn derive_kid_from_content_id(content_id: &str) -> [u8; 16] {
+    let bytes = content_id.as_bytes();
+    let mut kid = [0u8; 16];
+    let len = bytes.len().min(16);
+    kid[..len].copy_from_slice(&bytes[..len]);
+    kid
+}
+
 fn restore_content_key(cached: &CachedKey) -> ContentKey {
     let mut kid = [0u8; 16];
     let len = cached.kid.len().min(16);
@@ -670,8 +775,8 @@ struct CachedDrmSystem {
 /// Serializable segment rewrite parameters stored in Redis for continuation chaining.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ContinuationParams {
-    source_key: CachedKey,
-    target_key: CachedKey,
+    source_key: Option<CachedKey>,
+    target_key: Option<CachedKey>,
     source_scheme: EncryptionScheme,
     target_scheme: EncryptionScheme,
     source_iv_size: u8,
@@ -972,16 +1077,16 @@ mod tests {
     #[test]
     fn continuation_params_serde_roundtrip() {
         let params = ContinuationParams {
-            source_key: CachedKey {
+            source_key: Some(CachedKey {
                 kid: vec![0x01; 16],
                 key: vec![0xAA; 16],
                 iv: Some(vec![0xBB; 8]),
-            },
-            target_key: CachedKey {
+            }),
+            target_key: Some(CachedKey {
                 kid: vec![0x01; 16],
                 key: vec![0xAA; 16],
                 iv: None,
-            },
+            }),
             source_scheme: EncryptionScheme::Cbcs,
             target_scheme: EncryptionScheme::Cenc,
             source_iv_size: 8,
@@ -994,7 +1099,7 @@ mod tests {
 
         let json = serde_json::to_string(&params).unwrap();
         let parsed: ContinuationParams = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.source_key.kid.len(), 16);
+        assert_eq!(parsed.source_key.as_ref().unwrap().kid.len(), 16);
         assert_eq!(parsed.source_scheme, EncryptionScheme::Cbcs);
         assert_eq!(parsed.target_scheme, EncryptionScheme::Cenc);
         assert_eq!(parsed.source_iv_size, 8);
