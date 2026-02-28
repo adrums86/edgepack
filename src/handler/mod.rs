@@ -107,7 +107,9 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
             request::handle_init_segment_request(content_id, output_format, ctx)
         }
 
-        // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.cmfv, .m4s, or .mp4
+        // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.{ext}
+        // Accepts all CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions:
+        // .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a
         (HttpMethod::Get, ["repackage", content_id, format, segment_file]) => {
             let output_format = parse_format(format)?;
             if let Some(seg_num) = parse_segment_number(segment_file) {
@@ -148,11 +150,19 @@ fn parse_format(s: &str) -> Result<OutputFormat> {
 }
 
 fn parse_segment_number(filename: &str) -> Option<u32> {
-    // segment_0.cmfv, segment_0.m4s, segment_0.mp4, etc.
-    let name = filename
-        .strip_suffix(".cmfv")
-        .or_else(|| filename.strip_suffix(".m4s"))
-        .or_else(|| filename.strip_suffix(".mp4"))?;
+    // All ISOBMFF (ISO 14496-12) and CMAF (ISO 23000-19) segment extensions.
+    const SEGMENT_EXTENSIONS: &[&str] = &[
+        ".cmfv", // CMAF video (ISO 23000-19)
+        ".cmfa", // CMAF audio (ISO 23000-19)
+        ".cmft", // CMAF text (ISO 23000-19)
+        ".cmfm", // CMAF multiplexed (ISO 23000-19)
+        ".m4s",  // fMP4 media segment (ISO 14496-12)
+        ".mp4",  // ISO BMFF segment (ISO 14496-12)
+        ".m4a",  // ISOBMFF audio segment (ISO 14496-12)
+    ];
+    let name = SEGMENT_EXTENSIONS
+        .iter()
+        .find_map(|ext| filename.strip_suffix(ext))?;
     let num_str = name.strip_prefix("segment_")?;
     num_str.parse().ok()
 }
@@ -261,6 +271,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_segment_number_cmfa_valid() {
+        assert_eq!(parse_segment_number("segment_0.cmfa"), Some(0));
+        assert_eq!(parse_segment_number("segment_1.cmfa"), Some(1));
+        assert_eq!(parse_segment_number("segment_42.cmfa"), Some(42));
+        assert_eq!(parse_segment_number("segment_999.cmfa"), Some(999));
+    }
+
+    #[test]
+    fn parse_segment_number_cmft_valid() {
+        assert_eq!(parse_segment_number("segment_0.cmft"), Some(0));
+        assert_eq!(parse_segment_number("segment_5.cmft"), Some(5));
+    }
+
+    #[test]
+    fn parse_segment_number_cmfm_valid() {
+        assert_eq!(parse_segment_number("segment_0.cmfm"), Some(0));
+        assert_eq!(parse_segment_number("segment_5.cmfm"), Some(5));
+    }
+
+    #[test]
+    fn parse_segment_number_m4a_valid() {
+        assert_eq!(parse_segment_number("segment_0.m4a"), Some(0));
+        assert_eq!(parse_segment_number("segment_1.m4a"), Some(1));
+        assert_eq!(parse_segment_number("segment_42.m4a"), Some(42));
+        assert_eq!(parse_segment_number("segment_999.m4a"), Some(999));
+    }
+
+    #[test]
     fn parse_segment_number_invalid() {
         assert_eq!(parse_segment_number("segment_abc.cmfv"), None);
         assert_eq!(parse_segment_number("init.mp4"), None);
@@ -270,6 +308,10 @@ mod tests {
         assert_eq!(parse_segment_number("segment_.m4s"), None);
         assert_eq!(parse_segment_number("segment_abc.mp4"), None);
         assert_eq!(parse_segment_number("segment_.mp4"), None);
+        assert_eq!(parse_segment_number("segment_abc.cmfa"), None);
+        assert_eq!(parse_segment_number("segment_.m4a"), None);
+        assert_eq!(parse_segment_number("segment_0.wav"), None);
+        assert_eq!(parse_segment_number("segment_0.aac"), None);
     }
 
     #[test]
@@ -403,6 +445,34 @@ mod tests {
         };
         let resp = route(&req, &ctx).unwrap();
         // Should parse correctly (not "unknown resource") — just no data in cache
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn route_media_segment_cmfa_request_not_found() {
+        let ctx = test_context();
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/content-1/hls/segment_0.cmfa".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let resp = route(&req, &ctx).unwrap();
+        // CMAF audio segment routes correctly — just no data in cache
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn route_media_segment_m4a_request_not_found() {
+        let ctx = test_context();
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/content-1/hls/segment_0.m4a".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let resp = route(&req, &ctx).unwrap();
+        // ISOBMFF audio segment routes correctly — just no data in cache
         assert_eq!(resp.status, 404);
     }
 

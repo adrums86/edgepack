@@ -451,10 +451,19 @@ fn is_local_path(s: &str) -> bool {
 }
 
 fn parse_segment_number(filename: &str) -> Option<u32> {
-    let name = filename
-        .strip_suffix(".cmfv")
-        .or_else(|| filename.strip_suffix(".m4s"))
-        .or_else(|| filename.strip_suffix(".mp4"))?;
+    // All ISOBMFF (ISO 14496-12) and CMAF (ISO 23000-19) segment extensions.
+    const SEGMENT_EXTENSIONS: &[&str] = &[
+        ".cmfv", // CMAF video (ISO 23000-19)
+        ".cmfa", // CMAF audio (ISO 23000-19)
+        ".cmft", // CMAF text (ISO 23000-19)
+        ".cmfm", // CMAF multiplexed (ISO 23000-19)
+        ".m4s",  // fMP4 media segment (ISO 14496-12)
+        ".mp4",  // ISO BMFF segment (ISO 14496-12)
+        ".m4a",  // ISOBMFF audio segment (ISO 14496-12)
+    ];
+    let name = SEGMENT_EXTENSIONS
+        .iter()
+        .find_map(|ext| filename.strip_suffix(ext))?;
     let num_str = name.strip_prefix("segment_")?;
     num_str.parse().ok()
 }

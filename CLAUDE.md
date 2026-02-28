@@ -116,7 +116,8 @@ The output container format is configurable via `ContainerFormat` enum (`Cmaf`, 
 - `ContainerFormat` flows through `RepackageRequest` → `ContinuationParams` → `ManifestState` → `ProgressiveOutput`
 - Segment URIs are built dynamically using `container_format.video_segment_extension()`
 - DASH renderer uses `container_format.dash_profiles()` for MPD `@profiles` attribute
-- Route handler accepts all three extensions (`.cmfv`, `.m4s`, `.mp4`) for media segment requests
+- Route handler accepts all 7 CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions: `.cmfv`, `.cmfa`, `.cmft`, `.cmfm`, `.m4s`, `.mp4`, `.m4a`
+- Extensions not in scope: `.aac` (raw ADTS, not ISOBMFF), `.m4v`/`.3gp`/`.mov` (progressive-only)
 
 ### Progressive Manifest Output
 
@@ -203,9 +204,9 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **560 tests** total: 480 unit tests and 80 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
+The project has **566 tests** total: 484 unit tests and 82 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
 
-### Unit Tests (480)
+### Unit Tests (484)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -221,13 +222,13 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion, container format threading through ContinuationParams
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
-- **HTTP routing**: Path parsing, format validation, segment number extraction (.cmfv, .m4s, and .mp4), all route dispatching
+- **HTTP routing**: Path parsing, format validation, segment number extraction (all 7 CMAF/ISOBMFF extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a), all route dispatching
 - **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing, container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgePackagerError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (80)
+### Integration Tests (82)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -238,7 +239,7 @@ tests/
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
-├── handler_integration.rs    30 tests: HTTP routing (incl. .cmfv, .m4s, and .mp4 segments), webhook validation, response helpers
+├── handler_integration.rs    32 tests: HTTP routing (all 7 CMAF/ISOBMFF segment extensions), webhook validation, response helpers
 └── wasm_binary_size.rs        1 test: release WASM binary stays under 600 KB size limit
 ```
 
@@ -276,9 +277,7 @@ When adding new functionality, follow the existing pattern:
 | GET | `/health` | inline | Health check, returns "ok" |
 | GET | `/repackage/{id}/{format}/manifest` | `request::handle_manifest_request` | Serve repackaged manifest |
 | GET | `/repackage/{id}/{format}/init.mp4` | `request::handle_init_segment_request` | Serve repackaged init segment |
-| GET | `/repackage/{id}/{format}/segment_{n}.cmfv` | `request::handle_media_segment_request` | Serve repackaged CMAF media segment |
-| GET | `/repackage/{id}/{format}/segment_{n}.m4s` | `request::handle_media_segment_request` | Serve repackaged fMP4 media segment |
-| GET | `/repackage/{id}/{format}/segment_{n}.mp4` | `request::handle_media_segment_request` | Serve repackaged ISO BMFF media segment |
+| GET | `/repackage/{id}/{format}/segment_{n}.{ext}` | `request::handle_media_segment_request` | Serve repackaged media segment (accepts all 7 CMAF/ISOBMFF extensions) |
 | POST | `/webhook/repackage` | `webhook::handle_repackage_webhook` | Trigger proactive repackaging (returns 200 after first manifest) |
 | POST | `/webhook/repackage/continue` | `webhook::handle_continue` | Internal self-invocation to process remaining segments |
 | GET | `/status/{id}/{format}` | `request::handle_status_request` | Query job progress |

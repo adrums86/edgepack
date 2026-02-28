@@ -24,18 +24,9 @@ pub enum ContainerFormat {
 }
 
 impl ContainerFormat {
-    /// Segment file extension for this container format (video default).
+    /// Video segment file extension.
     ///
     /// Returns `".cmfv"` for CMAF, `".m4s"` for fMP4, `".mp4"` for ISO BMFF.
-    pub fn segment_extension(&self) -> &'static str {
-        match self {
-            ContainerFormat::Cmaf => ".cmfv",
-            ContainerFormat::Fmp4 => ".m4s",
-            ContainerFormat::Iso => ".mp4",
-        }
-    }
-
-    /// Video segment file extension.
     pub fn video_segment_extension(&self) -> &'static str {
         match self {
             ContainerFormat::Cmaf => ".cmfv",
@@ -146,16 +137,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn segment_extension_cmaf() {
-        assert_eq!(ContainerFormat::Cmaf.segment_extension(), ".cmfv");
-    }
-
-    #[test]
-    fn segment_extension_fmp4() {
-        assert_eq!(ContainerFormat::Fmp4.segment_extension(), ".m4s");
-    }
-
-    #[test]
     fn video_segment_extension_cmaf() {
         assert_eq!(ContainerFormat::Cmaf.video_segment_extension(), ".cmfv");
     }
@@ -251,8 +232,8 @@ mod tests {
     }
 
     #[test]
-    fn segment_extension_iso() {
-        assert_eq!(ContainerFormat::Iso.segment_extension(), ".mp4");
+    fn video_segment_extension_fmp4() {
+        assert_eq!(ContainerFormat::Fmp4.video_segment_extension(), ".m4s");
     }
 
     #[test]
@@ -272,6 +253,7 @@ mod tests {
 
     #[test]
     fn compatible_brands_iso_no_cmfc() {
+        // Iso has the same brands as Fmp4 by design — they differ only in segment extension.
         let brands = ContainerFormat::Iso.compatible_brands();
         assert_eq!(brands.len(), 2);
         assert!(!brands.contains(&&b"cmfc"));
@@ -281,6 +263,7 @@ mod tests {
 
     #[test]
     fn build_ftyp_iso() {
+        // Iso ftyp is identical to Fmp4 by design — same brands, same structure.
         let ftyp = ContainerFormat::Iso.build_ftyp();
         // header(8) + major(4) + minor(4) + 2 brands(8) = 24 (same as fmp4)
         assert_eq!(ftyp.len(), 24);
@@ -292,6 +275,7 @@ mod tests {
 
     #[test]
     fn dash_profiles_iso_no_cmaf() {
+        // Iso uses the same DASH profile as Fmp4 by design — they differ only in segment extension.
         let profiles = ContainerFormat::Iso.dash_profiles();
         assert!(!profiles.contains("cmaf"));
         assert!(profiles.contains("isoff-live:2011"));

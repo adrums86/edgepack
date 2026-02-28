@@ -224,6 +224,34 @@ fn media_segment_request_mp4_segment_42() {
 }
 
 #[test]
+fn media_segment_request_cmfa_segment_0() {
+    let ctx = test_context();
+    let req = HttpRequest {
+        method: HttpMethod::Get,
+        path: "/repackage/movie-123/hls/segment_0.cmfa".into(),
+        headers: vec![],
+        body: None,
+    };
+    let resp = route(&req, &ctx).unwrap();
+    // CMAF audio segment routes correctly — just no data in cache
+    assert_eq!(resp.status, 404);
+}
+
+#[test]
+fn media_segment_request_m4a_segment_0() {
+    let ctx = test_context();
+    let req = HttpRequest {
+        method: HttpMethod::Get,
+        path: "/repackage/movie-123/hls/segment_0.m4a".into(),
+        headers: vec![],
+        body: None,
+    };
+    let resp = route(&req, &ctx).unwrap();
+    // ISOBMFF audio segment routes correctly — just no data in cache
+    assert_eq!(resp.status, 404);
+}
+
+#[test]
 fn media_segment_request_invalid_filename() {
     let ctx = test_context();
     let req = HttpRequest {
