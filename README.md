@@ -407,7 +407,7 @@ The runtime is fully implemented and compiles to a functional WASM component:
 
 ## Roadmap
 
-Phase 1 (encryption scheme generalization) and Phase 2 (container format flexibility) are complete. The following phases are planned:
+Phase 1 (encryption scheme generalization) and Phase 2 (container format flexibility) are complete. The following phases are planned next:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 
@@ -418,21 +418,33 @@ Phase 1 (encryption scheme generalization) and Phase 2 (container format flexibi
 - [x] Updated route handler to accept both `.cmfv` and `.m4s` segment file extensions
 - [x] Updated DASH renderer with dynamic profile string and segment template extension
 
-### Phase 3: Dual-Scheme Output
+### Phase 3: Unencrypted Input Support
+
+- [ ] Add `EncryptionScheme::None` variant — represents clear (unencrypted) content
+- [ ] Update source scheme detection in `hls_input.rs` and `dash_input.rs` to identify unencrypted sources (no `#EXT-X-KEY` / no `<ContentProtection>`)
+- [ ] Add `create_protection_info()` in `src/media/init.rs` — inject sinf/schm/tenc boxes into init segments that lack them (clear → encrypted path)
+- [ ] Update `src/media/segment.rs` — skip decryption when source scheme is `None`; encrypt-only path for clear → encrypted
+- [ ] Support clear → clear pass-through (format conversion only, no encryption/decryption)
+- [ ] Make SPEKE key acquisition conditional — skip when both source and target are unencrypted
+- [ ] Update `RepackageRequest` to accept `None` target scheme for decrypt-only or pass-through workflows
+- [ ] Update sandbox UI — add "None (Clear)" option for target encryption scheme, conditionally hide SPEKE fields when both source and target are clear
+- [ ] Add integration tests for clear→CENC, clear→CBCS, encrypted→clear, and clear→clear pipelines
+
+### Phase 4: Dual-Scheme Output
 
 - [ ] Support `target_schemes: Vec<EncryptionScheme>` for multi-rendition output (one rendition per scheme)
 - [ ] Implement scheme-suffixed cache keys (`ep:{id}:{fmt}:cenc:seg:{n}`, `ep:{id}:{fmt}:cbcs:seg:{n}`)
 - [ ] Implement dual-encrypted segments (single segment with both CBCS and CENC applied)
 - [ ] Multi-variant HLS master playlist and multi-AdaptationSet DASH MPD for dual-scheme output
 
-### Phase 4: Full Remux (Sample-Level mdat Access)
+### Phase 5: Full Remux (Sample-Level mdat Access)
 
 - [ ] Create `src/media/samples.rs` — sample-level parsing and rebuilding from mdat + trun + senc
 - [ ] Segment boundary restructuring: split/merge samples at sync points to target duration
 - [ ] Timescale parsing from mdhd/mvhd boxes
 - [ ] Update progressive output to handle variable segment counts (remux may change segment boundaries)
 
-### Phase 5: Compatibility Validation & Hardening
+### Phase 6: Compatibility Validation & Hardening
 
 - [ ] Create `src/media/compat.rs` — compatibility checker (e.g. Chromium 53: CENC-only, H.264+AAC, fMP4)
 - [ ] Codec detection from stsd sample entries (avc1/hev1/mp4a)

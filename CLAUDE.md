@@ -361,7 +361,7 @@ FairPlay is recognised in both input and output. For CENC target output, FairPla
 
 ## Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1 and 2 are complete. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1 and 2 are complete. Remaining phases (3–6):
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -370,21 +370,31 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Updated segment URI extensions dynamically, DASH profile signaling, and route handling for `.cmfv`/`.m4s`
 - Result: 526 tests total (452 unit + 74 integration), +31 from Phase 1
 
-### Phase 3: Dual-Scheme Output
+### Phase 3: Unencrypted Input Support
+- Add `EncryptionScheme::None` variant for clear (unencrypted) content
+- Update source detection (`hls_input.rs`, `dash_input.rs`) to identify unencrypted sources
+- Add `create_protection_info()` in `init.rs` to inject sinf/schm/tenc into clear init segments (clear→encrypted)
+- Skip decryption in `segment.rs` when source is `None`; encrypt-only path for clear→encrypted
+- Clear→clear pass-through for format-only conversion (no encryption/decryption)
+- Conditional SPEKE key acquisition — skip when both source and target are unencrypted
+- Update sandbox UI with "None (Clear)" target scheme and conditional SPEKE visibility
+- Estimated: ~300 new LOC, ~180 modified LOC, ~25 new tests
+
+### Phase 4: Dual-Scheme Output
 - Multi-rendition: `target_schemes: Vec<EncryptionScheme>` producing separate segment sets per scheme
 - Scheme-suffixed cache keys (`ep:{id}:{fmt}:cenc:seg:{n}`)
 - Dual-encrypted segments: single segment encrypted with both CBCS and CENC (multiple sinf boxes)
 - Multi-variant HLS master playlist and multi-AdaptationSet DASH MPD
 - Estimated: ~380 new LOC, ~200 modified LOC, ~35 new tests
 
-### Phase 4: Full Remux (Sample-Level mdat Access)
+### Phase 5: Full Remux (Sample-Level mdat Access)
 - Create `src/media/samples.rs` for sample-level parsing/rebuilding
 - Segment boundary restructuring at sync points
 - Timescale parsing from mdhd/mvhd boxes
 - Variable segment count support in progressive output
 - Estimated: ~610 new LOC, ~80 modified LOC, ~40 new tests
 
-### Phase 5: Compatibility Validation & Hardening
+### Phase 6: Compatibility Validation & Hardening
 - Create `src/media/compat.rs` for target compatibility checking (e.g. Chromium 53+)
 - Codec detection from stsd sample entries
 - Pipeline validation hooks for early rejection of incompatible configs
