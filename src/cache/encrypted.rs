@@ -82,6 +82,11 @@ impl CacheBackend for EncryptedCacheBackend {
         }
     }
 
+    /// Pass through to inner backend — lock keys are not sensitive data.
+    fn set_nx(&self, key: &str, value: &[u8], ttl_seconds: u64) -> Result<bool> {
+        self.inner.set_nx(key, value, ttl_seconds)
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         self.inner.exists(key)
     }
@@ -182,6 +187,15 @@ mod tests {
                 .insert(key.to_string(), value.to_vec());
             Ok(())
         }
+        fn set_nx(&self, key: &str, value: &[u8], _ttl: u64) -> Result<bool> {
+            let mut store = self.store.write().unwrap();
+            if store.contains_key(key) {
+                Ok(false)
+            } else {
+                store.insert(key.to_string(), value.to_vec());
+                Ok(true)
+            }
+        }
         fn exists(&self, key: &str) -> Result<bool> {
             Ok(self.store.read().unwrap().contains_key(key))
         }
@@ -225,6 +239,15 @@ mod tests {
                 .unwrap()
                 .insert(key.to_string(), value.to_vec());
             Ok(())
+        }
+        fn set_nx(&self, key: &str, value: &[u8], _ttl: u64) -> Result<bool> {
+            let mut store = self.store.write().unwrap();
+            if store.contains_key(key) {
+                Ok(false)
+            } else {
+                store.insert(key.to_string(), value.to_vec());
+                Ok(true)
+            }
         }
         fn exists(&self, key: &str) -> Result<bool> {
             Ok(self.store.read().unwrap().contains_key(key))
@@ -393,6 +416,15 @@ mod tests {
             fn set(&self, key: &str, value: &[u8], _: u64) -> Result<()> {
                 self.0.write().unwrap().insert(key.to_string(), value.to_vec());
                 Ok(())
+            }
+            fn set_nx(&self, key: &str, value: &[u8], _: u64) -> Result<bool> {
+                let mut store = self.0.write().unwrap();
+                if store.contains_key(key) {
+                    Ok(false)
+                } else {
+                    store.insert(key.to_string(), value.to_vec());
+                    Ok(true)
+                }
             }
             fn exists(&self, key: &str) -> Result<bool> {
                 Ok(self.0.read().unwrap().contains_key(key))

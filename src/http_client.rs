@@ -10,6 +10,8 @@ use crate::error::{EdgepackError, Result};
 pub enum HttpClientMethod {
     Get,
     Post,
+    Put,
+    Delete,
 }
 
 /// An outgoing HTTP request to send.
@@ -50,6 +52,32 @@ pub fn post(
         url: url.to_string(),
         headers: headers.to_vec(),
         body: Some(body),
+    })
+}
+
+/// Convenience: HTTP PUT with headers and body.
+pub fn put(
+    url: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Result<HttpClientResponse> {
+    send(OutgoingHttpRequest {
+        method: HttpClientMethod::Put,
+        url: url.to_string(),
+        headers: headers.to_vec(),
+        body: Some(body),
+    })
+}
+
+/// Convenience: HTTP DELETE with headers (no body).
+///
+/// Named `delete_request` to avoid conflict with Rust's `drop` semantics.
+pub fn delete_request(url: &str, headers: &[(String, String)]) -> Result<HttpClientResponse> {
+    send(OutgoingHttpRequest {
+        method: HttpClientMethod::Delete,
+        url: url.to_string(),
+        headers: headers.to_vec(),
+        body: None,
     })
 }
 
@@ -115,6 +143,8 @@ fn send_wasi(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
     let method = match req.method {
         HttpClientMethod::Get => Method::Get,
         HttpClientMethod::Post => Method::Post,
+        HttpClientMethod::Put => Method::Put,
+        HttpClientMethod::Delete => Method::Delete,
     };
     let outgoing = OutgoingRequest::new(fields);
     outgoing
@@ -219,6 +249,8 @@ fn send_reqwest(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
     let mut builder = match req.method {
         HttpClientMethod::Get => client.get(&req.url),
         HttpClientMethod::Post => client.post(&req.url),
+        HttpClientMethod::Put => client.put(&req.url),
+        HttpClientMethod::Delete => client.delete(&req.url),
     };
 
     for (key, value) in &req.headers {
@@ -293,6 +325,31 @@ mod tests {
         assert!(err.contains("only available in WASI"));
     }
 
+    #[cfg(not(feature = "sandbox"))]
+    #[test]
+    fn put_returns_error_on_native() {
+        let result = put(
+            "https://example.com/key",
+            &[("Authorization".into(), "Bearer tok".into())],
+            b"value".to_vec(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("only available in WASI"));
+    }
+
+    #[cfg(not(feature = "sandbox"))]
+    #[test]
+    fn delete_request_returns_error_on_native() {
+        let result = delete_request(
+            "https://example.com/key",
+            &[("Authorization".into(), "Bearer tok".into())],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("only available in WASI"));
+    }
+
     #[test]
     fn outgoing_request_construction() {
         let req = OutgoingHttpRequest {
@@ -316,6 +373,30 @@ mod tests {
         };
         assert_eq!(req.method, HttpClientMethod::Post);
         assert_eq!(req.body.as_ref().unwrap(), b"<xml/>");
+    }
+
+    #[test]
+    fn outgoing_request_with_put_method() {
+        let req = OutgoingHttpRequest {
+            method: HttpClientMethod::Put,
+            url: "https://example.com/kv/key1".into(),
+            headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+            body: Some(b"binary data".to_vec()),
+        };
+        assert_eq!(req.method, HttpClientMethod::Put);
+        assert_eq!(req.body.as_ref().unwrap(), b"binary data");
+    }
+
+    #[test]
+    fn outgoing_request_with_delete_method() {
+        let req = OutgoingHttpRequest {
+            method: HttpClientMethod::Delete,
+            url: "https://example.com/kv/key1".into(),
+            headers: vec![("Authorization".into(), "Bearer tok".into())],
+            body: None,
+        };
+        assert_eq!(req.method, HttpClientMethod::Delete);
+        assert!(req.body.is_none());
     }
 
     #[test]

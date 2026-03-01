@@ -30,6 +30,23 @@ fn default_target_schemes() -> Vec<EncryptionScheme> {
     vec![EncryptionScheme::Cenc]
 }
 
+/// Per-content source configuration for JIT packaging.
+///
+/// Maps a `content_id` to its source parameters, enabling GET-triggered
+/// on-demand repackaging without a prior webhook call.
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceConfig {
+    /// URL of the source manifest.
+    pub source_url: String,
+    /// Target encryption schemes for output.
+    #[serde(default = "default_target_schemes")]
+    pub target_schemes: Vec<EncryptionScheme>,
+    /// Target container format.
+    #[serde(default)]
+    pub container_format: ContainerFormat,
+}
+
 /// Status of a repackaging job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
@@ -187,6 +204,44 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
         assert!(parsed.key_ids.is_empty());
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn source_config_construction() {
+        let cfg = SourceConfig {
+            source_url: "https://origin.example.com/content/manifest.m3u8".into(),
+            target_schemes: vec![EncryptionScheme::Cenc],
+            container_format: ContainerFormat::Cmaf,
+        };
+        assert_eq!(cfg.source_url, "https://origin.example.com/content/manifest.m3u8");
+        assert_eq!(cfg.target_schemes, vec![EncryptionScheme::Cenc]);
+        assert_eq!(cfg.container_format, ContainerFormat::Cmaf);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn source_config_serde_roundtrip() {
+        let cfg = SourceConfig {
+            source_url: "https://example.com/source.mpd".into(),
+            target_schemes: vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs],
+            container_format: ContainerFormat::Fmp4,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: SourceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_url, cfg.source_url);
+        assert_eq!(parsed.target_schemes, cfg.target_schemes);
+        assert_eq!(parsed.container_format, cfg.container_format);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn source_config_defaults() {
+        // When optional fields are missing, defaults should apply
+        let json = r#"{"source_url":"https://example.com/source.m3u8"}"#;
+        let parsed: SourceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cenc]);
+        assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
     }
 
     #[test]

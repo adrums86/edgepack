@@ -48,7 +48,7 @@ fn handle_inner(request: IncomingRequest) -> Result<HttpResponse, EdgepackError>
     let config = AppConfig::from_env()?;
 
     // 3. Create cache backend from config
-    let cache_backend = cache::create_backend(&config.redis)?;
+    let cache_backend = cache::create_backend(&config)?;
 
     // 4. Build handler context
     let ctx = HandlerContext {

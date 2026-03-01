@@ -64,6 +64,11 @@ pub fn render(state: &ManifestState) -> Result<String> {
         .iter()
         .filter(|v| v.track_type == TrackMediaType::Audio)
         .collect();
+    let subtitle_variants: Vec<_> = state
+        .variants
+        .iter()
+        .filter(|v| v.track_type == TrackMediaType::Subtitle)
+        .collect();
 
     // Video AdaptationSet
     if !video_variants.is_empty() || state.variants.is_empty() {
@@ -71,6 +76,19 @@ pub fn render(state: &ManifestState) -> Result<String> {
             "    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n",
         );
         mpd.push_str(&cp_xml);
+
+        // CEA-608/708 closed caption Accessibility descriptors (inside video AdaptationSet)
+        for caption in &state.cea_captions {
+            let scheme = if caption.is_608 {
+                "urn:scte:dash:cc:cea-608:2015"
+            } else {
+                "urn:scte:dash:cc:cea-708:2015"
+            };
+            mpd.push_str(&format!(
+                "      <Accessibility schemeIdUri=\"{scheme}\" value=\"{}={}\"/>\n",
+                caption.service_name, caption.language
+            ));
+        }
 
         // SegmentTemplate
         mpd.push_str(&build_segment_template(state));
@@ -105,12 +123,45 @@ pub fn render(state: &ManifestState) -> Result<String> {
     // Audio AdaptationSet
     if !audio_variants.is_empty() {
         mpd.push_str(
-            "    <AdaptationSet contentType=\"audio\" mimeType=\"audio/mp4\" segmentAlignment=\"true\">\n",
+            "    <AdaptationSet contentType=\"audio\" mimeType=\"audio/mp4\" segmentAlignment=\"true\"",
         );
+        // Add lang attribute from first audio variant
+        if let Some(lang) = audio_variants.first().and_then(|v| v.language.as_deref()) {
+            mpd.push_str(&format!(" lang=\"{lang}\""));
+        }
+        mpd.push_str(">\n");
         mpd.push_str(&cp_xml);
         mpd.push_str(&build_segment_template(state));
 
         for variant in &audio_variants {
+            mpd.push_str(&format!(
+                "      <Representation id=\"{}\" bandwidth=\"{}\"",
+                variant.id, variant.bandwidth
+            ));
+            if !variant.codecs.is_empty() {
+                mpd.push_str(&format!(" codecs=\"{}\"", variant.codecs));
+            }
+            mpd.push_str(">\n");
+            mpd.push_str("      </Representation>\n");
+        }
+
+        mpd.push_str("    </AdaptationSet>\n");
+    }
+
+    // Subtitle AdaptationSet
+    if !subtitle_variants.is_empty() {
+        mpd.push_str(
+            "    <AdaptationSet contentType=\"text\" mimeType=\"application/mp4\" segmentAlignment=\"true\"",
+        );
+        // Add lang attribute from first subtitle variant
+        if let Some(lang) = subtitle_variants.first().and_then(|v| v.language.as_deref()) {
+            mpd.push_str(&format!(" lang=\"{lang}\""));
+        }
+        mpd.push_str(">\n");
+        // No content protection for subtitles (they pass through unencrypted)
+        mpd.push_str(&build_segment_template(state));
+
+        for variant in &subtitle_variants {
             mpd.push_str(&format!(
                 "      <Representation id=\"{}\" bandwidth=\"{}\"",
                 variant.id, variant.bandwidth
@@ -412,6 +463,7 @@ mod tests {
             resolution: Some((1280, 720)),
             frame_rate: Some(30.0),
             track_type: TrackMediaType::Video,
+            language: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("contentType=\"video\""));
@@ -432,6 +484,7 @@ mod tests {
             resolution: None,
             frame_rate: None,
             track_type: TrackMediaType::Audio,
+            language: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("contentType=\"audio\""));
@@ -463,5 +516,189 @@ mod tests {
         assert!(mpd.contains("xmlns=\"urn:mpeg:dash:schema:mpd:2011\""));
         assert!(mpd.contains("xmlns:cenc=\"urn:mpeg:cenc:2013\""));
         assert!(mpd.contains("xmlns:mspr=\"urn:microsoft:playready\""));
+    }
+
+    #[test]
+    fn render_with_subtitle_variants() {
+        let mut state = make_live_state_with_segments(1);
+        state.variants.push(VariantInfo {
+            id: "sub_eng".into(),
+            bandwidth: 0,
+            codecs: "wvtt".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("eng".into()),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("contentType=\"text\""));
+        assert!(mpd.contains("mimeType=\"application/mp4\""));
+        assert!(mpd.contains("lang=\"eng\""));
+        assert!(mpd.contains("id=\"sub_eng\""));
+        assert!(mpd.contains("codecs=\"wvtt\""));
+    }
+
+    #[test]
+    fn render_with_subtitle_stpp() {
+        let mut state = make_live_state_with_segments(1);
+        state.variants.push(VariantInfo {
+            id: "sub_spa".into(),
+            bandwidth: 0,
+            codecs: "stpp".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("spa".into()),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("contentType=\"text\""));
+        assert!(mpd.contains("lang=\"spa\""));
+        assert!(mpd.contains("codecs=\"stpp\""));
+    }
+
+    #[test]
+    fn render_subtitle_no_content_protection() {
+        let mut state = make_live_state_with_segments(1);
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: Some("WVDATA".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+        });
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "sub_eng".into(),
+            bandwidth: 0,
+            codecs: "wvtt".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("eng".into()),
+        });
+        let mpd = render(&state).unwrap();
+        // Video AdaptationSet should have ContentProtection
+        assert!(mpd.contains("urn:mpeg:dash:mp4protection:2011"));
+        // Count schemeIdUri occurrences — should only be in video AdaptationSet
+        // (2: mp4protection + Widevine)
+        let scheme_count = mpd.matches("schemeIdUri").count();
+        assert_eq!(scheme_count, 2, "ContentProtection only in video AdaptationSet");
+    }
+
+    #[test]
+    fn render_with_cea_608_captions() {
+        let mut state = make_live_state_with_segments(1);
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "CC1".into(),
+            language: "eng".into(),
+            is_608: true,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("urn:scte:dash:cc:cea-608:2015"));
+        assert!(mpd.contains("value=\"CC1=eng\""));
+    }
+
+    #[test]
+    fn render_with_cea_708_captions() {
+        let mut state = make_live_state_with_segments(1);
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "SERVICE1".into(),
+            language: "eng".into(),
+            is_608: false,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("urn:scte:dash:cc:cea-708:2015"));
+        assert!(mpd.contains("value=\"SERVICE1=eng\""));
+    }
+
+    #[test]
+    fn render_with_multiple_cea_captions() {
+        let mut state = make_live_state_with_segments(1);
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "CC1".into(),
+            language: "eng".into(),
+            is_608: true,
+        });
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "CC3".into(),
+            language: "spa".into(),
+            is_608: true,
+        });
+        let mpd = render(&state).unwrap();
+        assert_eq!(mpd.matches("Accessibility").count(), 2);
+        assert!(mpd.contains("value=\"CC1=eng\""));
+        assert!(mpd.contains("value=\"CC3=spa\""));
+    }
+
+    #[test]
+    fn render_audio_with_language() {
+        let mut state = make_live_state_with_segments(1);
+        state.variants.push(VariantInfo {
+            id: "a1".into(),
+            bandwidth: 128_000,
+            codecs: "mp4a.40.2".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Audio,
+            language: Some("eng".into()),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("contentType=\"audio\""));
+        assert!(mpd.contains("lang=\"eng\""));
+    }
+
+    #[test]
+    fn render_combined_video_audio_subtitle_cea() {
+        let mut state = make_live_state_with_segments(1);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: Some((1280, 720)),
+            frame_rate: Some(30.0),
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "a1".into(),
+            bandwidth: 128_000,
+            codecs: "mp4a.40.2".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Audio,
+            language: Some("eng".into()),
+        });
+        state.variants.push(VariantInfo {
+            id: "sub_eng".into(),
+            bandwidth: 0,
+            codecs: "wvtt".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("eng".into()),
+        });
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "CC1".into(),
+            language: "eng".into(),
+            is_608: true,
+        });
+        let mpd = render(&state).unwrap();
+        // Should have all three AdaptationSets
+        assert!(mpd.contains("contentType=\"video\""));
+        assert!(mpd.contains("contentType=\"audio\""));
+        assert!(mpd.contains("contentType=\"text\""));
+        // CEA inside video AdaptationSet
+        assert!(mpd.contains("urn:scte:dash:cc:cea-608:2015"));
+        // Count AdaptationSet elements
+        assert_eq!(mpd.matches("<AdaptationSet").count(), 3);
     }
 }

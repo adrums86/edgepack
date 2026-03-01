@@ -281,6 +281,7 @@ mod tests {
             resolution: Some((1280, 720)),
             frame_rate: Some(29.97),
             track_type: TrackMediaType::Video,
+            language: None,
         });
         let uris = vec!["v720.m3u8".to_string()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -302,6 +303,7 @@ mod tests {
             resolution: None,
             frame_rate: None,
             track_type: TrackMediaType::Audio,
+            language: None,
         });
         let uris = vec!["audio.m3u8".to_string()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -328,6 +330,7 @@ mod tests {
             resolution: None,
             frame_rate: None,
             track_type: TrackMediaType::Video,
+            language: None,
         });
         let uris = vec!["v1.m3u8".into()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -344,14 +347,232 @@ mod tests {
             resolution: None,
             frame_rate: None,
             track_type: TrackMediaType::Video,
+            language: None,
         });
         let m3u8 = render_master(&state, &[]).unwrap();
         assert!(m3u8.contains("variant.m3u8"));
+    }
+
+    #[test]
+    fn render_master_subtitle_rendition() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: Some((1280, 720)),
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "sub_eng".into(),
+            bandwidth: 0,
+            codecs: "wvtt".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("eng".into()),
+        });
+        let uris = vec!["v1.m3u8".into(), "subs_eng.m3u8".into()];
+        let m3u8 = render_master(&state, &uris).unwrap();
+        // Should have subtitle rendition group
+        assert!(m3u8.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"));
+        assert!(m3u8.contains("GROUP-ID=\"subs\""));
+        assert!(m3u8.contains("LANGUAGE=\"eng\""));
+        assert!(m3u8.contains("NAME=\"sub_eng\""));
+        assert!(m3u8.contains("URI=\"subs_eng.m3u8\""));
+        // Video STREAM-INF should reference subs group
+        assert!(m3u8.contains("SUBTITLES=\"subs\""));
+    }
+
+    #[test]
+    fn render_master_subtitle_stpp() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "sub_spa".into(),
+            bandwidth: 0,
+            codecs: "stpp".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("spa".into()),
+        });
+        let uris = vec!["v1.m3u8".into(), "subs_spa.m3u8".into()];
+        let m3u8 = render_master(&state, &uris).unwrap();
+        assert!(m3u8.contains("LANGUAGE=\"spa\""));
+        assert!(m3u8.contains("NAME=\"sub_spa\""));
+        assert!(m3u8.contains("SUBTITLES=\"subs\""));
+    }
+
+    #[test]
+    fn render_master_subtitle_no_language_defaults_und() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "sub1".into(),
+            bandwidth: 0,
+            codecs: "wvtt".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: None,
+        });
+        let uris = vec!["v1.m3u8".into(), "subs.m3u8".into()];
+        let m3u8 = render_master(&state, &uris).unwrap();
+        assert!(m3u8.contains("LANGUAGE=\"und\""));
+    }
+
+    #[test]
+    fn render_master_cea_608_captions() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "CC1".into(),
+            language: "eng".into(),
+            is_608: true,
+        });
+        let uris = vec!["v1.m3u8".into()];
+        let m3u8 = render_master(&state, &uris).unwrap();
+        // Should have closed captions signaling
+        assert!(m3u8.contains("#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS"));
+        assert!(m3u8.contains("GROUP-ID=\"cc\""));
+        assert!(m3u8.contains("LANGUAGE=\"eng\""));
+        assert!(m3u8.contains("INSTREAM-ID=\"CC1\""));
+        // Video STREAM-INF should reference cc group
+        assert!(m3u8.contains("CLOSED-CAPTIONS=\"cc\""));
+    }
+
+    #[test]
+    fn render_master_cea_708_captions() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "SERVICE1".into(),
+            language: "eng".into(),
+            is_608: false,
+        });
+        let uris = vec!["v1.m3u8".into()];
+        let m3u8 = render_master(&state, &uris).unwrap();
+        assert!(m3u8.contains("INSTREAM-ID=\"SERVICE1\""));
+    }
+
+    #[test]
+    fn render_master_multiple_captions_and_subs() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "sub_eng".into(),
+            bandwidth: 0,
+            codecs: "wvtt".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("eng".into()),
+        });
+        state.variants.push(VariantInfo {
+            id: "sub_spa".into(),
+            bandwidth: 0,
+            codecs: "wvtt".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("spa".into()),
+        });
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "CC1".into(),
+            language: "eng".into(),
+            is_608: true,
+        });
+        state.cea_captions.push(CeaCaptionInfo {
+            service_name: "CC3".into(),
+            language: "spa".into(),
+            is_608: true,
+        });
+        let uris = vec!["v1.m3u8".into(), "subs_eng.m3u8".into(), "subs_spa.m3u8".into()];
+        let m3u8 = render_master(&state, &uris).unwrap();
+        // Two subtitle renditions
+        assert_eq!(m3u8.matches("TYPE=SUBTITLES").count(), 2);
+        // Two closed caption entries
+        assert_eq!(m3u8.matches("TYPE=CLOSED-CAPTIONS").count(), 2);
+        // Video has both group references
+        assert!(m3u8.contains("SUBTITLES=\"subs\""));
+        assert!(m3u8.contains("CLOSED-CAPTIONS=\"cc\""));
+    }
+
+    #[test]
+    fn render_master_audio_with_language() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "audio_eng".into(),
+            bandwidth: 128_000,
+            codecs: "mp4a.40.2".into(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Audio,
+            language: Some("eng".into()),
+        });
+        let uris = vec!["v1.m3u8".into(), "audio.m3u8".into()];
+        let m3u8 = render_master(&state, &uris).unwrap();
+        assert!(m3u8.contains("LANGUAGE=\"eng\""));
+        assert!(m3u8.contains("AUDIO=\"audio\""));
     }
 }
 
 /// Render an HLS master playlist referencing variant streams.
 pub fn render_master(state: &ManifestState, variant_playlist_uris: &[String]) -> Result<String> {
+    use crate::manifest::types::TrackMediaType;
+
     let mut m3u8 = String::new();
 
     m3u8.push_str("#EXTM3U\n");
@@ -373,33 +594,108 @@ pub fn render_master(state: &ManifestState, variant_playlist_uris: &[String]) ->
         }
     }
 
+    // Check if we have subtitle or audio renditions for STREAM-INF attributes
+    let has_subtitles = state
+        .variants
+        .iter()
+        .any(|v| v.track_type == TrackMediaType::Subtitle);
+    let has_audio = state
+        .variants
+        .iter()
+        .any(|v| v.track_type == TrackMediaType::Audio);
+    let has_cea_captions = !state.cea_captions.is_empty();
+
+    // Emit audio rendition groups first
     for (i, variant) in state.variants.iter().enumerate() {
+        if variant.track_type != TrackMediaType::Audio {
+            continue;
+        }
         let uri = variant_playlist_uris
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("variant.m3u8");
 
-        match variant.track_type {
-            crate::manifest::types::TrackMediaType::Video => {
-                let mut attrs = format!("BANDWIDTH={}", variant.bandwidth);
-                attrs.push_str(&format!(",CODECS=\"{}\"", variant.codecs));
-                if let Some((w, h)) = variant.resolution {
-                    attrs.push_str(&format!(",RESOLUTION={w}x{h}"));
-                }
-                if let Some(fps) = variant.frame_rate {
-                    attrs.push_str(&format!(",FRAME-RATE={fps:.3}"));
-                }
-                m3u8.push_str(&format!("#EXT-X-STREAM-INF:{attrs}\n"));
-                m3u8.push_str(&format!("{uri}\n"));
-            }
-            crate::manifest::types::TrackMediaType::Audio => {
-                m3u8.push_str(&format!(
-                    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"{}\",\
-                     DEFAULT=YES,AUTOSELECT=YES,URI=\"{uri}\"\n",
-                    variant.id
-                ));
-            }
+        let mut attrs = String::from("TYPE=AUDIO,GROUP-ID=\"audio\"");
+        if let Some(ref lang) = variant.language {
+            attrs.push_str(&format!(",LANGUAGE=\"{lang}\""));
         }
+        attrs.push_str(&format!(",NAME=\"{}\"", variant.id));
+        attrs.push_str(",DEFAULT=YES,AUTOSELECT=YES");
+        attrs.push_str(&format!(",URI=\"{uri}\""));
+        m3u8.push_str(&format!("#EXT-X-MEDIA:{attrs}\n"));
+    }
+
+    // Emit subtitle rendition groups
+    for (i, variant) in state.variants.iter().enumerate() {
+        if variant.track_type != TrackMediaType::Subtitle {
+            continue;
+        }
+        let uri = variant_playlist_uris
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("variant.m3u8");
+
+        let lang = variant.language.as_deref().unwrap_or("und");
+        let name = if variant.id.is_empty() {
+            lang
+        } else {
+            &variant.id
+        };
+        m3u8.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",\
+             LANGUAGE=\"{lang}\",NAME=\"{name}\",\
+             DEFAULT=NO,AUTOSELECT=YES,URI=\"{uri}\"\n"
+        ));
+    }
+
+    // CEA-608/708 closed caption signaling
+    // In HLS, CEA captions are signaled via EXT-X-MEDIA TYPE=CLOSED-CAPTIONS (no URI).
+    // The INSTREAM-ID identifies the CC channel.
+    for caption in &state.cea_captions {
+        let instream_id = if caption.is_608 {
+            // CEA-608: CC1-CC4
+            format!("\"{}\"", caption.service_name)
+        } else {
+            // CEA-708: SERVICE1-SERVICE63
+            format!("\"{}\"", caption.service_name)
+        };
+        m3u8.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",\
+             LANGUAGE=\"{}\",NAME=\"{}\",\
+             INSTREAM-ID={instream_id},DEFAULT=NO,AUTOSELECT=YES\n",
+            caption.language, caption.service_name
+        ));
+    }
+
+    // Emit video variant STREAM-INF lines
+    for (i, variant) in state.variants.iter().enumerate() {
+        if variant.track_type != TrackMediaType::Video {
+            continue;
+        }
+        let uri = variant_playlist_uris
+            .get(i)
+            .map(|s| s.as_str())
+            .unwrap_or("variant.m3u8");
+
+        let mut attrs = format!("BANDWIDTH={}", variant.bandwidth);
+        attrs.push_str(&format!(",CODECS=\"{}\"", variant.codecs));
+        if let Some((w, h)) = variant.resolution {
+            attrs.push_str(&format!(",RESOLUTION={w}x{h}"));
+        }
+        if let Some(fps) = variant.frame_rate {
+            attrs.push_str(&format!(",FRAME-RATE={fps:.3}"));
+        }
+        if has_audio {
+            attrs.push_str(",AUDIO=\"audio\"");
+        }
+        if has_subtitles {
+            attrs.push_str(",SUBTITLES=\"subs\"");
+        }
+        if has_cea_captions {
+            attrs.push_str(",CLOSED-CAPTIONS=\"cc\"");
+        }
+        m3u8.push_str(&format!("#EXT-X-STREAM-INF:{attrs}\n"));
+        m3u8.push_str(&format!("{uri}\n"));
     }
 
     Ok(m3u8)

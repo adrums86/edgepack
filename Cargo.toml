@@ -8,6 +8,8 @@ description = "CDN edge WASM application for repackaging DASH/HLS CMAF media fro
 crate-type = ["cdylib", "rlib"]
 
 [features]
+jit = []
+cloudflare = []
 sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
 
 [[bin]]

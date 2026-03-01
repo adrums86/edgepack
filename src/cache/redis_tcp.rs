@@ -35,6 +35,12 @@ impl CacheBackend for RedisTcpBackend {
         ))
     }
 
+    fn set_nx(&self, _key: &str, _value: &[u8], _ttl_seconds: u64) -> Result<bool> {
+        Err(EdgepackError::Cache(
+            "TCP Redis backend not yet implemented — use HTTP backend".into(),
+        ))
+    }
+
     fn exists(&self, _key: &str) -> Result<bool> {
         Err(EdgepackError::Cache(
             "TCP Redis backend not yet implemented — use HTTP backend".into(),
@@ -64,6 +70,7 @@ mod tests {
 
         assert!(backend.get("key").is_err());
         assert!(backend.set("key", b"value", 60).is_err());
+        assert!(backend.set_nx("key", b"value", 30).is_err());
         assert!(backend.exists("key").is_err());
         assert!(backend.delete("key").is_err());
     }

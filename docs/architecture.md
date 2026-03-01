@@ -28,7 +28,7 @@ graph TB
 
     Origin["Origin Server<br/>CBCS/CENC-encrypted<br/>CMAF content"]
     LicenseServer["DRM License Server<br/>SPEKE 2.0 endpoint"]
-    Redis["Redis<br/>(Upstash HTTP or TCP)"]
+    Redis["Cache Backend<br/>(Redis / CF KV / HTTP KV)"]
 
     Player -- "GET /repackage/{id}/{fmt}/..." --> Cache
     Cache -- "cache miss" --> Handler
@@ -126,10 +126,10 @@ graph TD
     end
 
     subgraph Core["Core Modules"]
-        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>codec extraction<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
+        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>codec + language extraction<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
         DRMMod["drm/<br/>EncryptionScheme<br/>SampleDecryptor/Encryptor<br/>SPEKE client + CPIX XML<br/>CBCS decrypt+encrypt<br/>CENC encrypt+decrypt"]
-        Manifest["manifest/<br/>HLS renderer<br/>DASH renderer<br/>HLS input parser<br/>DASH input parser"]
-        CacheMod2["cache/<br/>CacheBackend trait<br/>EncryptedCacheBackend<br/>Redis HTTP / TCP<br/>In-memory (sandbox)"]
+        Manifest["manifest/<br/>HLS renderer<br/>DASH renderer<br/>HLS input parser<br/>DASH input parser<br/>Subtitle/CEA signaling"]
+        CacheMod2["cache/<br/>CacheBackend trait<br/>EncryptedCacheBackend<br/>Redis HTTP / TCP<br/>Cloudflare KV / HTTP KV<br/>In-memory (sandbox)"]
     end
 
     subgraph Shared["Shared"]
@@ -415,7 +415,10 @@ flowchart TD
 | **Multi-DRM** | Widevine + PlayReady for CENC output; FairPlay + Widevine + PlayReady for CBCS output |
 | **Multi-Key DRM** | Per-track keying (separate video/audio KIDs), multi-KID PSSH v1 boxes, TrackKeyMapping |
 | **Codec Awareness** | RFC 6381 codec string extraction from init segments for manifest signaling |
-| **Zero External Test Dependencies** | All 709 tests use synthetic CMAF fixtures — no network or media files needed |
+| **Subtitle Pass-Through** | WebVTT/TTML in fMP4, HLS subtitle rendition groups, DASH text AdaptationSets, CEA-608/708 caption signaling |
+| **JIT Packaging** | On-demand GET packaging (manifest/init/segment-on-GET), request coalescing via distributed locking |
+| **Multi-Backend Caching** | Redis HTTP, Cloudflare Workers KV, generic HTTP KV for AWS/Akamai/custom stores |
+| **Zero External Test Dependencies** | All 825 tests use synthetic CMAF fixtures — no network or media files needed |
 | **WASM-Native** | Entire runtime compiles to `wasm32-wasip2` with no async runtime or system calls |
 
 ## Inputs and Outputs
@@ -460,28 +463,42 @@ flowchart TD
 - `TrackKeyMapping` type mapping `TrackType → [u8; 16]` KID for per-track keying
 - Per-track `tenc` in init segments — video and audio tracks get different KIDs via `hdlr` detection
 - Multi-KID PSSH v1 — grouped by `system_id`, all track KIDs embedded per DRM system
-- Codec string extraction via `extract_tracks()` in `src/media/codec.rs` — RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C)
-- Timescale parsing from `mdhd` box
+- Codec string extraction via `extract_tracks()` in `src/media/codec.rs` — RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C, wvtt, stpp)
+- Timescale and language parsing from `mdhd` box (ISO 639-2/T packed 3×5-bit chars)
 - Pipeline integration: `extract_tracks()` → `build_track_key_mapping()` → multi-KID SPEKE → per-track init rewriting
 - Codec strings populated into `VariantInfo` for HLS `CODECS=` and DASH `codecs=` manifest attributes
 - `TrackKeyMapping` serialized via `ContinuationParams` for split execution
 
+### ~~Phase 6: Subtitle & Text Track Pass-Through~~ ✅ Complete
+- WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4 — subtitles bypass encryption via `encrypted_sample_entry_type()` returning `None`
+- `TrackMediaType::Subtitle` enum variant, `language` field on `VariantInfo` and `TrackInfo`
+- ISO 639-2/T language extraction from `mdhd` box (packed 3×5-bit chars)
+- `CeaCaptionInfo` struct for CEA-608/708 manifest signaling (pass-through automatic in video SEI NALs)
+- HLS subtitle rendition groups (`#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs"`) with `SUBTITLES="subs"` on `EXT-X-STREAM-INF`
+- HLS CEA caption signaling (`#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,INSTREAM-ID=...`) with `CLOSED-CAPTIONS="cc"` on `EXT-X-STREAM-INF`
+- DASH subtitle `<AdaptationSet contentType="text" mimeType="application/mp4">` with `lang` attribute
+- DASH CEA `<Accessibility schemeIdUri="urn:scte:dash:cc:cea-608:2015">` descriptors inside video AdaptationSet
+
+### ~~Phase 8: JIT Packaging (On-Demand GET)~~ ✅ Complete
+- Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging on cache miss)
+- Request coalescing via `set_nx` distributed locking with configurable TTL
+- Hybrid mode (JIT + proactive webhook coexist — webhook detects JIT setup marker)
+- `POST /config/source` endpoint for per-content source configuration
+- URL pattern-based source resolution with `{content_id}` placeholder
+- All JIT code behind `#[cfg(feature = "jit")]` feature flag
+
+### ~~Phase 17: CDN Provider Adapters & Binary Optimization~~ ✅ Complete
+- Generalized config: `RedisConfig` → `StoreConfig`, `RedisBackendType` → `CacheBackendType`
+- Cloudflare Workers KV backend (`cloudflare` feature) via REST API
+- Generic HTTP KV backend for AWS DynamoDB, Akamai EdgeKV, custom stores
+- HTTP client extended with `PUT` and `DELETE` methods
+- Backward compatible: `REDIS_URL`/`REDIS_TOKEN` still work unchanged
+- `CACHE_BACKEND` env var override, `CACHE_ENCRYPTION_TOKEN` for custom key derivation
+- `set_nx()` best-effort (GET then PUT) on non-Redis backends
+
 ## Planned Architecture Extensions
 
-### Phase 6: Subtitle & Text Track Pass-Through — P0
-- WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4
-- CEA-608/708 manifest signaling
-- HLS subtitle rendition groups, DASH subtitle AdaptationSets
-
-### Phase 8: JIT Packaging (On-Demand GET) — P0
-- Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging)
-- Request coalescing via Redis locking
-- Hybrid mode (JIT + proactive webhook coexist)
-
-### Phase 17: CDN Provider Adapters & Binary Optimization — P0
-- Cloudflare Workers, Fastly Compute, AWS Lambda@Edge adapters
-- WASI Preview 1 fallback shim
-- Binary profiling with `twiggy` + `wasm-opt`
+All P0 items are complete. Remaining phases are P1 and P2.
 
 ---
 

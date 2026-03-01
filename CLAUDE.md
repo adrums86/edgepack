@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), and **codec string extraction** (RFC 6381 codec strings for manifest signaling). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **codec string extraction** (RFC 6381 codec strings for manifest signaling), and **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
 
 ## Build Commands
 
@@ -41,12 +41,14 @@ src/
 ├── wasi_handler.rs     WASI incoming handler bridge (wasm32 only)
 ├── bin/
 │   └── sandbox.rs      Local sandbox binary (Axum web UI + API, sandbox feature only)
-├── cache/              Redis-backed application state store
+├── cache/              Cache backend abstraction layer (multi-provider)
 │   ├── mod.rs          CacheBackend trait + CacheKeys builder + factory
 │   ├── encrypted.rs    AES-256-GCM encryption layer for sensitive cache entries
 │   ├── memory.rs       In-memory cache backend (sandbox feature only)
-│   ├── redis_http.rs   Upstash-compatible HTTP Redis (primary)
-│   └── redis_tcp.rs    TCP Redis stub (forward compatibility)
+│   ├── redis_http.rs   Upstash-compatible HTTP Redis (default)
+│   ├── redis_tcp.rs    TCP Redis stub (forward compatibility)
+│   ├── cloudflare_kv.rs Cloudflare Workers KV REST API (cloudflare feature)
+│   └── http_kv.rs      Generic HTTP KV (AWS DynamoDB, Akamai EdgeKV, custom)
 ├── drm/                DRM key acquisition and encryption
 │   ├── mod.rs          ContentKey, DrmSystemData, DrmKeySet types + system ID constants
 │   ├── scheme.rs       EncryptionScheme enum (Cbcs/Cenc/None) + scheme-specific helpers
@@ -64,7 +66,7 @@ src/
 │   └── segment.rs      Media segment rewriting (senc/mdat decrypt+re-encrypt)
 ├── manifest/           Manifest parsing (input) and rendering (output)
 │   ├── mod.rs          render_manifest() dispatcher
-│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, DrmInfo, SourceManifest
+│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, DrmInfo, CeaCaptionInfo, SourceManifest
 │   ├── hls.rs          HLS M3U8 renderer (media + master playlists)
 │   ├── dash.rs         DASH MPD renderer (SegmentTemplate + SegmentTimeline)
 │   ├── hls_input.rs    HLS M3U8 input parser (source manifest extraction)
@@ -88,7 +90,7 @@ Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md).
 ### Two-Tier Caching
 
 - **CDN cache** (primary): HTTP `Cache-Control` headers on responses. Segments and finalised manifests use `max-age=31536000, immutable`. Live manifests use `max-age=1, s-maxage=1`.
-- **Redis** (application state): Stores DRM keys, job state, SPEKE response cache, progressive manifest state, and rewritten media data (init segments, media segments) for the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) does not cache media data in Redis — it returns output directly via `ProgressiveOutput`.
+- **Cache backend** (application state): Stores DRM keys, job state, SPEKE response cache, progressive manifest state, and rewritten media data (init segments, media segments) for the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) does not cache media data — it returns output directly via `ProgressiveOutput`. Backend is configurable: Redis HTTP (default), Redis TCP, Cloudflare Workers KV (`cloudflare` feature), or generic HTTP KV (for AWS DynamoDB, Akamai EdgeKV, custom stores).
 
 ### Encryption Transform
 
@@ -148,12 +150,14 @@ The `ProgressiveOutput` state machine transitions:
 - Track ID from `tkhd`
 - Timescale from `mdhd`
 - KID from `sinf → tenc` (if encrypted)
+- Language from `mdhd` (ISO 639-2/T packed 3×5-bit chars, `None` for "und")
 - RFC 6381 codec string from `stsd` sample entry config boxes:
   - H.264: `avcC` → `avc1.{profile}{constraint}{level}`
   - H.265: `hvcC` → `hev1.{profile}.{tier}{level}.{constraint}`
   - AAC: `esds` → `mp4a.40.{audioObjectType}`
   - VP9: `vpcC` → `vp09.{profile}.{level}.{bitDepth}`
   - AV1: `av1C` → `av01.{profile}.{level}{tier}.{bitDepth}`
+  - WebVTT: `wvtt` → `"wvtt"`, TTML: `stpp` → `"stpp"`
   - AC-3, EC-3, Opus, FLAC → simple FourCC strings
 
 **Pipeline integration:** The pipeline calls `extract_tracks()` on the source init segment, builds `TrackKeyMapping` from the track metadata, collects all unique KIDs for the SPEKE request, and threads the key mapping through init rewriting. Codec strings are populated into `VariantInfo` for manifest rendering (HLS `CODECS=` attribute, DASH `codecs=` attribute).
@@ -170,7 +174,7 @@ All modules use `crate::error::Result<T>` which aliases `std::result::Result<T, 
 
 All HTTP transport and request handling is fully implemented:
 
-1. **`http_client.rs`**: Shared HTTP client using `wasi:http/outgoing-handler` (wasm32) with native stub error (non-wasm32, preserves test builds).
+1. **`http_client.rs`**: Shared HTTP client (GET, POST, PUT, DELETE) using `wasi:http/outgoing-handler` (wasm32) with native stub error (non-wasm32, preserves test builds).
 2. **`wasi_handler.rs`**: WASI incoming handler bridge implementing `wasi:http/incoming-handler::Guest`. Converts WASI types ↔ library types and maps errors to HTTP status codes.
 3. **`cache/redis_http.rs` → `execute_command()`**: Uses `http_client::get()` to make Upstash REST API calls. Parses JSON responses via extracted `parse_upstash_response()`.
 4. **`drm/speke.rs` → `post_cpix()`**: Uses `http_client::post()` to POST CPIX XML to license server with auth headers.
@@ -193,6 +197,8 @@ The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses
 
 ```toml
 [features]
+jit = []                  # Phase 8: JIT on-demand packaging
+cloudflare = []           # Phase 17: Cloudflare Workers KV cache backend
 sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
 ```
 
@@ -236,9 +242,9 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **709 tests** total: 583 unit tests and 126 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
+The project has **825 tests** total (with `--features jit,cloudflare`): 648 unit tests and 177 integration tests. Without optional features: **768 tests** (624 unit + 144 integration). All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
 
-### Unit Tests (583)
+### Unit Tests (648 with all features)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -248,9 +254,9 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Encryption correctness**: CBCS decrypt + encrypt, CENC encrypt + decrypt, scheme-agnostic roundtrips through factory functions
 - **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
 - **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme, per-track KID assignment via TrackKeyMapping, multi-KID PSSH v1 generation), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not), clear→encrypted sinf injection (`create_protection_info`), encrypted→clear sinf stripping (`strip_protection_info`), clear→clear ftyp-only rewrite (`rewrite_ftyp_only`)
-- **Codec string extraction**: RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C), track metadata parsing (hdlr handler type, mdhd timescale, tkhd track_id, sinf/tenc default_kid), TrackKeyMapping construction and serde roundtrips
+- **Codec string extraction**: RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C, wvtt, stpp), track metadata parsing (hdlr handler type, mdhd timescale + language, tkhd track_id, sinf/tenc default_kid), TrackKeyMapping construction and serde roundtrips
 - **Segment rewriting**: Four-way dispatch (encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear pass-through), scheme-aware decrypt/re-encrypt with optional source/target keys
-- **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering
+- **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering, subtitle rendition groups (HLS `TYPE=SUBTITLES`, DASH text AdaptationSet), CEA-608/708 closed caption signaling (HLS `TYPE=CLOSED-CAPTIONS` with `INSTREAM-ID`, DASH `Accessibility` descriptors)
 - **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through ContinuationParams, TrackKeyMapping construction and serialization, variant building from track metadata
@@ -261,7 +267,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (126)
+### Integration Tests (177 with all features)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -269,10 +275,12 @@ Located in the `tests/` directory. These exercise cross-module workflows using s
 tests/
 ├── common/
 │   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
+├── cdn_adapters.rs            18+ tests: backend type selection, config serde, create_backend factory, encryption token derivation
 ├── clear_content.rs           10 tests: clear→CENC/CBCS, encrypted→clear, clear→clear (init + segment), roundtrips
 ├── dual_scheme.rs             22 tests: scheme-qualified routing, cache keys, webhook multi-scheme parsing, backward compat
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
+├── jit_packaging.rs           27 tests: JIT source config, on-demand setup, lock contention, backward compat (jit feature)
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
 ├── handler_integration.rs    32 tests: HTTP routing (all 7 CMAF/ISOBMFF segment extensions), webhook validation, response helpers
 ├── multi_key.rs              12 tests: per-track tenc, multi-KID PSSH, single-key backward compat, codec extraction, TrackKeyMapping serde, create→strip roundtrip
@@ -324,17 +332,57 @@ When adding new functionality, follow the existing pattern:
 
 ## Environment Variables
 
+### Cache Store
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `REDIS_URL` | Yes | — | Redis endpoint (e.g. `https://us1-xxx.upstash.io`) |
-| `REDIS_TOKEN` | Yes | — | Redis auth token |
-| `REDIS_BACKEND` | No | `http` | Backend type: `http` or `tcp` |
+| `STORE_URL` | Yes* | — | Cache store endpoint URL |
+| `STORE_TOKEN` | Yes* | — | Cache store auth token |
+| `CACHE_BACKEND` | No | `redis_http` | Backend type: `redis_http`, `redis_tcp`, `cloudflare_kv`, `http_kv` |
+| `CACHE_ENCRYPTION_TOKEN` | No | `STORE_TOKEN` | Token for cache encryption key derivation |
+| `REDIS_URL` | Yes* | — | Redis endpoint (backward compat alias for `STORE_URL`) |
+| `REDIS_TOKEN` | Yes* | — | Redis auth token (backward compat alias for `STORE_TOKEN`) |
+| `REDIS_BACKEND` | No | `http` | Legacy backend type: `http` or `tcp` (overridden by `CACHE_BACKEND`) |
+
+*`STORE_URL`/`STORE_TOKEN` fall back to `REDIS_URL`/`REDIS_TOKEN` for backward compatibility.
+
+### Cloudflare Workers KV (requires `cloudflare` feature + `CACHE_BACKEND=cloudflare_kv`)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `CF_ACCOUNT_ID` | Yes | — | Cloudflare account ID |
+| `CF_KV_NAMESPACE_ID` | Yes | — | Workers KV namespace ID |
+| `CF_API_TOKEN` | Yes | — | Cloudflare API token with KV permissions |
+| `CF_API_BASE_URL` | No | `https://api.cloudflare.com/client/v4` | API base URL |
+
+### Generic HTTP KV (requires `CACHE_BACKEND=http_kv`)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HTTP_KV_BASE_URL` | Yes | — | KV API base URL (e.g. `https://xxx.execute-api.us-east-1.amazonaws.com/prod`) |
+| `HTTP_KV_AUTH_HEADER` | No | `Authorization` | Auth header name (e.g. `x-api-key`) |
+| `HTTP_KV_AUTH_VALUE` | Yes | — | Auth header value (e.g. `Bearer xxx` or API key) |
+
+### DRM / SPEKE
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
 | `SPEKE_URL` | Yes | — | SPEKE 2.0 license server endpoint |
 | `SPEKE_BEARER_TOKEN` | One of three | — | Bearer token auth |
 | `SPEKE_API_KEY` | One of three | — | API key auth (pair with `SPEKE_API_KEY_HEADER`) |
 | `SPEKE_API_KEY_HEADER` | No | `x-api-key` | Header name for API key |
 | `SPEKE_USERNAME` | One of three | — | Basic auth username |
 | `SPEKE_PASSWORD` | One of three | — | Basic auth password |
+
+### JIT Packaging (requires `jit` feature)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `JIT_ENABLED` | No | `false` | Enable JIT on-demand packaging |
+| `JIT_SOURCE_URL_PATTERN` | No | — | URL template with `{content_id}` placeholder |
+| `JIT_DEFAULT_TARGET_SCHEME` | No | `cenc` | Default scheme: `cenc` or `cbcs` |
+| `JIT_DEFAULT_CONTAINER_FORMAT` | No | `cmaf` | Default format: `cmaf` or `fmp4` |
+| `JIT_LOCK_TTL` | No | `30` | Processing lock TTL in seconds |
 
 ## Redis Key Schema
 
@@ -406,7 +454,7 @@ FairPlay is recognised in both input and output. For CENC target output, FairPla
 
 ## Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–5 are complete. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–6, 8, and 17 are complete. All P0 items are done. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -448,12 +496,18 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - `TrackKeyMapping` threaded through pipeline, init rewriting, PSSH building, and ContinuationParams
 - Codec strings populated into `VariantInfo` for HLS/DASH manifest signaling
 - New: `src/media/codec.rs` (34 unit tests), `tests/multi_key.rs` (12 integration tests)
-- Result: 709 tests total (583 unit + 126 integration)
 
-### Phase 6: Subtitle & Text Track Pass-Through — P0
-- WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4
-- CEA-608/708 manifest signaling (pass-through is automatic)
-- HLS subtitle rendition groups, DASH subtitle AdaptationSets
+### ~~Phase 6: Subtitle & Text Track Pass-Through~~ ✅ Complete
+- WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4 (subtitles bypass encryption via `encrypted_sample_entry_type()` returning `None`)
+- `TrackMediaType::Subtitle` enum variant, `language` field on `VariantInfo` and `TrackInfo`
+- ISO 639-2/T language extraction from `mdhd` box (packed 3×5-bit chars)
+- Explicit `wvtt`/`stpp` codec string detection in `extract_codec_string()`
+- `CeaCaptionInfo` struct for CEA-608/708 manifest signaling (pass-through is automatic in video SEI NALs)
+- HLS subtitle rendition groups (`#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs"`) with `SUBTITLES="subs"` on `EXT-X-STREAM-INF`
+- HLS CEA caption signaling (`#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,INSTREAM-ID=...`) with `CLOSED-CAPTIONS="cc"` on `EXT-X-STREAM-INF`
+- DASH subtitle `<AdaptationSet contentType="text">` with language attribute
+- DASH CEA `<Accessibility schemeIdUri="urn:scte:dash:cc:cea-608:2015">` descriptors inside video AdaptationSet
+- Result: 825 tests total with `--features jit,cloudflare` (18 new subtitle/caption tests)
 
 ### Phase 7: SCTE-35 Ad Markers & Multi-Period DASH — P1
 - Parse `emsg` boxes for SCTE-35 splice info
@@ -461,11 +515,14 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Multi-period DASH at SCTE-35 boundaries
 - New: `src/media/scte35.rs`
 
-### Phase 8: JIT Packaging (On-Demand GET) — P0
-- Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging)
-- Request coalescing via Redis locking
-- Hybrid mode (JIT + proactive webhook coexist)
-- Configuration endpoint for source resolution
+### ~~Phase 8: JIT Packaging (On-Demand GET)~~ ✅ Complete
+- Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging on cache miss)
+- Request coalescing via `set_nx` distributed locking with configurable TTL
+- Hybrid mode (JIT + proactive webhook coexist — webhook detects JIT setup marker)
+- `POST /config/source` endpoint for per-content source configuration
+- URL pattern-based source resolution with `{content_id}` placeholder
+- All JIT code behind `#[cfg(feature = "jit")]` feature flag
+- Result: 762 tests total with `--features jit` (27 new JIT integration tests)
 
 ### Phase 9: LL-HLS & LL-DASH — P1
 - LL-HLS (`#EXT-X-PART`, `#EXT-X-PRELOAD-HINT`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-SKIP`)
@@ -500,10 +557,37 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - HDR metadata preservation validation
 - New: `src/media/compat.rs`, conformance test suite
 
-### Phase 17: CDN Provider Adapters & Binary Optimization — P0
-- Cloudflare Workers, Fastly Compute, AWS Lambda@Edge, Vercel adapters
-- WASI Preview 1 fallback shim
-- Binary profiling with `twiggy` + `wasm-opt`
+### ~~Phase 17: CDN Provider Adapters & Binary Optimization~~ ✅ Complete
+- Generalized config: `RedisConfig` → `StoreConfig`, `RedisBackendType` → `CacheBackendType`
+- **Cloudflare Workers KV** backend (`cloudflare` feature) via REST API
+- **Generic HTTP KV** backend (always available) for AWS DynamoDB via API Gateway, Akamai EdgeKV via proxy, or custom KV stores
+- HTTP client extended with `PUT` and `DELETE` methods
+- Backward compatible: `REDIS_URL`/`REDIS_TOKEN` env vars still work unchanged
+- `CACHE_BACKEND` env var override for backend selection
+- `CACHE_ENCRYPTION_TOKEN` env var for custom key derivation source
+- No new crate dependencies — all backends use existing `http_client.rs` and `serde_json`
+- `set_nx()` is best-effort (GET then PUT) on non-Redis backends (acceptable for JIT lock coalescing)
+- Result: 807 tests total with `--features jit,cloudflare` (18 new CDN adapter integration tests)
 
-Critical path: **Phase 8 → Phase 17**
+### CDN Platform Compatibility
+
+| CDN Platform | WASI P2 Support | Recommended Backend | Alternative |
+|---|---|---|---|
+| Generic WASI P2 | Native | Redis HTTP (default) | — |
+| Cloudflare Workers | Via component model | **Cloudflare KV** (`cloudflare` feature) | Redis HTTP |
+| Fastly Compute | Native | Redis HTTP (existing) | HTTP KV |
+| AWS CloudFront / Lambda@Edge | Via wasmtime in Lambda | **HTTP KV** (DynamoDB via API Gateway) | Redis HTTP |
+| Akamai EdgeWorkers / EdgeCompute | Via WASI runtime | **HTTP KV** (EdgeKV via auth proxy) | Redis HTTP |
+| Vercel Edge Functions | Via V8 WASI shim | Redis HTTP (existing) | HTTP KV |
+
+Build commands per platform:
+```bash
+cargo build --release                           # Generic WASI P2 (Redis HTTP)
+cargo build --release --features cloudflare     # Cloudflare Workers
+cargo build --release --features jit            # JIT only
+cargo build --release --features jit,cloudflare # All features
+```
+
+**All P0 items are complete.** No P0 phases remain in the roadmap.
+
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

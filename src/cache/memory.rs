@@ -46,6 +46,19 @@ impl CacheBackend for InMemoryCacheBackend {
         Ok(())
     }
 
+    fn set_nx(&self, key: &str, value: &[u8], _ttl_seconds: u64) -> Result<bool> {
+        let mut store = self
+            .store
+            .write()
+            .map_err(|e| EdgepackError::Cache(format!("lock poisoned: {e}")))?;
+        if store.contains_key(key) {
+            Ok(false)
+        } else {
+            store.insert(key.to_string(), value.to_vec());
+            Ok(true)
+        }
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         let store = self
             .store
@@ -129,6 +142,30 @@ mod tests {
         let cache = InMemoryCacheBackend::new();
         cache.set("key", b"val", 0).unwrap();
         assert_eq!(cache.get("key").unwrap(), Some(b"val".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_succeeds_when_absent() {
+        let cache = InMemoryCacheBackend::new();
+        assert!(cache.set_nx("key", b"val", 30).unwrap());
+        assert_eq!(cache.get("key").unwrap(), Some(b"val".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_fails_when_present() {
+        let cache = InMemoryCacheBackend::new();
+        cache.set("key", b"original", 60).unwrap();
+        assert!(!cache.set_nx("key", b"new", 30).unwrap());
+        // Original value should be preserved
+        assert_eq!(cache.get("key").unwrap(), Some(b"original".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_second_call_fails() {
+        let cache = InMemoryCacheBackend::new();
+        assert!(cache.set_nx("key", b"first", 30).unwrap());
+        assert!(!cache.set_nx("key", b"second", 30).unwrap());
+        assert_eq!(cache.get("key").unwrap(), Some(b"first".to_vec()));
     }
 
     #[test]

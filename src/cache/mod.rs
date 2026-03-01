@@ -1,12 +1,16 @@
 pub mod encrypted;
+pub mod http_kv;
 pub mod redis_http;
 pub mod redis_tcp;
+
+#[cfg(feature = "cloudflare")]
+pub mod cloudflare_kv;
 
 #[cfg(feature = "sandbox")]
 pub mod memory;
 
-use crate::config::{RedisBackendType, RedisConfig};
-use crate::error::Result;
+use crate::config::{AppConfig, CacheBackendType};
+use crate::error::{EdgepackError, Result};
 
 /// Abstract cache backend for application state storage.
 ///
@@ -15,27 +19,47 @@ use crate::error::Result;
 pub trait CacheBackend: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     fn set(&self, key: &str, value: &[u8], ttl_seconds: u64) -> Result<()>;
+    /// Atomic set-if-not-exists. Returns `true` if the key was set (did not exist),
+    /// `false` if the key already existed. Used for distributed locking / request coalescing.
+    fn set_nx(&self, key: &str, value: &[u8], ttl_seconds: u64) -> Result<bool>;
     fn exists(&self, key: &str) -> Result<bool>;
     fn delete(&self, key: &str) -> Result<()>;
 }
 
-/// Create a cache backend from configuration.
+/// Create a cache backend from application configuration.
 ///
 /// The returned backend automatically encrypts sensitive cache entries
 /// (DRM keys, SPEKE responses, rewrite parameters) using AES-256-GCM
-/// with a key derived from the Redis token.
-pub fn create_backend(config: &RedisConfig) -> Result<Box<dyn CacheBackend>> {
-    let inner: Box<dyn CacheBackend> = match config.backend {
-        RedisBackendType::Http => Box::new(redis_http::RedisHttpBackend::new(
-            &config.url,
-            &config.token,
+/// with a key derived from the store token.
+///
+/// Dispatches to the appropriate backend based on `config.store.backend`:
+/// - `RedisHttp` → Upstash-compatible HTTP Redis
+/// - `RedisTcp` → TCP Redis (stub)
+/// - `CloudflareKv` → Cloudflare Workers KV REST API (requires `cloudflare` feature)
+/// - `HttpKv` → Generic HTTP KV (for DynamoDB via API GW, EdgeKV via proxy, etc.)
+pub fn create_backend(config: &AppConfig) -> Result<Box<dyn CacheBackend>> {
+    let inner: Box<dyn CacheBackend> = match config.store.backend {
+        CacheBackendType::RedisHttp => Box::new(redis_http::RedisHttpBackend::new(
+            &config.store.url,
+            &config.store.token,
         )),
-        RedisBackendType::Tcp => Box::new(redis_tcp::RedisTcpBackend::new(
-            &config.url,
-            &config.token,
+        CacheBackendType::RedisTcp => Box::new(redis_tcp::RedisTcpBackend::new(
+            &config.store.url,
+            &config.store.token,
         )?),
+        #[cfg(feature = "cloudflare")]
+        CacheBackendType::CloudflareKv => {
+            let cf = config.cloudflare_kv.as_ref()
+                .ok_or_else(|| EdgepackError::Config("cloudflare_kv config required for CloudflareKv backend".into()))?;
+            Box::new(cloudflare_kv::CloudflareKvBackend::new(cf))
+        }
+        CacheBackendType::HttpKv => {
+            let hkv = config.http_kv.as_ref()
+                .ok_or_else(|| EdgepackError::Config("http_kv config required for HttpKv backend".into()))?;
+            Box::new(http_kv::HttpKvBackend::new(hkv))
+        }
     };
-    let enc_key = encrypted::derive_key(&config.token);
+    let enc_key = encrypted::derive_key(config.cache_encryption_token());
     Ok(Box::new(encrypted::EncryptedCacheBackend::new(inner, &enc_key)))
 }
 
@@ -117,6 +141,24 @@ impl CacheKeys {
     pub fn rewrite_params_for_scheme(content_id: &str, format: &str, scheme: &str) -> String {
         let sf = Self::scheme_fmt(format, scheme);
         format!("ep:{content_id}:{sf}:rewrite_params")
+    }
+
+    // --- JIT Packaging key builders (Phase 8) ---
+
+    /// Per-content source configuration (source URL, target schemes, container format).
+    pub fn source_config(content_id: &str) -> String {
+        format!("ep:{content_id}:source_config")
+    }
+
+    /// Distributed processing lock for a specific resource.
+    /// Prevents duplicate JIT work when multiple requests arrive simultaneously.
+    pub fn processing_lock(content_id: &str, format: &str, resource: &str) -> String {
+        format!("ep:{content_id}:{format}:lock:{resource}")
+    }
+
+    /// Marker that JIT setup (manifest + init + keys) is complete for this content/format.
+    pub fn jit_setup(content_id: &str, format: &str) -> String {
+        format!("ep:{content_id}:{format}:jit_setup")
     }
 }
 
@@ -231,6 +273,32 @@ mod tests {
         );
     }
 
+    // --- JIT key tests ---
+
+    #[test]
+    fn cache_keys_source_config() {
+        assert_eq!(CacheKeys::source_config("abc"), "ep:abc:source_config");
+        assert_eq!(CacheKeys::source_config("my-video"), "ep:my-video:source_config");
+    }
+
+    #[test]
+    fn cache_keys_processing_lock() {
+        assert_eq!(
+            CacheKeys::processing_lock("abc", "hls", "setup"),
+            "ep:abc:hls:lock:setup"
+        );
+        assert_eq!(
+            CacheKeys::processing_lock("abc", "dash", "seg:5"),
+            "ep:abc:dash:lock:seg:5"
+        );
+    }
+
+    #[test]
+    fn cache_keys_jit_setup() {
+        assert_eq!(CacheKeys::jit_setup("abc", "hls"), "ep:abc:hls:jit_setup");
+        assert_eq!(CacheKeys::jit_setup("abc", "dash"), "ep:abc:dash:jit_setup");
+    }
+
     #[test]
     fn cache_keys_scheme_fmt_different_from_unqualified() {
         // Scheme-qualified keys should differ from unqualified keys
@@ -241,10 +309,23 @@ mod tests {
 
     #[test]
     fn create_backend_http() {
-        let config = RedisConfig {
-            url: "https://redis.example.com".into(),
-            token: "token123".into(),
-            backend: RedisBackendType::Http,
+        use crate::config::*;
+        let config = AppConfig {
+            store: StoreConfig {
+                url: "https://redis.example.com".into(),
+                token: "token123".into(),
+                backend: CacheBackendType::RedisHttp,
+            },
+            drm: DrmConfig {
+                speke_url: crate::url::Url::parse("https://speke.test/v2").unwrap(),
+                speke_auth: SpekeAuth::Bearer("test".into()),
+                system_ids: DrmSystemIds::default(),
+            },
+            cache: CacheConfig::default(),
+            jit: JitConfig::default(),
+            #[cfg(feature = "cloudflare")]
+            cloudflare_kv: None,
+            http_kv: None,
         };
         let backend = create_backend(&config);
         assert!(backend.is_ok());
@@ -252,10 +333,23 @@ mod tests {
 
     #[test]
     fn create_backend_tcp() {
-        let config = RedisConfig {
-            url: "redis://localhost:6379".into(),
-            token: "token123".into(),
-            backend: RedisBackendType::Tcp,
+        use crate::config::*;
+        let config = AppConfig {
+            store: StoreConfig {
+                url: "redis://localhost:6379".into(),
+                token: "token123".into(),
+                backend: CacheBackendType::RedisTcp,
+            },
+            drm: DrmConfig {
+                speke_url: crate::url::Url::parse("https://speke.test/v2").unwrap(),
+                speke_auth: SpekeAuth::Bearer("test".into()),
+                system_ids: DrmSystemIds::default(),
+            },
+            cache: CacheConfig::default(),
+            jit: JitConfig::default(),
+            #[cfg(feature = "cloudflare")]
+            cloudflare_kv: None,
+            http_kv: None,
         };
         let backend = create_backend(&config);
         // TCP backend constructor should succeed (it's a stub)

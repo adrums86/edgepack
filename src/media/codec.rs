@@ -18,6 +18,8 @@ pub struct TrackInfo {
     pub timescale: u32,
     /// Default KID from tenc box, if the track is encrypted.
     pub kid: Option<[u8; 16]>,
+    /// ISO 639-2/T language code from mdhd box (e.g., "eng", "und").
+    pub language: Option<String>,
 }
 
 /// Maps track types to key IDs for per-track keying.
@@ -153,11 +155,12 @@ fn parse_trak(trak_payload: &[u8]) -> Result<Option<TrackInfo>> {
         TrackType::Unknown
     };
 
-    // Extract timescale from mdhd
-    let timescale = if let Some(mdhd) = find_child_box(mdia_payload, &box_type::MDHD) {
-        parse_mdhd_timescale(box_payload(mdia_payload, &mdhd))
+    // Extract timescale and language from mdhd
+    let (timescale, language) = if let Some(mdhd) = find_child_box(mdia_payload, &box_type::MDHD) {
+        let payload = box_payload(mdia_payload, &mdhd);
+        (parse_mdhd_timescale(payload), parse_mdhd_language(payload))
     } else {
-        0
+        (0, None)
     };
 
     // Navigate to stsd: mdia → minf → stbl → stsd
@@ -169,6 +172,7 @@ fn parse_trak(trak_payload: &[u8]) -> Result<Option<TrackInfo>> {
         codec_string,
         timescale,
         kid,
+        language,
     }))
 }
 
@@ -223,6 +227,46 @@ fn parse_mdhd_timescale(payload: &[u8]) -> u32 {
         payload[timescale_offset + 2],
         payload[timescale_offset + 3],
     ])
+}
+
+/// Extract language from mdhd payload (ISO 639-2/T packed as 3×5-bit chars).
+///
+/// mdhd stores language as a 16-bit field where each 5-bit group encodes
+/// a letter: 0x01='a', 0x02='b', ..., 0x1A='z'. The value 0x0000 or
+/// the decoded "und" means undetermined.
+fn parse_mdhd_language(payload: &[u8]) -> Option<String> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let version = payload[0];
+    // Version 0: creation(4) + modification(4) + timescale(4) + duration(4) + language(2)
+    // Version 1: creation(8) + modification(8) + timescale(4) + duration(8) + language(2)
+    let lang_offset = if version == 0 { 4 + 4 + 4 + 4 + 4 } else { 4 + 8 + 8 + 4 + 8 };
+    if payload.len() < lang_offset + 2 {
+        return None;
+    }
+    let packed = u16::from_be_bytes([payload[lang_offset], payload[lang_offset + 1]]);
+    if packed == 0 {
+        return None;
+    }
+    // Unpack 3 characters from 15 bits (bit 15 is padding)
+    let c1 = ((packed >> 10) & 0x1F) as u8;
+    let c2 = ((packed >> 5) & 0x1F) as u8;
+    let c3 = (packed & 0x1F) as u8;
+    if c1 == 0 || c2 == 0 || c3 == 0 {
+        return None;
+    }
+    let lang = format!(
+        "{}{}{}",
+        (c1 + 0x60) as char,
+        (c2 + 0x60) as char,
+        (c3 + 0x60) as char,
+    );
+    // "und" (undetermined) is treated as no language
+    if lang == "und" {
+        return None;
+    }
+    Some(lang)
 }
 
 /// Navigate mdia → minf → stbl → stsd to extract codec string and KID.
@@ -374,6 +418,8 @@ fn extract_codec_string(fourcc: &[u8; 4], entry_payload: &[u8]) -> String {
         b"ec-3" => "ec-3".to_string(),
         b"Opus" => "opus".to_string(),
         b"fLaC" => "flac".to_string(),
+        b"wvtt" => "wvtt".to_string(),
+        b"stpp" => "stpp".to_string(),
         _ => String::from_utf8_lossy(fourcc).to_string(),
     }
 }
@@ -818,6 +864,7 @@ mod tests {
                 codec_string: "avc1.64001f".to_string(),
                 timescale: 90000,
                 kid: Some([0xAA; 16]),
+                language: None,
             },
             TrackInfo {
                 track_type: TrackType::Audio,
@@ -825,6 +872,7 @@ mod tests {
                 codec_string: "mp4a.40.2".to_string(),
                 timescale: 44100,
                 kid: Some([0xBB; 16]),
+                language: None,
             },
         ];
         let mapping = TrackKeyMapping::from_tracks(&tracks);
@@ -841,6 +889,7 @@ mod tests {
             codec_string: "avc1.64001f".to_string(),
             timescale: 90000,
             kid: None,
+            language: None,
         }];
         let mapping = TrackKeyMapping::from_tracks(&tracks);
         assert!(mapping.entries.is_empty());

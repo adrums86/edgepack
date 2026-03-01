@@ -329,6 +329,7 @@ fn track_key_mapping_from_tracks_preserves_per_track_kids() {
             codec_string: "avc1.64001f".to_string(),
             timescale: 90000,
             kid: Some(VIDEO_KID),
+            language: None,
         },
         TrackInfo {
             track_type: TrackType::Audio,
@@ -336,6 +337,7 @@ fn track_key_mapping_from_tracks_preserves_per_track_kids() {
             codec_string: "mp4a.40.2".to_string(),
             timescale: 44100,
             kid: Some(AUDIO_KID),
+            language: None,
         },
     ];
 
@@ -361,6 +363,7 @@ fn track_key_mapping_from_tracks_same_kid_is_single() {
             codec_string: "avc1.64001f".to_string(),
             timescale: 90000,
             kid: Some(shared_kid),
+            language: None,
         },
         TrackInfo {
             track_type: TrackType::Audio,
@@ -368,6 +371,7 @@ fn track_key_mapping_from_tracks_same_kid_is_single() {
             codec_string: "mp4a.40.2".to_string(),
             timescale: 44100,
             kid: Some(shared_kid),
+            language: None,
         },
     ];
 

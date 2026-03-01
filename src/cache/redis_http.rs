@@ -87,6 +87,23 @@ impl CacheBackend for RedisHttpBackend {
         Ok(())
     }
 
+    fn set_nx(&self, key: &str, value: &[u8], ttl_seconds: u64) -> Result<bool> {
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            value,
+        );
+        let ttl = ttl_seconds.to_string();
+        // SET key value NX EX ttl — returns "OK" if set, null if already exists
+        let result = self.execute_command(&["SET", key, &encoded, "EX", &ttl, "NX"])?;
+        match result {
+            Some(data) => {
+                let s = String::from_utf8_lossy(&data);
+                Ok(s == "OK")
+            }
+            None => Ok(false), // Key already existed
+        }
+    }
+
     fn exists(&self, key: &str) -> Result<bool> {
         match self.execute_command(&["EXISTS", key]) {
             Ok(Some(data)) => {
@@ -136,6 +153,13 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Redis HTTP request failed") || err.contains("only available in WASI"));
+    }
+
+    #[test]
+    fn set_nx_returns_error_on_native() {
+        let backend = RedisHttpBackend::new("https://example.com", "token");
+        let result = backend.set_nx("key", b"value", 30);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -227,6 +251,22 @@ mod tests {
             &value,
         ).unwrap();
         assert_eq!(decoded, b"binary data");
+    }
+
+    #[test]
+    fn parse_upstash_set_nx_success() {
+        // SET NX returns "OK" when key was set (didn't exist)
+        let body = br#"{"result":"OK"}"#;
+        let result = parse_upstash_response(200, body).unwrap();
+        assert_eq!(result, Some(b"OK".to_vec()));
+    }
+
+    #[test]
+    fn parse_upstash_set_nx_already_exists() {
+        // SET NX returns null when key already existed
+        let body = br#"{"result":null}"#;
+        let result = parse_upstash_response(200, body).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

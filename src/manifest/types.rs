@@ -62,12 +62,16 @@ pub struct VariantInfo {
     pub frame_rate: Option<f64>,
     /// Track type.
     pub track_type: TrackMediaType,
+    /// ISO 639-2/T language code (e.g., "eng", "und"). Used for audio/subtitle renditions.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackMediaType {
     Video,
     Audio,
+    Subtitle,
 }
 
 /// DRM signaling information for manifests.
@@ -85,6 +89,17 @@ pub struct ManifestDrmInfo {
     pub fairplay_key_uri: Option<String>,
     /// Default Key ID (hex string, no hyphens).
     pub default_kid: String,
+}
+
+/// CEA-608/708 closed caption channel info for manifest signaling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CeaCaptionInfo {
+    /// CEA service name (e.g., "CC1", "SERVICE1").
+    pub service_name: String,
+    /// Language code (e.g., "eng", "spa").
+    pub language: String,
+    /// Whether this is CEA-608 (true) or CEA-708 (false).
+    pub is_608: bool,
 }
 
 /// The persistent state of a manifest being progressively built.
@@ -113,6 +128,9 @@ pub struct ManifestState {
     /// Container format (CMAF or fMP4). Defaults to CMAF for backward compatibility.
     #[serde(default)]
     pub container_format: ContainerFormat,
+    /// CEA-608/708 closed caption channels (embedded in video, signaled in manifest).
+    #[serde(default)]
+    pub cea_captions: Vec<CeaCaptionInfo>,
 }
 
 /// Lifecycle phase of the manifest.
@@ -145,6 +163,7 @@ impl ManifestState {
             media_sequence: 0,
             base_url,
             container_format,
+            cea_captions: Vec::new(),
         }
     }
 
@@ -264,6 +283,7 @@ mod tests {
             resolution: Some((1920, 1080)),
             frame_rate: Some(30.0),
             track_type: TrackMediaType::Video,
+            language: None,
         };
         assert_eq!(v.track_type, TrackMediaType::Video);
         assert_eq!(v.resolution, Some((1920, 1080)));
@@ -278,16 +298,49 @@ mod tests {
             resolution: None,
             frame_rate: None,
             track_type: TrackMediaType::Audio,
+            language: Some("eng".to_string()),
         };
         assert_eq!(v.track_type, TrackMediaType::Audio);
         assert!(v.resolution.is_none());
+        assert_eq!(v.language.as_deref(), Some("eng"));
+    }
+
+    #[test]
+    fn variant_info_subtitle() {
+        let v = VariantInfo {
+            id: "sub_eng".to_string(),
+            bandwidth: 0,
+            codecs: "wvtt".to_string(),
+            resolution: None,
+            frame_rate: None,
+            track_type: TrackMediaType::Subtitle,
+            language: Some("eng".to_string()),
+        };
+        assert_eq!(v.track_type, TrackMediaType::Subtitle);
+        assert_eq!(v.codecs, "wvtt");
+        assert_eq!(v.language.as_deref(), Some("eng"));
     }
 
     #[test]
     fn track_media_type_equality() {
         assert_eq!(TrackMediaType::Video, TrackMediaType::Video);
         assert_eq!(TrackMediaType::Audio, TrackMediaType::Audio);
+        assert_eq!(TrackMediaType::Subtitle, TrackMediaType::Subtitle);
         assert_ne!(TrackMediaType::Video, TrackMediaType::Audio);
+        assert_ne!(TrackMediaType::Video, TrackMediaType::Subtitle);
+        assert_ne!(TrackMediaType::Audio, TrackMediaType::Subtitle);
+    }
+
+    #[test]
+    fn cea_caption_info_construction() {
+        let caption = CeaCaptionInfo {
+            service_name: "CC1".to_string(),
+            language: "eng".to_string(),
+            is_608: true,
+        };
+        assert_eq!(caption.service_name, "CC1");
+        assert_eq!(caption.language, "eng");
+        assert!(caption.is_608);
     }
 
     #[test]

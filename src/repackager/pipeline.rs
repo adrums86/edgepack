@@ -15,6 +15,15 @@ use crate::media::segment::{self, SegmentRewriteParams};
 use crate::repackager::progressive::ProgressiveOutput;
 use crate::repackager::{JobState, JobStatus, RepackageRequest};
 
+/// Result of a JIT setup operation.
+///
+/// Contains the manifest state (ready to render) and rewritten init segment.
+#[cfg(feature = "jit")]
+pub struct JitSetupResult {
+    pub manifest_state: ManifestState,
+    pub init_segment_data: Vec<u8>,
+}
+
 /// The main repackaging pipeline.
 ///
 /// Orchestrates: fetch source -> get DRM keys -> repackage init segment ->
@@ -682,6 +691,295 @@ impl RepackagePipeline {
         self.cache.set(&key, &json, self.config.cache.job_state_ttl)
     }
 
+    // --- JIT Packaging Methods (Phase 8) ---
+
+    /// JIT setup: fetch source manifest, init segment, and DRM keys, then cache
+    /// everything needed for subsequent per-segment JIT requests.
+    ///
+    /// This is the expensive initial operation triggered on the first GET for content.
+    /// After setup, manifests and init segments are immediately available in cache.
+    /// Media segments are processed individually on demand via `jit_segment()`.
+    #[cfg(feature = "jit")]
+    pub fn jit_setup(
+        &self,
+        content_id: &str,
+        source_config: &crate::repackager::SourceConfig,
+        output_format: OutputFormat,
+        target_scheme: EncryptionScheme,
+        base_url: &str,
+    ) -> Result<JitSetupResult> {
+        let fmt = format_str(output_format);
+        let scheme_str = target_scheme.scheme_type_str();
+        let ttl = self.config.cache.job_state_ttl;
+
+        // Check if setup is already done (idempotency)
+        let setup_key = CacheKeys::jit_setup(content_id, &fmt);
+        if self.cache.exists(&setup_key)? {
+            // Load existing manifest state and init segment
+            let state_data = self.cache.get(&CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str))?;
+            let init_data = self.cache.get(&CacheKeys::init_segment_for_scheme(content_id, &fmt, scheme_str))?;
+            if let (Some(state_bytes), Some(init_bytes)) = (state_data, init_data) {
+                let manifest_state: ManifestState = serde_json::from_slice(&state_bytes)
+                    .map_err(|e| EdgepackError::Cache(format!("deserialize manifest state: {e}")))?;
+                return Ok(JitSetupResult {
+                    manifest_state,
+                    init_segment_data: init_bytes,
+                });
+            }
+        }
+
+        // Step 1: Fetch source manifest
+        let source = self.fetch_source_manifest(&source_config.source_url)?;
+        let _total_segments = source.segment_urls.len() as u32;
+
+        // Cache source manifest for jit_segment() to use later
+        let source_json = serde_json::to_vec(&source)
+            .map_err(|e| EdgepackError::Cache(format!("serialize source manifest: {e}")))?;
+        self.cache.set(&CacheKeys::source_manifest(content_id, &fmt), &source_json, ttl)?;
+
+        // Step 2: Fetch init segment and parse protection info
+        let init_data = self.fetch_segment(&source.init_segment_url)?;
+        let protection_info = init::parse_protection_info(&init_data)?;
+
+        // Detect source encryption scheme
+        let source_scheme = if let Some(ref info) = protection_info {
+            EncryptionScheme::from_scheme_type(&info.scheme_type)
+                .ok_or_else(|| EdgepackError::Drm(format!(
+                    "unsupported encryption scheme: {:?}",
+                    std::str::from_utf8(&info.scheme_type)
+                )))?
+        } else {
+            EncryptionScheme::None
+        };
+
+        let source_pattern = protection_info.as_ref().map(|info| (
+            info.tenc.default_crypt_byte_block,
+            info.tenc.default_skip_byte_block,
+        )).unwrap_or((0, 0));
+
+        // Step 3: Extract tracks and build key mapping
+        let tracks = extract_tracks(&init_data).unwrap_or_default();
+        let key_mapping = build_track_key_mapping(&tracks, &protection_info, content_id);
+        let primary_kid = key_mapping.all_kids().into_iter().next()
+            .unwrap_or_else(|| derive_kid_from_content_id(content_id));
+
+        // Step 4: Conditional SPEKE
+        let needs_keys = source_scheme.is_encrypted() || target_scheme.is_encrypted();
+        let (key_set, source_key, content_key) = if needs_keys {
+            let key_ids = key_mapping.all_kids();
+            let ks = self.get_or_fetch_keys(content_id, &key_ids)?;
+            let key = find_key_for_kid(&ks, &primary_kid)?;
+            let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
+            (Some(ks), src, Some(key))
+        } else {
+            (None, None, None)
+        };
+
+        // Step 5: Source IV info
+        let source_iv_size = protection_info.as_ref()
+            .map(|info| info.tenc.default_per_sample_iv_size)
+            .unwrap_or(0);
+        let constant_iv = protection_info.as_ref()
+            .and_then(|info| info.tenc.default_constant_iv.clone());
+
+        // Step 6: Rewrite init segment
+        let target_iv_size = target_scheme.default_iv_size();
+        let target_pattern = target_scheme.default_video_pattern();
+        let container_format = source_config.container_format;
+        let target_key = if target_scheme.is_encrypted() { content_key.clone() } else { None };
+
+        let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
+            (true, true) => {
+                let ks = key_set.as_ref().unwrap();
+                init::rewrite_init_segment(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
+            }
+            (false, true) => {
+                let ks = key_set.as_ref().unwrap();
+                init::create_protection_info(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
+            }
+            (true, false) => {
+                init::strip_protection_info(&init_data, container_format)?
+            }
+            (false, false) => {
+                init::rewrite_ftyp_only(&init_data, container_format)?
+            }
+        };
+
+        // Step 7: Build and cache rewrite params (for jit_segment)
+        let continuation = ContinuationParams {
+            source_key: source_key.as_ref().map(|k| CachedKey {
+                kid: k.kid.to_vec(),
+                key: k.key.clone(),
+                iv: k.iv.clone(),
+            }),
+            target_key: target_key.as_ref().map(|k| CachedKey {
+                kid: k.kid.to_vec(),
+                key: k.key.clone(),
+                iv: k.iv.clone(),
+            }),
+            source_scheme,
+            target_scheme,
+            source_iv_size,
+            target_iv_size,
+            source_pattern,
+            target_pattern,
+            constant_iv,
+            container_format,
+            track_key_mapping: if key_mapping.is_multi_key() {
+                Some(key_mapping.clone())
+            } else {
+                None
+            },
+        };
+        let cont_json = serde_json::to_vec(&continuation)
+            .map_err(|e| EdgepackError::Cache(format!("serialize rewrite params: {e}")))?;
+        self.cache.set(
+            &CacheKeys::rewrite_params_for_scheme(content_id, &fmt, scheme_str),
+            &cont_json,
+            ttl,
+        )?;
+
+        // Step 8: Cache init segment
+        self.cache.set(
+            &CacheKeys::init_segment_for_scheme(content_id, &fmt, scheme_str),
+            &new_init,
+            ttl,
+        )?;
+
+        // Step 9: Build manifest state with all segment entries (but not yet processed)
+        let drm_info = if target_scheme.is_encrypted() {
+            let ks = key_set.as_ref().unwrap();
+            Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme))
+        } else {
+            None
+        };
+
+        let ext = container_format.video_segment_extension();
+        let manifest_segments: Vec<SegmentInfo> = source.segment_urls.iter().enumerate().map(|(i, _)| {
+            let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
+            SegmentInfo {
+                number: i as u32,
+                duration,
+                uri: format!("{base_url}segment_{i}{ext}"),
+                byte_size: 0, // Not yet processed — size will be updated when segment is processed
+            }
+        }).collect();
+
+        let target_duration = source.segment_durations.iter().copied()
+            .fold(0.0_f64, f64::max)
+            .max(6.0);
+
+        use crate::manifest::types::InitSegmentInfo;
+        let manifest_state = ManifestState {
+            content_id: content_id.to_string(),
+            format: output_format,
+            phase: ManifestPhase::Complete,
+            init_segment: Some(InitSegmentInfo {
+                uri: format!("{base_url}init.mp4"),
+                byte_size: new_init.len() as u64,
+            }),
+            segments: manifest_segments,
+            target_duration,
+            variants: build_variants_from_tracks(&tracks),
+            drm_info,
+            media_sequence: 0,
+            base_url: base_url.to_string(),
+            container_format,
+            cea_captions: Vec::new(),
+        };
+
+        let state_json = serde_json::to_vec(&manifest_state)
+            .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
+        self.cache.set(
+            &CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str),
+            &state_json,
+            ttl,
+        )?;
+
+        // Step 10: Set JIT setup marker
+        self.cache.set(&setup_key, b"1", ttl)?;
+
+        Ok(JitSetupResult {
+            manifest_state,
+            init_segment_data: new_init,
+        })
+    }
+
+    /// JIT segment: fetch, decrypt, re-encrypt, and cache a single media segment on demand.
+    ///
+    /// Requires `jit_setup()` to have been called first (loads source manifest and
+    /// rewrite params from cache). Returns the rewritten segment bytes.
+    #[cfg(feature = "jit")]
+    pub fn jit_segment(
+        &self,
+        content_id: &str,
+        output_format: OutputFormat,
+        target_scheme: EncryptionScheme,
+        segment_number: u32,
+    ) -> Result<Vec<u8>> {
+        let fmt = format_str(output_format);
+        let scheme_str = target_scheme.scheme_type_str();
+
+        // Check if segment is already cached
+        let seg_cache_key = CacheKeys::media_segment_for_scheme(content_id, &fmt, scheme_str, segment_number);
+        if let Some(cached) = self.cache.get(&seg_cache_key)? {
+            return Ok(cached);
+        }
+
+        // Load source manifest
+        let source_data = self.cache.get(&CacheKeys::source_manifest(content_id, &fmt))?
+            .ok_or_else(|| EdgepackError::Cache(format!(
+                "source manifest not found for {content_id}/{fmt} — call jit_setup first"
+            )))?;
+        let source: SourceManifest = serde_json::from_slice(&source_data)
+            .map_err(|e| EdgepackError::Cache(format!("deserialize source manifest: {e}")))?;
+
+        // Validate segment number
+        if segment_number as usize >= source.segment_urls.len() {
+            return Err(EdgepackError::InvalidInput(format!(
+                "segment {segment_number} out of bounds (total: {})",
+                source.segment_urls.len()
+            )));
+        }
+
+        // Load rewrite params
+        let params_data = self.cache.get(&CacheKeys::rewrite_params_for_scheme(content_id, &fmt, scheme_str))?
+            .ok_or_else(|| EdgepackError::Cache(format!(
+                "rewrite params not found for {content_id}/{fmt}_{scheme_str} — call jit_setup first"
+            )))?;
+        let continuation: ContinuationParams = serde_json::from_slice(&params_data)
+            .map_err(|e| EdgepackError::Cache(format!("deserialize rewrite params: {e}")))?;
+
+        // Fetch source segment
+        let seg_data = self.fetch_segment(&source.segment_urls[segment_number as usize])?;
+
+        // Build rewrite params
+        let source_key = continuation.source_key.as_ref().map(restore_content_key);
+        let target_key = continuation.target_key.as_ref().map(restore_content_key);
+
+        let params = SegmentRewriteParams {
+            source_key,
+            target_key,
+            source_scheme: continuation.source_scheme,
+            target_scheme: continuation.target_scheme,
+            source_iv_size: continuation.source_iv_size,
+            target_iv_size: continuation.target_iv_size,
+            source_pattern: continuation.source_pattern,
+            target_pattern: continuation.target_pattern,
+            constant_iv: continuation.constant_iv,
+            segment_number,
+        };
+
+        // Rewrite segment
+        let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+
+        // Cache the result
+        let ttl = self.config.cache.job_state_ttl;
+        self.cache.set(&seg_cache_key, &new_segment, ttl)?;
+
+        Ok(new_segment)
+    }
+
     /// Delete all sensitive cache entries for a completed job.
     ///
     /// Removes DRM keys, SPEKE response, per-scheme rewrite params, target schemes
@@ -742,6 +1040,7 @@ fn build_variants_from_tracks(tracks: &[TrackInfo]) -> Vec<VariantInfo> {
             let track_type = match t.track_type {
                 crate::media::TrackType::Video => TrackMediaType::Video,
                 crate::media::TrackType::Audio => TrackMediaType::Audio,
+                crate::media::TrackType::Subtitle => TrackMediaType::Subtitle,
                 _ => return None,
             };
             Some(VariantInfo {
@@ -751,6 +1050,7 @@ fn build_variants_from_tracks(tracks: &[TrackInfo]) -> Vec<VariantInfo> {
                 resolution: None,
                 frame_rate: None,
                 track_type,
+                language: t.language.clone(),
             })
         })
         .collect()
@@ -991,6 +1291,74 @@ impl From<CachedKeySet> for DrmKeySet {
     }
 }
 
+/// Resolve source configuration for JIT packaging.
+///
+/// Priority:
+/// 1. Redis cache (previously stored via `POST /config/source`)
+/// 2. URL pattern from `JitConfig.source_url_pattern` (replaces `{content_id}`)
+/// 3. Error if neither is available
+///
+/// The `scheme_from_url` parameter allows the URL path scheme to override
+/// the default target scheme from the source config.
+#[cfg(feature = "jit")]
+pub fn resolve_source_config(
+    cache: &dyn CacheBackend,
+    content_id: &str,
+    config: &AppConfig,
+    scheme_from_url: Option<&str>,
+) -> Result<crate::repackager::SourceConfig> {
+    use crate::repackager::SourceConfig;
+
+    // 1. Check Redis for per-content config
+    let cache_key = CacheKeys::source_config(content_id);
+    if let Some(data) = cache.get(&cache_key)? {
+        let mut source_config: SourceConfig = serde_json::from_slice(&data).map_err(|e| {
+            EdgepackError::Cache(format!("deserialize source config: {e}"))
+        })?;
+
+        // Override scheme from URL if provided
+        if let Some(scheme_str) = scheme_from_url {
+            if let Some(scheme) = parse_scheme_str(scheme_str) {
+                source_config.target_schemes = vec![scheme];
+            }
+        }
+        return Ok(source_config);
+    }
+
+    // 2. Try URL pattern from config
+    if let Some(ref pattern) = config.jit.source_url_pattern {
+        let source_url = pattern.replace("{content_id}", content_id);
+
+        let target_schemes = if let Some(scheme_str) = scheme_from_url {
+            vec![parse_scheme_str(scheme_str).unwrap_or(config.jit.default_target_scheme)]
+        } else {
+            vec![config.jit.default_target_scheme]
+        };
+
+        return Ok(SourceConfig {
+            source_url,
+            target_schemes,
+            container_format: config.jit.default_container_format,
+        });
+    }
+
+    // 3. No source configuration available
+    Err(EdgepackError::InvalidInput(format!(
+        "no source configuration for content_id: {content_id}"
+    )))
+}
+
+/// Parse a scheme string into an EncryptionScheme.
+#[cfg(feature = "jit")]
+fn parse_scheme_str(s: &str) -> Option<EncryptionScheme> {
+    match s {
+        "cenc" => Some(EncryptionScheme::Cenc),
+        "cbcs" => Some(EncryptionScheme::Cbcs),
+        "none" => Some(EncryptionScheme::None),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,6 +1392,9 @@ mod tests {
         }
         fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> crate::error::Result<()> {
             Ok(())
+        }
+        fn set_nx(&self, _key: &str, _value: &[u8], _ttl: u64) -> crate::error::Result<bool> {
+            Ok(true)
         }
         fn exists(&self, key: &str) -> crate::error::Result<bool> {
             Ok(self.inner.contains_key(key))
@@ -1370,6 +1741,7 @@ mod tests {
                 codec_string: "avc1.64001f".to_string(),
                 timescale: 90000,
                 kid: Some([0xAA; 16]),
+                language: None,
             },
             TrackInfo {
                 track_type: TrackType::Audio,
@@ -1377,6 +1749,7 @@ mod tests {
                 codec_string: "mp4a.40.2".to_string(),
                 timescale: 44100,
                 kid: Some([0xBB; 16]),
+                language: None,
             },
         ];
 
@@ -1436,6 +1809,7 @@ mod tests {
             codec_string: "avc1.64001f".to_string(),
             timescale: 90000,
             kid: Some([0xAA; 16]),
+            language: None,
         }];
 
         let info = ProtectionSchemeInfo {
@@ -1470,6 +1844,7 @@ mod tests {
             codec_string: "avc1.64001f".to_string(),
             timescale: 90000,
             kid: None,
+            language: None,
         }];
 
         let variants = build_variants_from_tracks(&tracks);
@@ -1491,6 +1866,7 @@ mod tests {
             codec_string: "mp4a.40.2".to_string(),
             timescale: 44100,
             kid: None,
+            language: None,
         }];
 
         let variants = build_variants_from_tracks(&tracks);
@@ -1511,6 +1887,7 @@ mod tests {
                 codec_string: "avc1.64001f".to_string(),
                 timescale: 90000,
                 kid: None,
+                language: None,
             },
             TrackInfo {
                 track_type: TrackType::Audio,
@@ -1518,6 +1895,7 @@ mod tests {
                 codec_string: "mp4a.40.2".to_string(),
                 timescale: 44100,
                 kid: None,
+                language: None,
             },
         ];
 
@@ -1525,6 +1903,27 @@ mod tests {
         assert_eq!(variants.len(), 2);
         assert_eq!(variants[0].track_type, TrackMediaType::Video);
         assert_eq!(variants[1].track_type, TrackMediaType::Audio);
+    }
+
+    #[test]
+    fn build_variants_from_tracks_subtitle() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+
+        let tracks = vec![TrackInfo {
+            track_type: TrackType::Subtitle,
+            track_id: 3,
+            codec_string: "wvtt".to_string(),
+            timescale: 1000,
+            kid: None,
+            language: Some("eng".to_string()),
+        }];
+
+        let variants = build_variants_from_tracks(&tracks);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].track_type, TrackMediaType::Subtitle);
+        assert_eq!(variants[0].codecs, "wvtt");
+        assert_eq!(variants[0].language.as_deref(), Some("eng"));
     }
 
     #[test]
@@ -1539,13 +1938,7 @@ mod tests {
                 codec_string: "???".to_string(),
                 timescale: 0,
                 kid: None,
-            },
-            TrackInfo {
-                track_type: TrackType::Subtitle,
-                track_id: 4,
-                codec_string: "stpp".to_string(),
-                timescale: 0,
-                kid: None,
+                language: None,
             },
         ];
 
@@ -1593,10 +1986,10 @@ mod tests {
     fn make_test_config() -> AppConfig {
         use crate::config::*;
         AppConfig {
-            redis: RedisConfig {
+            store: StoreConfig {
                 url: "unused://localhost".into(),
                 token: "test-token".into(),
-                backend: RedisBackendType::Http,
+                backend: CacheBackendType::RedisHttp,
             },
             drm: DrmConfig {
                 speke_url: crate::url::Url::parse("https://speke.test/v2").unwrap(),
@@ -1604,6 +1997,10 @@ mod tests {
                 system_ids: DrmSystemIds::default(),
             },
             cache: CacheConfig::default(),
+            jit: JitConfig::default(),
+            #[cfg(feature = "cloudflare")]
+            cloudflare_kv: None,
+            http_kv: None,
         }
     }
 
@@ -1695,6 +2092,9 @@ mod tests {
             fn set(&self, _: &str, _: &[u8], _: u64) -> crate::error::Result<()> {
                 Ok(())
             }
+            fn set_nx(&self, _: &str, _: &[u8], _: u64) -> crate::error::Result<bool> {
+                Ok(true)
+            }
             fn exists(&self, _: &str) -> crate::error::Result<bool> {
                 Ok(false)
             }
@@ -1707,5 +2107,118 @@ mod tests {
 
         // Should not panic — errors are swallowed with `let _ =`
         pipeline.cleanup_sensitive_data("test", OutputFormat::Hls, &[EncryptionScheme::Cenc]);
+    }
+
+    // --- resolve_source_config tests ---
+
+    /// In-memory cache for resolve_source_config tests.
+    #[cfg(feature = "jit")]
+    struct MemCache(std::sync::RwLock<std::collections::HashMap<String, Vec<u8>>>);
+    #[cfg(feature = "jit")]
+    impl MemCache {
+        fn new() -> Self {
+            Self(std::sync::RwLock::new(std::collections::HashMap::new()))
+        }
+    }
+    #[cfg(feature = "jit")]
+    impl CacheBackend for MemCache {
+        fn get(&self, key: &str) -> crate::error::Result<Option<Vec<u8>>> {
+            Ok(self.0.read().unwrap().get(key).cloned())
+        }
+        fn set(&self, key: &str, value: &[u8], _ttl: u64) -> crate::error::Result<()> {
+            self.0.write().unwrap().insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+        fn set_nx(&self, key: &str, value: &[u8], _ttl: u64) -> crate::error::Result<bool> {
+            let mut store = self.0.write().unwrap();
+            if store.contains_key(key) {
+                Ok(false)
+            } else {
+                store.insert(key.to_string(), value.to_vec());
+                Ok(true)
+            }
+        }
+        fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.0.read().unwrap().contains_key(key))
+        }
+        fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.0.write().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn resolve_source_config_from_redis() {
+        let cache = MemCache::new();
+        let config = make_test_config();
+
+        // Store a SourceConfig in Redis
+        let source = crate::repackager::SourceConfig {
+            source_url: "https://origin.example.com/manifest.m3u8".into(),
+            target_schemes: vec![EncryptionScheme::Cenc],
+            container_format: ContainerFormat::Cmaf,
+        };
+        let data = serde_json::to_vec(&source).unwrap();
+        cache.set(&CacheKeys::source_config("test-id"), &data, 3600).unwrap();
+
+        let resolved = resolve_source_config(&cache, "test-id", &config, None).unwrap();
+        assert_eq!(resolved.source_url, "https://origin.example.com/manifest.m3u8");
+        assert_eq!(resolved.target_schemes, vec![EncryptionScheme::Cenc]);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn resolve_source_config_from_pattern() {
+        let cache = MemCache::new();
+        let mut config = make_test_config();
+        config.jit.source_url_pattern = Some("https://origin.example.com/{content_id}/master.m3u8".into());
+
+        let resolved = resolve_source_config(&cache, "movie-123", &config, None).unwrap();
+        assert_eq!(resolved.source_url, "https://origin.example.com/movie-123/master.m3u8");
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn resolve_source_config_missing() {
+        let cache = MemCache::new();
+        let config = make_test_config();
+
+        let result = resolve_source_config(&cache, "nonexistent", &config, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no source configuration"));
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn resolve_source_config_scheme_override() {
+        let cache = MemCache::new();
+        let config = make_test_config();
+
+        // Store a SourceConfig with cenc
+        let source = crate::repackager::SourceConfig {
+            source_url: "https://origin.example.com/manifest.m3u8".into(),
+            target_schemes: vec![EncryptionScheme::Cenc],
+            container_format: ContainerFormat::Cmaf,
+        };
+        let data = serde_json::to_vec(&source).unwrap();
+        cache.set(&CacheKeys::source_config("test-id"), &data, 3600).unwrap();
+
+        // Override with cbcs from URL
+        let resolved = resolve_source_config(&cache, "test-id", &config, Some("cbcs")).unwrap();
+        assert_eq!(resolved.target_schemes, vec![EncryptionScheme::Cbcs]);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn resolve_source_config_pattern_with_scheme() {
+        let cache = MemCache::new();
+        let mut config = make_test_config();
+        config.jit.source_url_pattern = Some("https://cdn.test/{content_id}/index.m3u8".into());
+        config.jit.default_target_scheme = EncryptionScheme::Cenc;
+
+        let resolved = resolve_source_config(&cache, "vid-1", &config, Some("cbcs")).unwrap();
+        assert_eq!(resolved.source_url, "https://cdn.test/vid-1/index.m3u8");
+        assert_eq!(resolved.target_schemes, vec![EncryptionScheme::Cbcs]);
     }
 }

@@ -10,7 +10,8 @@ mod common;
 
 use edgepack::cache::CacheBackend;
 use edgepack::config::{
-    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, RedisBackendType, RedisConfig, SpekeAuth,
+    AppConfig, CacheBackendType, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, StoreConfig,
+    SpekeAuth,
 };
 use edgepack::handler::{route, HandlerContext, HttpMethod, HttpRequest, HttpResponse};
 
@@ -24,6 +25,9 @@ impl CacheBackend for StubCacheBackend {
     fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> edgepack::error::Result<()> {
         Ok(())
     }
+    fn set_nx(&self, _key: &str, _value: &[u8], _ttl: u64) -> edgepack::error::Result<bool> {
+        Ok(true)
+    }
     fn exists(&self, _key: &str) -> edgepack::error::Result<bool> {
         Ok(false)
     }
@@ -36,10 +40,10 @@ fn test_context() -> HandlerContext {
     HandlerContext {
         cache: Box::new(StubCacheBackend),
         config: AppConfig {
-            redis: RedisConfig {
+            store: StoreConfig {
                 url: "https://test-redis.example.com".into(),
                 token: "test-token".into(),
-                backend: RedisBackendType::Http,
+                backend: CacheBackendType::RedisHttp,
             },
             drm: DrmConfig {
                 speke_url: edgepack::url::Url::parse("https://drm.example.com/speke").unwrap(),
@@ -47,6 +51,10 @@ fn test_context() -> HandlerContext {
                 system_ids: DrmSystemIds::default(),
             },
             cache: CacheConfig::default(),
+            jit: JitConfig::default(),
+            #[cfg(feature = "cloudflare")]
+            cloudflare_kv: None,
+            http_kv: None,
         },
     }
 }

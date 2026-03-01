@@ -66,6 +66,18 @@ impl HttpResponse {
         }
     }
 
+    /// 202 Accepted with Retry-After header — used for JIT lock contention.
+    pub fn accepted_retry_after(body: Vec<u8>, retry_seconds: u32) -> Self {
+        Self {
+            status: 202,
+            headers: vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Retry-After".into(), retry_seconds.to_string()),
+            ],
+            body,
+        }
+    }
+
     pub fn not_found(message: &str) -> Self {
         Self {
             status: 404,
@@ -128,6 +140,12 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
         // Continuation: POST /webhook/repackage/continue (internal self-invocation)
         (HttpMethod::Post, ["webhook", "repackage", "continue"]) => {
             webhook::handle_continue(req, ctx)
+        }
+
+        // Source config: POST /config/source (JIT per-content source registration)
+        #[cfg(feature = "jit")]
+        (HttpMethod::Post, ["config", "source"]) => {
+            webhook::handle_source_config(req, ctx)
         }
 
         // Status: GET /status/{content_id}/{format}
@@ -208,7 +226,8 @@ pub(crate) fn format_str(format: OutputFormat) -> &'static str {
 pub(crate) mod test_helpers {
     use super::*;
     use crate::config::{
-        AppConfig, CacheConfig, DrmConfig, DrmSystemIds, RedisBackendType, RedisConfig, SpekeAuth,
+        AppConfig, CacheBackendType, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, StoreConfig,
+        SpekeAuth,
     };
 
     /// A stub cache backend for tests that always returns None/Ok.
@@ -221,6 +240,9 @@ pub(crate) mod test_helpers {
         fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> crate::error::Result<()> {
             Ok(())
         }
+        fn set_nx(&self, _key: &str, _value: &[u8], _ttl: u64) -> crate::error::Result<bool> {
+            Ok(true)
+        }
         fn exists(&self, _key: &str) -> crate::error::Result<bool> {
             Ok(false)
         }
@@ -231,10 +253,10 @@ pub(crate) mod test_helpers {
 
     pub fn test_config() -> AppConfig {
         AppConfig {
-            redis: RedisConfig {
+            store: StoreConfig {
                 url: "https://test-redis.example.com".into(),
                 token: "test-token".into(),
-                backend: RedisBackendType::Http,
+                backend: CacheBackendType::RedisHttp,
             },
             drm: DrmConfig {
                 speke_url: crate::url::Url::parse("https://drm.example.com/speke").unwrap(),
@@ -242,6 +264,10 @@ pub(crate) mod test_helpers {
                 system_ids: DrmSystemIds::default(),
             },
             cache: CacheConfig::default(),
+            jit: JitConfig::default(),
+            #[cfg(feature = "cloudflare")]
+            cloudflare_kv: None,
+            http_kv: None,
         }
     }
 
@@ -638,6 +664,41 @@ mod tests {
         assert_eq!(HttpMethod::Post, HttpMethod::Post);
         assert_eq!(HttpMethod::Options, HttpMethod::Options);
         assert_ne!(HttpMethod::Get, HttpMethod::Post);
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn route_config_source_post() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "movie-1",
+            "source_url": "https://origin.example.com/movie-1/manifest.m3u8"
+        });
+        let body = serde_json::to_vec(&payload).unwrap();
+        let req = HttpRequest {
+            method: HttpMethod::Post,
+            path: "/config/source".to_string(),
+            headers: vec![],
+            body: Some(body),
+        };
+        let resp = route(&req, &ctx).unwrap();
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["content_id"], "movie-1");
+    }
+
+    #[test]
+    fn route_config_source_wrong_method() {
+        let ctx = test_context();
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/config/source".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let resp = route(&req, &ctx).unwrap();
+        assert_eq!(resp.status, 404);
     }
 
     #[test]

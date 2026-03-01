@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use edgepack::cache::memory::InMemoryCacheBackend;
 use edgepack::cache::{CacheBackend, CacheKeys};
 use edgepack::config::{
-    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, RedisBackendType, RedisConfig, SpekeAuth,
+    AppConfig, CacheBackendType, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, StoreConfig,
+    SpekeAuth,
 };
 use edgepack::manifest;
 use edgepack::manifest::types::OutputFormat;
@@ -28,6 +29,8 @@ use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::repackager::pipeline::RepackagePipeline;
 use edgepack::repackager::progressive::ProgressiveOutput;
 use edgepack::repackager::{JobStatus, RepackageRequest};
+#[cfg(feature = "jit")]
+use edgepack::repackager::SourceConfig;
 
 // ─── Application State ─────────────────────────────────────────────────
 
@@ -238,12 +241,12 @@ async fn handle_repackage(
         payload.source_url.clone()
     };
 
-    // Build config — redis config is unused (in-memory cache), but required by AppConfig
+    // Build config — store config is unused (in-memory cache), but required by AppConfig
     let config = AppConfig {
-        redis: RedisConfig {
+        store: StoreConfig {
             url: "unused://localhost".into(),
             token: "unused".into(),
-            backend: RedisBackendType::Http,
+            backend: CacheBackendType::RedisHttp,
         },
         drm: DrmConfig {
             speke_url,
@@ -251,6 +254,10 @@ async fn handle_repackage(
             system_ids: DrmSystemIds::default(),
         },
         cache: CacheConfig::default(),
+        jit: JitConfig::default(),
+        #[cfg(feature = "cloudflare")]
+        cloudflare_kv: None,
+        http_kv: None,
     };
 
     let container_format_str = payload.container_format.clone();
@@ -426,6 +433,122 @@ async fn handle_output(
     }
 }
 
+// ─── JIT Source Config (feature = "jit") ─────────────────────────────────
+
+#[cfg(feature = "jit")]
+#[derive(Deserialize)]
+struct SourceConfigPayload {
+    content_id: String,
+    source_url: String,
+    #[serde(default)]
+    target_schemes: Vec<String>,
+    #[serde(default = "default_container_format")]
+    container_format: String,
+}
+
+#[cfg(feature = "jit")]
+async fn handle_source_config(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SourceConfigPayload>,
+) -> Response {
+    if payload.content_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "content_id is required".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    if payload.source_url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "source_url is required".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Parse target schemes
+    let target_schemes = if payload.target_schemes.is_empty() {
+        vec![EncryptionScheme::Cenc]
+    } else {
+        let mut schemes = Vec::with_capacity(payload.target_schemes.len());
+        for s in &payload.target_schemes {
+            let scheme = match s.as_str() {
+                "cenc" => EncryptionScheme::Cenc,
+                "cbcs" => EncryptionScheme::Cbcs,
+                "none" => EncryptionScheme::None,
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("invalid target_scheme: {s}"),
+                        }),
+                    )
+                        .into_response();
+                }
+            };
+            schemes.push(scheme);
+        }
+        schemes
+    };
+
+    let container_format = match payload.container_format.as_str() {
+        "cmaf" => edgepack::media::container::ContainerFormat::Cmaf,
+        "fmp4" => edgepack::media::container::ContainerFormat::Fmp4,
+        "iso" => edgepack::media::container::ContainerFormat::Iso,
+        _ => edgepack::media::container::ContainerFormat::Cmaf,
+    };
+
+    let source_config = SourceConfig {
+        source_url: payload.source_url,
+        target_schemes,
+        container_format,
+    };
+
+    let data = match serde_json::to_vec(&source_config) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("serialize error: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let cache_key = CacheKeys::source_config(&payload.content_id);
+    if let Err(e) = state.cache.set(&cache_key, &data, 172_800) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("cache error: {e}"),
+            }),
+        )
+            .into_response();
+    }
+
+    eprintln!(
+        "  Source config stored for {} -> {}",
+        payload.content_id,
+        source_config.source_url
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "content_id": payload.content_id,
+        })),
+    )
+        .into_response()
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 fn generate_content_id(source_url: &str) -> String {
@@ -538,7 +661,8 @@ async fn main() {
         jobs: Mutex::new(HashMap::new()),
     });
 
-    let app = Router::new()
+    #[allow(unused_mut)]
+    let mut app = Router::new()
         .route("/", get(serve_ui))
         .route("/api/repackage", post(handle_repackage))
         .route("/api/status/{content_id}/{format}", get(handle_status))
@@ -551,8 +675,15 @@ async fn main() {
         .route(
             "/repackage/{content_id}/{format}/{file}",
             get(handle_output),
-        )
-        .with_state(state);
+        );
+
+    // JIT source config endpoint (when jit feature is enabled)
+    #[cfg(feature = "jit")]
+    {
+        app = app.route("/api/config/source", post(handle_source_config));
+    }
+
+    let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3333")
         .await
