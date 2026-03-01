@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output**: a single request can produce multiple target encryption schemes simultaneously (e.g., both CBCS and CENC), each with its own init segment, media segments, manifest, and cache keys. The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), and **codec string extraction** (RFC 6381 codec strings for manifest signaling). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
 
 ## Build Commands
 
@@ -58,8 +58,9 @@ src/
 ├── media/              ISOBMFF/CMAF/fMP4 container handling
 │   ├── mod.rs          FourCC type, box_type constants, TrackType enum
 │   ├── cmaf.rs         Zero-copy MP4 box parser, builders, iterators
+│   ├── codec.rs        Codec string extraction, track metadata parsing, TrackKeyMapping
 │   ├── container.rs    ContainerFormat enum (Cmaf/Fmp4) — brands, extensions, profiles
-│   ├── init.rs         Init segment rewriting (sinf/schm/tenc/pssh + ftyp brand rewriting)
+│   ├── init.rs         Init segment rewriting (sinf/schm/tenc/pssh + ftyp brand rewriting, per-track keying)
 │   └── segment.rs      Media segment rewriting (senc/mdat decrypt+re-encrypt)
 ├── manifest/           Manifest parsing (input) and rendering (output)
 │   ├── mod.rs          render_manifest() dispatcher
@@ -131,9 +132,35 @@ The `ProgressiveOutput` state machine transitions:
 - `Live` → `Live` (each subsequent segment updates manifest)
 - `Live` → `Complete` (final segment or source EOF, manifest switches to immutable cache headers; HLS adds `#EXT-X-ENDLIST`, DASH changes `type` from `dynamic` to `static`)
 
+### Multi-Key DRM & Codec Awareness
+
+**Per-track keying:** Content can use separate encryption keys for video and audio tracks. The `TrackKeyMapping` type (in `media/codec.rs`) maps `TrackType → [u8; 16]` KIDs. Three constructors:
+- `TrackKeyMapping::single(kid)` — same KID for all tracks (backward compat with single-key content)
+- `TrackKeyMapping::per_type(video_kid, audio_kid)` — different KIDs per track type
+- `TrackKeyMapping::from_tracks(&[TrackInfo])` — auto-detects from parsed track metadata (if all tracks share a KID, returns single)
+
+**Init rewriting:** `rewrite_init_segment()` and `create_protection_info()` accept `&TrackKeyMapping`. Each track's `tenc` box gets the correct KID based on its `hdlr` handler type (`vide`/`soun`).
+
+**Multi-KID PSSH:** `build_pssh_boxes()` groups DRM system entries by `system_id` and builds one PSSH v1 box per system containing all unique KIDs. The `PsshBox` struct in `cmaf.rs` already supports `key_ids: Vec<[u8; 16]>`.
+
+**Codec string extraction:** `extract_tracks()` in `media/codec.rs` parses the moov box to extract per-track metadata (`TrackInfo`):
+- Track type from `hdlr` handler type
+- Track ID from `tkhd`
+- Timescale from `mdhd`
+- KID from `sinf → tenc` (if encrypted)
+- RFC 6381 codec string from `stsd` sample entry config boxes:
+  - H.264: `avcC` → `avc1.{profile}{constraint}{level}`
+  - H.265: `hvcC` → `hev1.{profile}.{tier}{level}.{constraint}`
+  - AAC: `esds` → `mp4a.40.{audioObjectType}`
+  - VP9: `vpcC` → `vp09.{profile}.{level}.{bitDepth}`
+  - AV1: `av1C` → `av01.{profile}.{level}{tier}.{bitDepth}`
+  - AC-3, EC-3, Opus, FLAC → simple FourCC strings
+
+**Pipeline integration:** The pipeline calls `extract_tracks()` on the source init segment, builds `TrackKeyMapping` from the track metadata, collects all unique KIDs for the SPEKE request, and threads the key mapping through init rewriting. Codec strings are populated into `VariantInfo` for manifest rendering (HLS `CODECS=` attribute, DASH `codecs=` attribute).
+
 ### SPEKE 2.0 / CPIX
 
-The `drm/speke.rs` client POSTs a CPIX XML document to the license server requesting content keys for specified KIDs and DRM system IDs (Widevine, PlayReady). The response contains encrypted content keys and PSSH box data. The `drm/cpix.rs` module handles XML building and parsing.
+The `drm/speke.rs` client POSTs a CPIX XML document to the license server requesting content keys for specified KIDs and DRM system IDs (Widevine, PlayReady). The response contains encrypted content keys and PSSH box data. The `drm/cpix.rs` module handles XML building and parsing. Multi-key requests are natively supported — the CPIX builder assigns `intendedTrackType` ("VIDEO"/"AUDIO") per KID.
 
 ## Error Handling
 
@@ -209,9 +236,9 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **652 tests** total: 538 unit tests and 114 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
+The project has **709 tests** total: 583 unit tests and 126 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
 
-### Unit Tests (538)
+### Unit Tests (583)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -220,12 +247,13 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Container format abstraction**: `ContainerFormat` enum with three variants (Cmaf, Fmp4, Iso) — extensions, brands, ftyp box building, DASH profile strings, serde roundtrips, display, from_str_value parsing
 - **Encryption correctness**: CBCS decrypt + encrypt, CENC encrypt + decrypt, scheme-agnostic roundtrips through factory functions
 - **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
-- **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not), clear→encrypted sinf injection (`create_protection_info`), encrypted→clear sinf stripping (`strip_protection_info`), clear→clear ftyp-only rewrite (`rewrite_ftyp_only`)
+- **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme, per-track KID assignment via TrackKeyMapping, multi-KID PSSH v1 generation), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not), clear→encrypted sinf injection (`create_protection_info`), encrypted→clear sinf stripping (`strip_protection_info`), clear→clear ftyp-only rewrite (`rewrite_ftyp_only`)
+- **Codec string extraction**: RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C), track metadata parsing (hdlr handler type, mdhd timescale, tkhd track_id, sinf/tenc default_kid), TrackKeyMapping construction and serde roundtrips
 - **Segment rewriting**: Four-way dispatch (encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear pass-through), scheme-aware decrypt/re-encrypt with optional source/target keys
 - **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering
 - **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
-- **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion, container format threading through ContinuationParams
+- **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through ContinuationParams, TrackKeyMapping construction and serialization, variant building from track metadata
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (all 7 CMAF/ISOBMFF extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a), all route dispatching
 - **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme/target_schemes parsing (cenc/cbcs/none, backward compat, duplicate rejection), container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
@@ -233,7 +261,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (114)
+### Integration Tests (126)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -247,6 +275,7 @@ tests/
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
 ├── handler_integration.rs    32 tests: HTTP routing (all 7 CMAF/ISOBMFF segment extensions), webhook validation, response helpers
+├── multi_key.rs              12 tests: per-track tenc, multi-KID PSSH, single-key backward compat, codec extraction, TrackKeyMapping serde, create→strip roundtrip
 └── wasm_binary_size.rs        1 test: release WASM binary stays under 600 KB size limit
 ```
 
@@ -377,7 +406,7 @@ FairPlay is recognised in both input and output. For CENC target output, FairPla
 
 ## Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–3 are complete. Remaining phases (4–6):
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–5 are complete. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -410,13 +439,16 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Sandbox UI supports "Both (Dual-Scheme)" option, writes output per scheme
 - Webhook response includes `manifest_urls: HashMap<String, String>` mapping scheme names to URLs
 
-### Phase 5: Multi-Key DRM & Codec Awareness — P0
+### ~~Phase 5: Multi-Key DRM & Codec Awareness~~ ✅ Complete
 - Multi-key SPEKE requests for multiple KIDs in a single CPIX exchange
-- Per-track sinf/tenc via `hdlr` box parsing (video vs audio keying)
-- Multi-key PSSH v1 generation, per-track manifest signaling
-- Codec string extraction from stsd (`avcC`, `hvcC`, `vpcC`, `av1C` → codec strings)
-- Timescale parsing from `mdhd`/`mvhd`
-- New: `src/media/codec.rs`
+- Per-track sinf/tenc via `hdlr` box parsing (video vs audio keying) with `TrackKeyMapping`
+- Multi-key PSSH v1 generation (grouped by system_id, all KIDs per system)
+- Codec string extraction from stsd (`avcC`, `hvcC`, `vpcC`, `av1C`, `esds` → codec strings)
+- Timescale parsing from `mdhd`
+- `TrackKeyMapping` threaded through pipeline, init rewriting, PSSH building, and ContinuationParams
+- Codec strings populated into `VariantInfo` for HLS/DASH manifest signaling
+- New: `src/media/codec.rs` (34 unit tests), `tests/multi_key.rs` (12 integration tests)
+- Result: 709 tests total (583 unit + 126 integration)
 
 ### Phase 6: Subtitle & Text Track Pass-Through — P0
 - WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4
@@ -473,5 +505,5 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - WASI Preview 1 fallback shim
 - Binary profiling with `twiggy` + `wasm-opt`
 
-Critical path: **Phase 5 → Phase 8 → Phase 17**
+Critical path: **Phase 8 → Phase 17**
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

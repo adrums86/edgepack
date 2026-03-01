@@ -71,9 +71,9 @@ flowchart LR
 
     subgraph Transform["TRANSFORM"]
         Parse["Parse Source<br/>Manifest +<br/>detect scheme"]
-        FetchKeys["Fetch Keys<br/>via SPEKE 2.0"]
-        ParseInit["Parse Init<br/>Protection Info<br/>(confirm scheme)"]
-        RewriteInit["Rewrite Init<br/>schm→target scheme<br/>tenc→target params<br/>ftyp→target format<br/>PSSH per target<br/>(±FairPlay)"]
+        FetchKeys["Fetch Keys<br/>via SPEKE 2.0<br/>(multi-KID CPIX)"]
+        ParseInit["Parse Init<br/>Protection Info +<br/>extract tracks<br/>(codec strings,<br/>per-track KIDs)"]
+        RewriteInit["Rewrite Init<br/>schm→target scheme<br/>tenc→per-track KIDs<br/>ftyp→target format<br/>multi-KID PSSH<br/>(±FairPlay)"]
         Decrypt["Decrypt mdat<br/>via create_decryptor()<br/>(CBCS or CENC)"]
         Encrypt["Re-encrypt mdat<br/>via create_encryptor()<br/>(CBCS or CENC)"]
         RewriteSenc["Rewrite senc<br/>new IVs<br/>(8B or 16B)"]
@@ -126,7 +126,7 @@ graph TD
     end
 
     subgraph Core["Core Modules"]
-        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
+        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>codec extraction<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
         DRMMod["drm/<br/>EncryptionScheme<br/>SampleDecryptor/Encryptor<br/>SPEKE client + CPIX XML<br/>CBCS decrypt+encrypt<br/>CENC encrypt+decrypt"]
         Manifest["manifest/<br/>HLS renderer<br/>DASH renderer<br/>HLS input parser<br/>DASH input parser"]
         CacheMod2["cache/<br/>CacheBackend trait<br/>EncryptedCacheBackend<br/>Redis HTTP / TCP<br/>In-memory (sandbox)"]
@@ -413,7 +413,9 @@ flowchart TD
 | **Immediate Cleanup** | All sensitive data deleted from cache the moment processing completes |
 | **Aggressive CDN Caching** | Segments and finalized manifests cached for 1 year; live manifests refresh every second |
 | **Multi-DRM** | Widevine + PlayReady for CENC output; FairPlay + Widevine + PlayReady for CBCS output |
-| **Zero External Test Dependencies** | All 526 tests use synthetic CMAF fixtures — no network or media files needed |
+| **Multi-Key DRM** | Per-track keying (separate video/audio KIDs), multi-KID PSSH v1 boxes, TrackKeyMapping |
+| **Codec Awareness** | RFC 6381 codec string extraction from init segments for manifest signaling |
+| **Zero External Test Dependencies** | All 709 tests use synthetic CMAF fixtures — no network or media files needed |
 | **WASM-Native** | Entire runtime compiles to `wasm32-wasip2` with no async runtime or system calls |
 
 ## Inputs and Outputs
@@ -431,34 +433,55 @@ flowchart TD
 
 ---
 
-## Planned Architecture Extensions
-
-The following phases extend the architecture. Phases 1 (encryption scheme) and 2 (container format) are complete.
+## Completed Architecture Extensions
 
 ### ~~Phase 2: Container Format Flexibility~~ ✅ Complete
-- `ContainerFormat` enum (`Cmaf`, `Fmp4`) in `src/media/container.rs` with brand, extension, profile helpers
+- `ContainerFormat` enum (`Cmaf`, `Fmp4`, `Iso`) in `src/media/container.rs` with brand, extension, profile helpers
 - ftyp box rewriting in init segments for output container format
-- Dynamic segment extensions (`.cmfv`/`.cmfa` for CMAF, `.m4s` for fMP4)
-- Dynamic DASH profile signaling (`cmaf:2019` for CMAF, `isoff-live:2011` for fMP4)
+- Dynamic segment extensions (`.cmfv`/`.cmfa` for CMAF, `.m4s` for fMP4, `.mp4` for ISO)
+- Dynamic DASH profile signaling (`cmaf:2019` for CMAF, `isoff-live:2011` for fMP4/ISO)
 - `container_format` threaded through `RepackageRequest` → `ContinuationParams` → `ManifestState` → `ProgressiveOutput`
-- Route handler accepts both `.cmfv` and `.m4s` segment file extensions
+- Route handler accepts all 7 CMAF/ISOBMFF segment extensions
 
-### Phase 3: Dual-Scheme Output
+### ~~Phase 3: Unencrypted Input Support~~ ✅ Complete
+- `EncryptionScheme::None` variant with `is_encrypted()` method
+- Four-way init/segment dispatch (encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear)
+- `create_protection_info()` / `strip_protection_info()` / `rewrite_ftyp_only()` in init.rs
+- Conditional SPEKE — skipped when both source and target are unencrypted
+
+### ~~Phase 4: Dual-Scheme Output~~ ✅ Complete
 - Multi-rendition pipeline: loop over target schemes, produce independent segment sets
-- Scheme-suffixed Redis cache keys
-- Dual-encrypted segments: multiple `sinf` boxes in init, sequential CBCS+CENC encryption in mdat
-- Multi-variant HLS master playlists and multi-AdaptationSet DASH MPDs
+- Scheme-qualified cache keys (`{format}_{scheme}` pattern, e.g. `hls_cenc`)
+- Scheme-qualified URL routes (e.g. `/repackage/{id}/hls_cenc/manifest`)
+- Source segments decrypted once, re-encrypted for each target scheme
+- Per-scheme `ContinuationParams`, init segments, manifest state in Redis
 
-### Phase 4: Full Remux
-- Sample-level mdat parsing via `src/media/samples.rs`
-- Segment boundary restructuring at sync points (GOP-aligned splitting)
-- Timescale extraction from mdhd/mvhd
-- Variable segment count support in progressive output state machine
+### ~~Phase 5: Multi-Key DRM & Codec Awareness~~ ✅ Complete
+- `TrackKeyMapping` type mapping `TrackType → [u8; 16]` KID for per-track keying
+- Per-track `tenc` in init segments — video and audio tracks get different KIDs via `hdlr` detection
+- Multi-KID PSSH v1 — grouped by `system_id`, all track KIDs embedded per DRM system
+- Codec string extraction via `extract_tracks()` in `src/media/codec.rs` — RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C)
+- Timescale parsing from `mdhd` box
+- Pipeline integration: `extract_tracks()` → `build_track_key_mapping()` → multi-KID SPEKE → per-track init rewriting
+- Codec strings populated into `VariantInfo` for HLS `CODECS=` and DASH `codecs=` manifest attributes
+- `TrackKeyMapping` serialized via `ContinuationParams` for split execution
 
-### Phase 5: Compatibility Validation
-- `src/media/compat.rs` for target device validation (Chromium 53+ floor)
-- Codec detection from stsd sample entries (avc1, hev1, mp4a)
-- Early pipeline rejection for incompatible configurations
+## Planned Architecture Extensions
+
+### Phase 6: Subtitle & Text Track Pass-Through — P0
+- WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4
+- CEA-608/708 manifest signaling
+- HLS subtitle rendition groups, DASH subtitle AdaptationSets
+
+### Phase 8: JIT Packaging (On-Demand GET) — P0
+- Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging)
+- Request coalescing via Redis locking
+- Hybrid mode (JIT + proactive webhook coexist)
+
+### Phase 17: CDN Provider Adapters & Binary Optimization — P0
+- Cloudflare Workers, Fastly Compute, AWS Lambda@Edge adapters
+- WASI Preview 1 fallback shim
+- Binary profiling with `twiggy` + `wasm-opt`
 
 ---
 

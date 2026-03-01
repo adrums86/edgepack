@@ -10,6 +10,7 @@ mod common;
 
 use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::drm::ContentKey;
+use edgepack::media::codec::TrackKeyMapping;
 use edgepack::media::container::ContainerFormat;
 use edgepack::media::init;
 use edgepack::media::segment::{rewrite_segment, SegmentRewriteParams};
@@ -21,9 +22,11 @@ fn clear_to_cenc_init_segment() {
     let init = common::build_clear_init_segment();
     let key_set = common::make_drm_key_set();
 
+    let key_mapping = TrackKeyMapping::single(key_set.keys[0].kid);
     let result = init::create_protection_info(
         &init,
         &key_set,
+        &key_mapping,
         EncryptionScheme::Cenc,
         8,
         (0, 0),
@@ -52,9 +55,11 @@ fn clear_to_cbcs_init_segment() {
     let init = common::build_clear_init_segment();
     let key_set = common::make_drm_key_set_with_fairplay();
 
+    let key_mapping = TrackKeyMapping::single(key_set.keys[0].kid);
     let result = init::create_protection_info(
         &init,
         &key_set,
+        &key_mapping,
         EncryptionScheme::Cbcs,
         16,
         (1, 9),
@@ -120,9 +125,11 @@ fn clear_to_encrypted_then_strip_roundtrip() {
     let key_set = common::make_drm_key_set();
 
     // Clear → Encrypted
+    let key_mapping = TrackKeyMapping::single(key_set.keys[0].kid);
     let encrypted = init::create_protection_info(
         &init,
         &key_set,
+        &key_mapping,
         EncryptionScheme::Cenc,
         8,
         (0, 0),

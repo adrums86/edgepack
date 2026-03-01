@@ -3,16 +3,16 @@
 
 # edgepack
 
-A Rust application compiled to WebAssembly for CDN edge environments. It repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4 ↔ ISO BMFF), producing progressive output manifests and segments cached at the CDN for maximum duration. Supports all encryption scheme combinations, clear content paths, automatic source scheme detection, and **dual-scheme output** — a single request can produce both CBCS and CENC renditions simultaneously, each with independent cache keys, manifests, and segments.
+A Rust application compiled to WebAssembly for CDN edge environments. It repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4 ↔ ISO BMFF), producing progressive output manifests and segments cached at the CDN for maximum duration. Supports all encryption scheme combinations, clear content paths, automatic source scheme detection, **dual-scheme output** (a single request can produce both CBCS and CENC renditions simultaneously), and **multi-key DRM** with per-track keying (separate keys for video and audio tracks) and codec string extraction for manifest signaling.
 
 ## What It Does
 
 1. **Receives a request** to repackage content (on-demand via HTTP or proactively via webhook)
-2. **Fetches DRM keys** from a license server using the SPEKE 2.0 protocol and CPIX standard
-3. **Fetches source media** (CMAF init + media segments) from the origin
+2. **Fetches DRM keys** from a license server using the SPEKE 2.0 protocol and CPIX standard (supports multi-key — separate keys for video and audio tracks)
+3. **Fetches source media** (CMAF init + media segments) from the origin, extracting per-track codec strings and key IDs
 4. **Decrypts** each segment using the source encryption scheme (CBCS or CENC, auto-detected from the init segment)
 5. **Re-encrypts** each segment for one or more target schemes (CBCS, CENC, or None — configurable per request, supports dual-scheme output)
-6. **Rewrites** init segments per target scheme (protection scheme info, PSSH boxes, DRM signaling, ftyp brands for container format)
+6. **Rewrites** init segments per target scheme (per-track protection scheme info with track-specific KIDs, multi-KID PSSH boxes, DRM signaling, ftyp brands for container format)
 7. **Outputs progressively** — writes a live manifest as soon as the first segment is ready, updates with each segment, finalises when complete
 8. **Caches aggressively** — segments are immutable with 1-year cache headers; live manifests have 1-second TTL; finalised manifests become immutable
 
@@ -67,7 +67,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **652 tests** (538 unit tests + 114 integration tests) covering every module, plus a binary size guard ensuring the release WASM stays under 600 KB. To run tests for a specific module:
+The project includes **709 tests** (583 unit tests + 126 integration tests) covering every module, plus a binary size guard ensuring the release WASM stays under 600 KB. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -83,22 +83,22 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
 ```
 
-#### Unit Test Coverage (538 tests)
+#### Unit Test Coverage (583 tests)
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
 | `error` | 16 | Error display strings, Result alias |
 | `config` | 11 | Defaults, serde roundtrips, env var loading |
 | `url` | 14 | URL parsing, join (absolute/relative/protocol-relative, normalization), serde roundtrip, authority extraction |
-| `cache` | 48 | CacheKeys formatting (incl. scheme-qualified keys), backend factory, Upstash JSON parsing, in-memory cache ops, encrypted backend (AES-256-GCM roundtrip, tamper detection, key sensitivity, key derivation) |
+| `cache` | 50 | CacheKeys formatting (incl. scheme-qualified keys), backend factory, Upstash JSON parsing, in-memory cache ops, encrypted backend (AES-256-GCM roundtrip, tamper detection, key sensitivity, key derivation) |
 | `drm` | 115 | EncryptionScheme enum (serde, bytes, from_scheme_type, from_str_value, HLS methods, IV sizes, patterns, FairPlay flags, `is_encrypted()`, None variant), SampleDecryptor/SampleEncryptor (factory dispatch, CBCS/CENC roundtrips), system IDs, CPIX XML, SPEKE client |
-| `media` | 115 | FourCC types, ISOBMFF box parsing/building/iteration, ContainerFormat enum, init segment rewriting (scheme-aware, container-format-aware, sinf injection/stripping, ftyp rewriting), segment rewriting (four-way dispatch), IV padding |
+| `media` | 149 | FourCC types, ISOBMFF box parsing/building/iteration, ContainerFormat enum, init segment rewriting (scheme-aware, container-format-aware, sinf injection/stripping, ftyp rewriting, per-track tenc with TrackKeyMapping, multi-KID PSSH generation), segment rewriting (four-way dispatch), IV padding, codec string extraction (AVC/HEVC/AAC/VP9/AV1/AC-3/EC-3/Opus/FLAC), track metadata parsing (hdlr, mdhd timescale, stsd sample entries), TrackKeyMapping (single/per_type/from_tracks, serde roundtrip) |
 | `manifest` | 93 | HLS/DASH rendering for all lifecycle phases, DRM scheme signaling, FairPlay key URI, variant streams, ISO 8601 duration, KID formatting, HLS/DASH input parsing (source scheme detection) |
-| `repackager` | 48 | Job types/serde, progressive output state machine, cache-control headers, key set caching, continuation params, pipeline execution, DRM info building, sensitive data cleanup (incl. per-scheme) |
-| `handler` | 73 | HTTP routing, path parsing incl. scheme-qualified formats (`hls_cenc`, `dash_cbcs`), segment number parsing (all 7 extensions), webhook validation (target_schemes array, backward compat, duplicate/invalid rejection), response construction |
+| `repackager` | 61 | Job types/serde, progressive output state machine, cache-control headers, key set caching, continuation params (incl. TrackKeyMapping serialization), pipeline execution, DRM info building (multi-KID PSSH per system), track key mapping construction, variant building from tracks, sensitive data cleanup (incl. per-scheme) |
+| `handler` | 69 | HTTP routing, path parsing incl. scheme-qualified formats (`hls_cenc`, `dash_cbcs`), segment number parsing (all 7 extensions), webhook validation (target_schemes array, backward compat, duplicate/invalid rejection), response construction |
 | `http_client` | 5 | Response construction, native stub errors |
 
-#### Integration Test Coverage (114 tests)
+#### Integration Test Coverage (126 tests)
 
 Integration tests live in `tests/` and use synthetic CMAF fixtures — no external services or network required.
 
@@ -110,9 +110,10 @@ Integration tests live in `tests/` and use synthetic CMAF fixtures — no extern
 | `manifest_integration` | 23 | Progressive output lifecycle (HLS+DASH, all container formats), DRM signaling, cache-control headers, ManifestState serde |
 | `handler_integration` | 32 | HTTP routing for all endpoints, webhook validation, HttpResponse helpers, method filtering |
 | `dual_scheme` | 22 | Scheme-qualified route parsing, cache key uniqueness per scheme, multi-scheme webhook payloads, backward compat, duplicate/invalid scheme rejection |
+| `multi_key` | 12 | Per-track tenc (video/audio KIDs), multi-KID PSSH generation, single-key backward compat, codec string extraction, TrackKeyMapping serde roundtrip, create→strip roundtrip, TrackKeyMapping::from_tracks |
 | `wasm_binary_size` | 1 | Release WASM binary stays under 600 KB |
 
-All tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data programmatically — no external test media files needed.
+All tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data programmatically — no external test media files needed. Multi-key tests use separate video/audio KIDs and keys to verify per-track tenc, multi-KID PSSH, and TrackKeyMapping behavior.
 
 ## Configuration
 
@@ -420,11 +421,11 @@ For dual-scheme output, each scheme gets its own directory (e.g., `hls_cenc/` an
 
 ## Project Status
 
-The runtime is fully implemented and compiles to a functional WASM component. All nine encryption scheme combinations, three container formats, and dual-scheme output are supported. The WASI component handles HTTP routing, source manifest parsing (HLS/DASH), DRM key acquisition (SPEKE 2.0), segment re-encryption, and progressive manifest output. Split execution via self-invocation chaining processes segments within WASI memory limits.
+The runtime is fully implemented and compiles to a functional WASM component. All nine encryption scheme combinations, three container formats, dual-scheme output, and multi-key DRM with per-track keying are supported. The WASI component handles HTTP routing, source manifest parsing (HLS/DASH), DRM key acquisition (SPEKE 2.0 with multi-KID CPIX), codec string extraction, per-track init segment rewriting, segment re-encryption, and progressive manifest output with codec signaling. Split execution via self-invocation chaining processes segments within WASI memory limits.
 
 ## Roadmap
 
-Phases 1–4 are complete. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. Critical path: **Phase 5 → Phase 8 → Phase 17**.
+Phases 1–5 are complete. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. Critical path: **Phase 8 → Phase 17**.
 
 ### Completed
 
@@ -434,14 +435,7 @@ Phases 1–4 are complete. The roadmap targets feature parity with Shaka Package
 | 2 | Container Format Flexibility (CMAF + fMP4 + ISO) | ✅ |
 | 3 | Unencrypted Input Support (clear content paths) | ✅ |
 | 4 | Dual-Scheme Output (multi-rendition per request) | ✅ |
-
-### Phase 5: Multi-Key DRM & Codec Awareness — P0
-
-- [ ] Multi-key SPEKE requests — fetch keys for multiple KIDs in a single CPIX exchange
-- [ ] Per-track sinf/tenc — assign different keys to video vs audio sample entries
-- [ ] Multi-key PSSH generation — embed multiple KIDs in PSSH v1 boxes
-- [ ] Codec string extraction from stsd — parse `avcC`, `hvcC`, `vpcC`, `av1C` → codec strings (e.g., `avc1.64001f`)
-- [ ] Timescale parsing from `mdhd`/`mvhd` for accurate duration computation
+| 5 | Multi-Key DRM & Codec Awareness | ✅ |
 
 ### Phase 6: Subtitle & Text Track Pass-Through — P0
 

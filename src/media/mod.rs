@@ -1,4 +1,5 @@
 pub mod cmaf;
+pub mod codec;
 pub mod container;
 pub mod init;
 pub mod segment;
@@ -45,7 +46,7 @@ pub mod box_type {
 }
 
 /// Track types as identified by the handler type in hdlr box.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrackType {
     Video,
     Audio,

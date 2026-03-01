@@ -6,7 +6,9 @@ use crate::drm::{ContentKey, DrmKeySet};
 use crate::error::{EdgepackError, Result};
 use crate::manifest::types::{
     ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo, SourceManifest,
+    TrackMediaType, VariantInfo,
 };
+use crate::media::codec::{extract_tracks, TrackInfo, TrackKeyMapping};
 use crate::media::container::ContainerFormat;
 use crate::media::init;
 use crate::media::segment::{self, SegmentRewriteParams};
@@ -69,30 +71,27 @@ impl RepackagePipeline {
             info.tenc.default_skip_byte_block,
         )).unwrap_or((0, 0));
 
-        // Step 3: Conditional SPEKE — only needed when either side is encrypted
+        // Step 3: Extract track info for codec strings and per-track KIDs
+        let tracks = extract_tracks(&init_data).unwrap_or_default();
+        let key_mapping = build_track_key_mapping(&tracks, &protection_info, content_id);
+        let primary_kid = key_mapping.all_kids().into_iter().next()
+            .unwrap_or_else(|| derive_kid_from_content_id(content_id));
+
+        // Step 4: Conditional SPEKE — only needed when either side is encrypted
         let any_target_encrypted = target_schemes.iter().any(|s| s.is_encrypted());
         let needs_keys = source_scheme.is_encrypted() || any_target_encrypted;
         let (key_set, source_key, content_key) = if needs_keys {
-            let key_ids = if let Some(ref info) = protection_info {
-                vec![info.tenc.default_kid]
-            } else {
-                let kid = derive_kid_from_content_id(content_id);
-                vec![kid]
-            };
+            let key_ids = key_mapping.all_kids();
             let ks = self.get_or_fetch_keys(content_id, &key_ids)?;
-            let kid = key_ids[0];
-            let key = find_key_for_kid(&ks, &kid)?;
+            let key = find_key_for_kid(&ks, &primary_kid)?;
             let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
             (Some(ks), src, Some(key))
         } else {
             (None, None, None)
         };
 
-        // Step 4: Per-scheme init rewriting and progressive output setup
+        // Step 5: Per-scheme init rewriting and progressive output setup
         let fmt = format_str(format);
-        let kid = protection_info.as_ref()
-            .map(|info| info.tenc.default_kid)
-            .unwrap_or_else(|| derive_kid_from_content_id(content_id));
 
         let mut outputs: Vec<(EncryptionScheme, ProgressiveOutput)> = Vec::with_capacity(target_schemes.len());
         for &target_scheme in target_schemes {
@@ -102,11 +101,11 @@ impl RepackagePipeline {
             let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
                 (true, true) => {
                     let ks = key_set.as_ref().unwrap();
-                    init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                    init::rewrite_init_segment(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
                 }
                 (false, true) => {
                     let ks = key_set.as_ref().unwrap();
-                    init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                    init::create_protection_info(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
                 }
                 (true, false) => {
                     init::strip_protection_info(&init_data, container_format)?
@@ -120,17 +119,18 @@ impl RepackagePipeline {
             let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
             let drm_info = if target_scheme.is_encrypted() {
                 let ks = key_set.as_ref().unwrap();
-                Some(build_manifest_drm_info(ks, &kid, target_scheme))
+                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme))
             } else {
                 None
             };
             let mut progressive =
                 ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
+            progressive.set_variants(build_variants_from_tracks(&tracks));
             progressive.set_init_segment(new_init);
             outputs.push((target_scheme, progressive));
         }
 
-        // Step 5: Process each media segment
+        // Step 6: Process each media segment
         let source_iv_size = protection_info.as_ref()
             .map(|info| info.tenc.default_per_sample_iv_size)
             .unwrap_or(0);
@@ -251,35 +251,31 @@ impl RepackagePipeline {
             info.tenc.default_skip_byte_block,
         )).unwrap_or((0, 0));
 
-        // Step 3: Conditional SPEKE
+        // Step 3: Extract track info and build key mapping
+        let tracks = extract_tracks(&init_data).unwrap_or_default();
+        let key_mapping = build_track_key_mapping(&tracks, &protection_info, content_id);
+        let primary_kid = key_mapping.all_kids().into_iter().next()
+            .unwrap_or_else(|| derive_kid_from_content_id(content_id));
+
+        // Step 4: Conditional SPEKE
         let any_target_encrypted = target_schemes.iter().any(|s| s.is_encrypted());
         let needs_keys = source_scheme.is_encrypted() || any_target_encrypted;
         let (key_set, source_key, content_key) = if needs_keys {
-            let key_ids = if let Some(ref info) = protection_info {
-                vec![info.tenc.default_kid]
-            } else {
-                let kid = derive_kid_from_content_id(content_id);
-                vec![kid]
-            };
+            let key_ids = key_mapping.all_kids();
             let ks = self.get_or_fetch_keys(content_id, &key_ids)?;
-            let kid = key_ids[0];
-            let key = find_key_for_kid(&ks, &kid)?;
+            let key = find_key_for_kid(&ks, &primary_kid)?;
             let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
             (Some(ks), src, Some(key))
         } else {
             (None, None, None)
         };
 
-        // Step 4: Source IV info
+        // Step 5: Source IV info
         let source_iv_size = protection_info.as_ref()
             .map(|info| info.tenc.default_per_sample_iv_size)
             .unwrap_or(0);
         let constant_iv = protection_info.as_ref()
             .and_then(|info| info.tenc.default_constant_iv.clone());
-
-        let kid = protection_info.as_ref()
-            .map(|info| info.tenc.default_kid)
-            .unwrap_or_else(|| derive_kid_from_content_id(content_id));
 
         // Step 5: Fetch first segment (once, shared across all schemes)
         self.update_job_state(content_id, format, JobState::Processing, 0, Some(total))?;
@@ -314,6 +310,11 @@ impl RepackagePipeline {
                 target_pattern,
                 constant_iv: constant_iv.clone(),
                 container_format,
+                track_key_mapping: if key_mapping.is_multi_key() {
+                    Some(key_mapping.clone())
+                } else {
+                    None
+                },
             };
             let cont_json = serde_json::to_vec(&continuation)
                 .map_err(|e| EdgepackError::Cache(format!("serialize rewrite params: {e}")))?;
@@ -327,11 +328,11 @@ impl RepackagePipeline {
             let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
                 (true, true) => {
                     let ks = key_set.as_ref().unwrap();
-                    init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                    init::rewrite_init_segment(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
                 }
                 (false, true) => {
                     let ks = key_set.as_ref().unwrap();
-                    init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                    init::create_protection_info(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
                 }
                 (true, false) => {
                     init::strip_protection_info(&init_data, container_format)?
@@ -352,7 +353,7 @@ impl RepackagePipeline {
             let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
             let drm_info = if target_scheme.is_encrypted() {
                 let ks = key_set.as_ref().unwrap();
-                Some(build_manifest_drm_info(ks, &kid, target_scheme))
+                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme))
             } else {
                 None
             };
@@ -363,6 +364,7 @@ impl RepackagePipeline {
                 drm_info,
                 container_format,
             );
+            progressive.set_variants(build_variants_from_tracks(&tracks));
             progressive.set_init_segment(new_init);
 
             // Process first segment for this scheme
@@ -702,6 +704,58 @@ impl RepackagePipeline {
     }
 }
 
+/// Build a TrackKeyMapping from extracted tracks and protection info.
+///
+/// Priority:
+/// 1. Per-track KIDs from extracted track info (multi-key encrypted)
+/// 2. Single KID from protection info tenc box (single-key encrypted)
+/// 3. Derived KID from content_id (clear source)
+fn build_track_key_mapping(
+    tracks: &[TrackInfo],
+    protection_info: &Option<crate::media::cmaf::ProtectionSchemeInfo>,
+    content_id: &str,
+) -> TrackKeyMapping {
+    // Try building from track-level KIDs first (multi-track encrypted)
+    let mapping = TrackKeyMapping::from_tracks(tracks);
+    if !mapping.all_kids().is_empty() {
+        return mapping;
+    }
+
+    // Fall back to protection_info KID (single-key encrypted)
+    if let Some(info) = protection_info {
+        return TrackKeyMapping::single(info.tenc.default_kid);
+    }
+
+    // Clear source: derive deterministic KID
+    TrackKeyMapping::single(derive_kid_from_content_id(content_id))
+}
+
+/// Build VariantInfo from extracted track metadata for manifest population.
+///
+/// Converts each video/audio track into a VariantInfo with codec string.
+/// Tracks with unknown types are skipped. Bandwidth defaults to 0
+/// (will be updated from actual segment sizes if needed).
+fn build_variants_from_tracks(tracks: &[TrackInfo]) -> Vec<VariantInfo> {
+    tracks
+        .iter()
+        .filter_map(|t| {
+            let track_type = match t.track_type {
+                crate::media::TrackType::Video => TrackMediaType::Video,
+                crate::media::TrackType::Audio => TrackMediaType::Audio,
+                _ => return None,
+            };
+            Some(VariantInfo {
+                id: t.track_id.to_string(),
+                bandwidth: 0,
+                codecs: t.codec_string.clone(),
+                resolution: None,
+                frame_rate: None,
+                track_type,
+            })
+        })
+        .collect()
+}
+
 fn find_key_for_kid(key_set: &DrmKeySet, kid: &[u8; 16]) -> Result<ContentKey> {
     key_set
         .keys
@@ -719,6 +773,7 @@ fn find_key_for_kid(key_set: &DrmKeySet, kid: &[u8; 16]) -> Result<ContentKey> {
 fn build_manifest_drm_info(
     key_set: &DrmKeySet,
     kid: &[u8; 16],
+    key_mapping: &TrackKeyMapping,
     target_scheme: EncryptionScheme,
 ) -> ManifestDrmInfo {
     let b64 = &base64::engine::general_purpose::STANDARD;
@@ -726,33 +781,11 @@ fn build_manifest_drm_info(
 
     let kid_hex: String = kid.iter().map(|b| format!("{b:02x}")).collect();
 
-    let widevine_pssh = key_set
-        .drm_systems
-        .iter()
-        .find(|d| d.system_id == crate::drm::system_ids::WIDEVINE)
-        .map(|d| {
-            let pssh_box = crate::media::cmaf::build_pssh_box(&crate::media::cmaf::PsshBox {
-                version: 1,
-                system_id: d.system_id,
-                key_ids: vec![d.kid],
-                data: d.pssh_data.clone(),
-            });
-            b64.encode(&pssh_box)
-        });
+    let widevine_pssh = build_manifest_pssh_for_system(key_set, key_mapping, crate::drm::system_ids::WIDEVINE)
+        .map(|pssh_box| b64.encode(&pssh_box));
 
-    let playready_pssh = key_set
-        .drm_systems
-        .iter()
-        .find(|d| d.system_id == crate::drm::system_ids::PLAYREADY)
-        .map(|d| {
-            let pssh_box = crate::media::cmaf::build_pssh_box(&crate::media::cmaf::PsshBox {
-                version: 1,
-                system_id: d.system_id,
-                key_ids: vec![d.kid],
-                data: d.pssh_data.clone(),
-            });
-            b64.encode(&pssh_box)
-        });
+    let playready_pssh = build_manifest_pssh_for_system(key_set, key_mapping, crate::drm::system_ids::PLAYREADY)
+        .map(|pssh_box| b64.encode(&pssh_box));
 
     let playready_pro = key_set
         .drm_systems
@@ -779,6 +812,53 @@ fn build_manifest_drm_info(
         fairplay_key_uri,
         default_kid: kid_hex,
     }
+}
+
+/// Build a PSSH box for a DRM system, merging all unique KIDs.
+///
+/// Groups DRM system entries by system_id and collects all unique KIDs
+/// from both the entries and the key_mapping. Produces one PSSH v1 box
+/// per system with all KIDs, matching the multi-KID PSSH in the init segment.
+fn build_manifest_pssh_for_system(
+    key_set: &DrmKeySet,
+    key_mapping: &TrackKeyMapping,
+    system_id: [u8; 16],
+) -> Option<Vec<u8>> {
+    let system_entries: Vec<_> = key_set
+        .drm_systems
+        .iter()
+        .filter(|d| d.system_id == system_id)
+        .collect();
+
+    if system_entries.is_empty() {
+        return None;
+    }
+
+    // Collect all unique KIDs from DRM system entries
+    let mut kid_set: Vec<[u8; 16]> = Vec::new();
+    for entry in &system_entries {
+        if !kid_set.contains(&entry.kid) {
+            kid_set.push(entry.kid);
+        }
+    }
+
+    // When multi-key, merge KIDs from key_mapping
+    if key_mapping.is_multi_key() {
+        for k in key_mapping.all_kids() {
+            if !kid_set.contains(&k) {
+                kid_set.push(k);
+            }
+        }
+    }
+
+    let pssh_box = crate::media::cmaf::build_pssh_box(&crate::media::cmaf::PsshBox {
+        version: 1,
+        system_id,
+        key_ids: kid_set,
+        data: system_entries[0].pssh_data.clone(),
+    });
+
+    Some(pssh_box)
 }
 
 fn format_str(format: OutputFormat) -> String {
@@ -851,6 +931,10 @@ struct ContinuationParams {
     constant_iv: Option<Vec<u8>>,
     #[serde(default)]
     container_format: ContainerFormat,
+    /// Per-track key mapping for multi-key support.
+    /// When `None`, falls back to single source_key/target_key (backward compat).
+    #[serde(default)]
+    track_key_mapping: Option<TrackKeyMapping>,
 }
 
 impl From<&DrmKeySet> for CachedKeySet {
@@ -1061,7 +1145,8 @@ mod tests {
     fn build_manifest_drm_info_widevine_and_playready() {
         let key_set = make_key_set();
         let kid = [0x01; 16];
-        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
+        let mapping = TrackKeyMapping::single(kid);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
 
         assert!(info.widevine_pssh.is_some());
         assert!(info.playready_pssh.is_some());
@@ -1079,7 +1164,8 @@ mod tests {
             drm_systems: vec![],
         };
         let kid = [0x01; 16];
-        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
+        let mapping = TrackKeyMapping::single(kid);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
 
         assert!(info.widevine_pssh.is_none());
         assert!(info.playready_pssh.is_none());
@@ -1095,7 +1181,8 @@ mod tests {
         };
         let kid = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
+        let mapping = TrackKeyMapping::single(kid);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
         assert_eq!(info.default_kid, "0123456789abcdef0123456789abcdef");
     }
 
@@ -1113,7 +1200,8 @@ mod tests {
             ],
         };
         let kid = [0x01; 16];
-        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cbcs);
+        let mapping = TrackKeyMapping::single(kid);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cbcs);
 
         assert_eq!(info.encryption_scheme, EncryptionScheme::Cbcs);
         assert_eq!(info.fairplay_key_uri, Some("skd://fairplay-key-uri".into()));
@@ -1133,10 +1221,58 @@ mod tests {
             ],
         };
         let kid = [0x01; 16];
-        let info = build_manifest_drm_info(&key_set, &kid, EncryptionScheme::Cenc);
+        let mapping = TrackKeyMapping::single(kid);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
 
         assert_eq!(info.encryption_scheme, EncryptionScheme::Cenc);
         assert!(info.fairplay_key_uri.is_none());
+    }
+
+    #[test]
+    fn build_manifest_drm_info_multi_kid_pssh() {
+        // Multi-key: video KID 0xAA, audio KID 0xBB
+        let key_set = DrmKeySet {
+            keys: vec![
+                ContentKey { kid: [0xAA; 16], key: vec![0x11; 16], iv: None },
+                ContentKey { kid: [0xBB; 16], key: vec![0x22; 16], iv: None },
+            ],
+            drm_systems: vec![
+                DrmSystemData {
+                    system_id: system_ids::WIDEVINE,
+                    kid: [0xAA; 16],
+                    pssh_data: vec![0x10],
+                    content_protection_data: None,
+                },
+                DrmSystemData {
+                    system_id: system_ids::WIDEVINE,
+                    kid: [0xBB; 16],
+                    pssh_data: vec![0x10],
+                    content_protection_data: None,
+                },
+            ],
+        };
+        let video_kid = [0xAA; 16];
+        let mapping = TrackKeyMapping::per_type([0xAA; 16], [0xBB; 16]);
+        let info = build_manifest_drm_info(&key_set, &video_kid, &mapping, EncryptionScheme::Cenc);
+
+        // Should have Widevine PSSH with both KIDs
+        assert!(info.widevine_pssh.is_some());
+        let pssh_b64 = info.widevine_pssh.unwrap();
+        let pssh_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &pssh_b64,
+        ).unwrap();
+
+        // PSSH v1 box should contain both KIDs (each 16 bytes)
+        // The key_ids count field is at a known offset in the PSSH box
+        // Just verify the bytes contain both KID patterns
+        assert!(pssh_bytes.windows(16).any(|w| w == [0xAA; 16]),
+            "PSSH should contain video KID");
+        assert!(pssh_bytes.windows(16).any(|w| w == [0xBB; 16]),
+            "PSSH should contain audio KID");
+
+        // Default KID should be the primary (video) KID
+        assert_eq!(info.default_kid, "aa".repeat(16));
     }
 
     #[test]
@@ -1160,6 +1296,7 @@ mod tests {
             target_pattern: (0, 0),
             constant_iv: Some(vec![0xCC; 16]),
             container_format: ContainerFormat::Fmp4,
+            track_key_mapping: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -1172,6 +1309,7 @@ mod tests {
         assert_eq!(parsed.target_pattern, (0, 0));
         assert!(parsed.constant_iv.is_some());
         assert_eq!(parsed.container_format, ContainerFormat::Fmp4);
+        assert!(parsed.track_key_mapping.is_none());
     }
 
     #[test]
@@ -1187,6 +1325,238 @@ mod tests {
         }"#;
         let parsed: ContinuationParams = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
+        // track_key_mapping should also default to None
+        assert!(parsed.track_key_mapping.is_none());
+    }
+
+    #[test]
+    fn continuation_params_with_track_key_mapping() {
+        let mapping = TrackKeyMapping::per_type([0xAA; 16], [0xBB; 16]);
+        let params = ContinuationParams {
+            source_key: None,
+            target_key: None,
+            source_scheme: EncryptionScheme::Cenc,
+            target_scheme: EncryptionScheme::Cenc,
+            source_iv_size: 8,
+            target_iv_size: 8,
+            source_pattern: (0, 0),
+            target_pattern: (0, 0),
+            constant_iv: None,
+            container_format: ContainerFormat::Cmaf,
+            track_key_mapping: Some(mapping),
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let parsed: ContinuationParams = serde_json::from_str(&json).unwrap();
+        let mapping = parsed.track_key_mapping.unwrap();
+        assert!(mapping.is_multi_key());
+        let kids = mapping.all_kids();
+        assert_eq!(kids.len(), 2);
+        assert!(kids.contains(&[0xAA; 16]));
+        assert!(kids.contains(&[0xBB; 16]));
+    }
+
+    // --- build_track_key_mapping tests ---
+
+    #[test]
+    fn build_track_key_mapping_from_encrypted_tracks() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+
+        let tracks = vec![
+            TrackInfo {
+                track_type: TrackType::Video,
+                track_id: 1,
+                codec_string: "avc1.64001f".to_string(),
+                timescale: 90000,
+                kid: Some([0xAA; 16]),
+            },
+            TrackInfo {
+                track_type: TrackType::Audio,
+                track_id: 2,
+                codec_string: "mp4a.40.2".to_string(),
+                timescale: 44100,
+                kid: Some([0xBB; 16]),
+            },
+        ];
+
+        let mapping = build_track_key_mapping(&tracks, &None, "content-1");
+        assert!(mapping.is_multi_key());
+        let kids = mapping.all_kids();
+        assert_eq!(kids.len(), 2);
+        assert!(kids.contains(&[0xAA; 16]));
+        assert!(kids.contains(&[0xBB; 16]));
+    }
+
+    #[test]
+    fn build_track_key_mapping_from_protection_info() {
+        use crate::media::cmaf::ProtectionSchemeInfo;
+        use crate::media::cmaf::TrackEncryptionBox;
+
+        let info = ProtectionSchemeInfo {
+            original_format: *b"avc1",
+            scheme_type: *b"cenc",
+            scheme_version: 0x00010000,
+            tenc: TrackEncryptionBox {
+                is_protected: 1,
+                default_per_sample_iv_size: 8,
+                default_kid: [0xCC; 16],
+                default_constant_iv: None,
+                default_crypt_byte_block: 0,
+                default_skip_byte_block: 0,
+            },
+        };
+
+        let mapping = build_track_key_mapping(&[], &Some(info), "content-1");
+        assert!(!mapping.is_multi_key());
+        assert_eq!(mapping.all_kids(), vec![[0xCC; 16]]);
+    }
+
+    #[test]
+    fn build_track_key_mapping_clear_source_derives_kid() {
+        let mapping = build_track_key_mapping(&[], &None, "test-content-id");
+        assert!(!mapping.is_multi_key());
+        let kids = mapping.all_kids();
+        assert_eq!(kids.len(), 1);
+        // Derived KID should be first 16 bytes of content_id
+        let expected = derive_kid_from_content_id("test-content-id");
+        assert_eq!(kids[0], expected);
+    }
+
+    #[test]
+    fn build_track_key_mapping_prefers_track_kids_over_protection_info() {
+        use crate::media::cmaf::ProtectionSchemeInfo;
+        use crate::media::cmaf::TrackEncryptionBox;
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+
+        let tracks = vec![TrackInfo {
+            track_type: TrackType::Video,
+            track_id: 1,
+            codec_string: "avc1.64001f".to_string(),
+            timescale: 90000,
+            kid: Some([0xAA; 16]),
+        }];
+
+        let info = ProtectionSchemeInfo {
+            original_format: *b"avc1",
+            scheme_type: *b"cenc",
+            scheme_version: 0x00010000,
+            tenc: TrackEncryptionBox {
+                is_protected: 1,
+                default_per_sample_iv_size: 8,
+                default_kid: [0xBB; 16], // Different KID
+                default_constant_iv: None,
+                default_crypt_byte_block: 0,
+                default_skip_byte_block: 0,
+            },
+        };
+
+        let mapping = build_track_key_mapping(&tracks, &Some(info), "content-1");
+        // Should use track KID, not protection_info KID
+        assert_eq!(mapping.all_kids(), vec![[0xAA; 16]]);
+    }
+
+    // --- build_variants_from_tracks tests ---
+
+    #[test]
+    fn build_variants_from_tracks_video() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+
+        let tracks = vec![TrackInfo {
+            track_type: TrackType::Video,
+            track_id: 1,
+            codec_string: "avc1.64001f".to_string(),
+            timescale: 90000,
+            kid: None,
+        }];
+
+        let variants = build_variants_from_tracks(&tracks);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].id, "1");
+        assert_eq!(variants[0].codecs, "avc1.64001f");
+        assert_eq!(variants[0].track_type, TrackMediaType::Video);
+        assert_eq!(variants[0].bandwidth, 0);
+    }
+
+    #[test]
+    fn build_variants_from_tracks_audio() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+
+        let tracks = vec![TrackInfo {
+            track_type: TrackType::Audio,
+            track_id: 2,
+            codec_string: "mp4a.40.2".to_string(),
+            timescale: 44100,
+            kid: None,
+        }];
+
+        let variants = build_variants_from_tracks(&tracks);
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].codecs, "mp4a.40.2");
+        assert_eq!(variants[0].track_type, TrackMediaType::Audio);
+    }
+
+    #[test]
+    fn build_variants_from_tracks_multi_track() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+
+        let tracks = vec![
+            TrackInfo {
+                track_type: TrackType::Video,
+                track_id: 1,
+                codec_string: "avc1.64001f".to_string(),
+                timescale: 90000,
+                kid: None,
+            },
+            TrackInfo {
+                track_type: TrackType::Audio,
+                track_id: 2,
+                codec_string: "mp4a.40.2".to_string(),
+                timescale: 44100,
+                kid: None,
+            },
+        ];
+
+        let variants = build_variants_from_tracks(&tracks);
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].track_type, TrackMediaType::Video);
+        assert_eq!(variants[1].track_type, TrackMediaType::Audio);
+    }
+
+    #[test]
+    fn build_variants_from_tracks_skips_unknown() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+
+        let tracks = vec![
+            TrackInfo {
+                track_type: TrackType::Unknown,
+                track_id: 3,
+                codec_string: "???".to_string(),
+                timescale: 0,
+                kid: None,
+            },
+            TrackInfo {
+                track_type: TrackType::Subtitle,
+                track_id: 4,
+                codec_string: "stpp".to_string(),
+                timescale: 0,
+                kid: None,
+            },
+        ];
+
+        let variants = build_variants_from_tracks(&tracks);
+        assert!(variants.is_empty());
+    }
+
+    #[test]
+    fn build_variants_from_tracks_empty() {
+        let variants = build_variants_from_tracks(&[]);
+        assert!(variants.is_empty());
     }
 
     #[test]

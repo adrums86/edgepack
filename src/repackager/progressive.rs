@@ -1,6 +1,7 @@
 use crate::manifest;
 use crate::manifest::types::{
     InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo,
+    VariantInfo,
 };
 use crate::media::container::ContainerFormat;
 
@@ -40,6 +41,11 @@ impl ProgressiveOutput {
             init_segment_data: None,
             segment_data: Vec::new(),
         }
+    }
+
+    /// Set variant/representation info (codec strings, bandwidth, etc.).
+    pub fn set_variants(&mut self, variants: Vec<VariantInfo>) {
+        self.state.variants = variants;
     }
 
     /// Set the rewritten init segment data.

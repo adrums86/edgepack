@@ -2,11 +2,13 @@ use crate::drm::scheme::EncryptionScheme;
 use crate::drm::DrmKeySet;
 use crate::error::Result;
 use crate::media::box_type;
+use crate::media::codec::TrackKeyMapping;
 use crate::media::container::ContainerFormat;
 use crate::media::cmaf::{
     self, BoxHeader, ProtectionSchemeInfo, build_pssh_box, find_child_box, iterate_boxes,
     parse_tenc, read_box_header, PsshBox,
 };
+use crate::media::TrackType;
 
 /// Rewrite an init segment to the target encryption scheme.
 ///
@@ -15,10 +17,14 @@ use crate::media::cmaf::{
 /// - `tenc` box: update pattern encryption fields for target scheme
 /// - `pssh` boxes: filter/add PSSH boxes appropriate for the target scheme
 ///
+/// The `key_mapping` parameter controls which KID is used per track type.
+/// For single-key content, use `TrackKeyMapping::single(kid)`.
+///
 /// Returns the rewritten init segment data.
 pub fn rewrite_init_segment(
     init_data: &[u8],
     key_set: &DrmKeySet,
+    key_mapping: &TrackKeyMapping,
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -37,7 +43,7 @@ pub fn rewrite_init_segment(
                 output.extend_from_slice(&container_format.build_ftyp());
             }
             t if t == &box_type::MOOV => {
-                output.extend_from_slice(&rewrite_moov(box_data, &header, key_set, target_scheme, target_iv_size, target_pattern)?);
+                output.extend_from_slice(&rewrite_moov(box_data, &header, key_set, key_mapping, target_scheme, target_iv_size, target_pattern)?);
             }
             _ => {
                 // Copy other boxes as-is
@@ -54,6 +60,7 @@ fn rewrite_moov(
     moov_data: &[u8],
     moov_header: &BoxHeader,
     key_set: &DrmKeySet,
+    key_mapping: &TrackKeyMapping,
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -71,12 +78,12 @@ fn rewrite_moov(
 
         match &header.box_type {
             t if t == &box_type::TRAK => {
-                children.extend_from_slice(&rewrite_trak(box_data, &header, key_set, target_scheme, target_iv_size, target_pattern)?);
+                children.extend_from_slice(&rewrite_trak(box_data, &header, key_mapping, target_scheme, target_iv_size, target_pattern)?);
             }
             t if t == &box_type::PSSH => {
                 // Replace all PSSH boxes with our new ones
                 if !wrote_new_pssh {
-                    children.extend_from_slice(&build_pssh_boxes(key_set, target_scheme)?);
+                    children.extend_from_slice(&build_pssh_boxes(key_set, key_mapping, target_scheme)?);
                     wrote_new_pssh = true;
                 }
                 // Skip original PSSH (including FairPlay for CENC output)
@@ -89,7 +96,7 @@ fn rewrite_moov(
 
     // If there were no PSSH boxes in the original, add them
     if !wrote_new_pssh {
-        children.extend_from_slice(&build_pssh_boxes(key_set, target_scheme)?);
+        children.extend_from_slice(&build_pssh_boxes(key_set, key_mapping, target_scheme)?);
     }
 
     let total_size = 8 + children.len() as u32;
@@ -100,15 +107,26 @@ fn rewrite_moov(
 }
 
 /// Rewrite a trak box, recursing into stbl/sinf for encryption info.
+///
+/// Detects track type from the hdlr box inside mdia and selects the
+/// appropriate KID from the key mapping.
 fn rewrite_trak(
     trak_data: &[u8],
     trak_header: &BoxHeader,
-    key_set: &DrmKeySet,
+    key_mapping: &TrackKeyMapping,
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
     let payload = &trak_data[trak_header.header_size as usize..];
+
+    // Detect track type from hdlr box to select the correct KID
+    let track_type = detect_track_type(payload);
+    let kid = key_mapping
+        .kid_for_track(track_type)
+        .copied()
+        .unwrap_or([0u8; 16]);
+
     let mut children = Vec::new();
 
     for box_result in iterate_boxes(payload) {
@@ -122,7 +140,7 @@ fn rewrite_trak(
                     box_data,
                     &header,
                     &box_type::MDIA,
-                    key_set,
+                    &kid,
                     target_scheme,
                     target_iv_size,
                     target_pattern,
@@ -141,12 +159,40 @@ fn rewrite_trak(
     Ok(output)
 }
 
+/// Detect track type by searching for hdlr box in trak → mdia.
+fn detect_track_type(trak_payload: &[u8]) -> TrackType {
+    // Look for mdia box
+    if let Some(mdia_header) = find_child_box(trak_payload, &box_type::MDIA) {
+        let mdia_end = (mdia_header.offset + mdia_header.size) as usize;
+        let mdia_data = &trak_payload[mdia_header.offset as usize..mdia_end.min(trak_payload.len())];
+        let mdia_payload = &mdia_data[mdia_header.header_size as usize..];
+
+        // Look for hdlr box inside mdia
+        if let Some(hdlr_header) = find_child_box(mdia_payload, &box_type::HDLR) {
+            let hdlr_end = (hdlr_header.offset + hdlr_header.size) as usize;
+            let hdlr_data = &mdia_payload[hdlr_header.offset as usize..hdlr_end.min(mdia_payload.len())];
+            let hdlr_payload = &hdlr_data[hdlr_header.header_size as usize..];
+            // hdlr: version(1)+flags(3)+pre_defined(4)+handler_type(4)...
+            if hdlr_payload.len() >= 12 {
+                let handler: [u8; 4] = [
+                    hdlr_payload[8],
+                    hdlr_payload[9],
+                    hdlr_payload[10],
+                    hdlr_payload[11],
+                ];
+                return TrackType::from_handler(&handler);
+            }
+        }
+    }
+    TrackType::Unknown
+}
+
 /// Generic container box rewriting — recurses into children looking for sinf.
 fn rewrite_container_box(
     box_data: &[u8],
     header: &BoxHeader,
     box_type_code: &[u8; 4],
-    key_set: &DrmKeySet,
+    kid: &[u8; 16],
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -165,14 +211,14 @@ fn rewrite_container_box(
                     child_data,
                     &child,
                     &child.box_type,
-                    key_set,
+                    kid,
                     target_scheme,
                     target_iv_size,
                     target_pattern,
                 )?);
             }
             t if t == &box_type::STSD => {
-                children.extend_from_slice(&rewrite_stsd(child_data, &child, key_set, target_scheme, target_iv_size, target_pattern)?);
+                children.extend_from_slice(&rewrite_stsd(child_data, &child, kid, target_scheme, target_iv_size, target_pattern)?);
             }
             _ => {
                 children.extend_from_slice(child_data);
@@ -191,7 +237,7 @@ fn rewrite_container_box(
 fn rewrite_stsd(
     stsd_data: &[u8],
     stsd_header: &BoxHeader,
-    key_set: &DrmKeySet,
+    kid: &[u8; 16],
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -218,7 +264,7 @@ fn rewrite_stsd(
         let entry_data = &payload[offset..entry_end.min(payload.len())];
 
         // Look for sinf inside this sample entry and rewrite it
-        entries_output.extend_from_slice(&rewrite_sample_entry(entry_data, &entry_header, key_set, target_scheme, target_iv_size, target_pattern)?);
+        entries_output.extend_from_slice(&rewrite_sample_entry(entry_data, &entry_header, kid, target_scheme, target_iv_size, target_pattern)?);
         offset = entry_end;
     }
 
@@ -236,7 +282,7 @@ fn rewrite_stsd(
 fn rewrite_sample_entry(
     entry_data: &[u8],
     entry_header: &BoxHeader,
-    key_set: &DrmKeySet,
+    kid: &[u8; 16],
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -269,7 +315,7 @@ fn rewrite_sample_entry(
             if sinf_size > 0 && pos + sinf_size <= payload.len() {
                 let sinf_data = &payload[pos..pos + sinf_size];
                 let sinf_header = read_box_header(sinf_data, 0)?;
-                output_payload.extend_from_slice(&rewrite_sinf(sinf_data, &sinf_header, key_set, target_scheme, target_iv_size, target_pattern)?);
+                output_payload.extend_from_slice(&rewrite_sinf(sinf_data, &sinf_header, kid, target_scheme, target_iv_size, target_pattern)?);
                 _found_sinf = true;
                 pos += sinf_size;
                 continue;
@@ -299,7 +345,7 @@ fn rewrite_sample_entry(
 fn rewrite_sinf(
     sinf_data: &[u8],
     sinf_header: &BoxHeader,
-    key_set: &DrmKeySet,
+    kid: &[u8; 16],
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -319,7 +365,7 @@ fn rewrite_sinf(
             }
             t if t == &box_type::SCHI => {
                 // Rewrite schi container (contains tenc)
-                children.extend_from_slice(&rewrite_schi(box_data, &header, key_set, target_iv_size, target_pattern)?);
+                children.extend_from_slice(&rewrite_schi(box_data, &header, kid, target_iv_size, target_pattern)?);
             }
             _ => {
                 // Copy frma and other boxes as-is
@@ -339,7 +385,7 @@ fn rewrite_sinf(
 fn rewrite_schi(
     schi_data: &[u8],
     schi_header: &BoxHeader,
-    key_set: &DrmKeySet,
+    kid: &[u8; 16],
     target_iv_size: u8,
     target_pattern: (u8, u8),
 ) -> Result<Vec<u8>> {
@@ -353,13 +399,8 @@ fn rewrite_schi(
 
         match &header.box_type {
             t if t == &box_type::TENC => {
-                // Rewrite tenc for target scheme
-                let kid = if let Some(key) = key_set.keys.first() {
-                    key.kid
-                } else {
-                    [0u8; 16]
-                };
-                children.extend_from_slice(&build_tenc(&kid, target_iv_size, target_pattern));
+                // Rewrite tenc for target scheme with per-track KID
+                children.extend_from_slice(&build_tenc(kid, target_iv_size, target_pattern));
             }
             _ => {
                 children.extend_from_slice(box_data);
@@ -410,10 +451,20 @@ fn build_tenc(kid: &[u8; 16], iv_size: u8, pattern: (u8, u8)) -> Vec<u8> {
 
 /// Build PSSH boxes for the target encryption scheme from the DRM key set.
 ///
-/// For CENC output: includes Widevine + PlayReady, skips FairPlay.
-/// For CBCS output: includes all DRM systems (FairPlay, Widevine, PlayReady).
-fn build_pssh_boxes(key_set: &DrmKeySet, target_scheme: EncryptionScheme) -> Result<Vec<u8>> {
+/// Groups DRM system entries by system_id and builds one PSSH v1 per system
+/// with all unique KIDs. For CENC output: skips FairPlay (CBCS only).
+///
+/// When `key_mapping` has multiple KIDs, the PSSH boxes will contain
+/// all track KIDs for each DRM system.
+fn build_pssh_boxes(
+    key_set: &DrmKeySet,
+    key_mapping: &TrackKeyMapping,
+    target_scheme: EncryptionScheme,
+) -> Result<Vec<u8>> {
     let mut output = Vec::new();
+
+    // Group DRM system entries by system_id
+    let mut systems: Vec<([u8; 16], Vec<[u8; 16]>, Vec<u8>)> = Vec::new();
 
     for drm_data in &key_set.drm_systems {
         // For CENC output, skip FairPlay (FairPlay only supports CBCS)
@@ -423,11 +474,39 @@ fn build_pssh_boxes(key_set: &DrmKeySet, target_scheme: EncryptionScheme) -> Res
             continue;
         }
 
+        // Find or create entry for this system_id
+        if let Some(entry) = systems.iter_mut().find(|(sid, _, _)| *sid == drm_data.system_id) {
+            // Add KID if not already present
+            if !entry.1.contains(&drm_data.kid) {
+                entry.1.push(drm_data.kid);
+            }
+        } else {
+            systems.push((drm_data.system_id, vec![drm_data.kid], drm_data.pssh_data.clone()));
+        }
+    }
+
+    // Build one PSSH v1 per DRM system with all KIDs
+    for (system_id, kid_list, pssh_data) in &systems {
+        // Use all KIDs from key_mapping if multi-key, otherwise use the system's KIDs
+        let kids = if key_mapping.is_multi_key() {
+            // Merge system-specific KIDs with key_mapping KIDs
+            let mapping_kids = key_mapping.all_kids();
+            let mut merged = kid_list.clone();
+            for kid in &mapping_kids {
+                if !merged.contains(kid) {
+                    merged.push(*kid);
+                }
+            }
+            merged
+        } else {
+            kid_list.clone()
+        };
+
         let pssh = PsshBox {
             version: 1,
-            system_id: drm_data.system_id,
-            key_ids: vec![drm_data.kid],
-            data: drm_data.pssh_data.clone(),
+            system_id: *system_id,
+            key_ids: kids,
+            data: pssh_data.clone(),
         };
         output.extend_from_slice(&build_pssh_box(&pssh));
     }
@@ -554,9 +633,12 @@ pub fn rewrite_ftyp_only(
 /// 2. Renaming sample entries (avc1→encv, mp4a→enca, etc.)
 /// 3. Injecting sinf/frma/schm/schi/tenc into each sample entry
 /// 4. Adding PSSH boxes to moov
+///
+/// The `key_mapping` parameter controls which KID is used per track type.
 pub fn create_protection_info(
     init_data: &[u8],
     key_set: &DrmKeySet,
+    key_mapping: &TrackKeyMapping,
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -575,7 +657,7 @@ pub fn create_protection_info(
             }
             t if t == &box_type::MOOV => {
                 output.extend_from_slice(&inject_protection_moov(
-                    box_data, &header, key_set, target_scheme, target_iv_size, target_pattern,
+                    box_data, &header, key_set, key_mapping, target_scheme, target_iv_size, target_pattern,
                 )?);
             }
             _ => {
@@ -592,6 +674,7 @@ fn inject_protection_moov(
     moov_data: &[u8],
     moov_header: &BoxHeader,
     key_set: &DrmKeySet,
+    key_mapping: &TrackKeyMapping,
     target_scheme: EncryptionScheme,
     target_iv_size: u8,
     target_pattern: (u8, u8),
@@ -606,9 +689,8 @@ fn inject_protection_moov(
 
         match &header.box_type {
             t if t == &box_type::TRAK => {
-                children.extend_from_slice(&inject_protection_container(
-                    box_data, &header, &box_type::TRAK,
-                    key_set, target_scheme, target_iv_size, target_pattern,
+                children.extend_from_slice(&inject_protection_trak(
+                    box_data, &header, key_mapping, target_scheme, target_iv_size, target_pattern,
                 )?);
             }
             _ => {
@@ -618,11 +700,61 @@ fn inject_protection_moov(
     }
 
     // Add PSSH boxes
-    children.extend_from_slice(&build_pssh_boxes(key_set, target_scheme)?);
+    children.extend_from_slice(&build_pssh_boxes(key_set, key_mapping, target_scheme)?);
 
     let total_size = 8 + children.len() as u32;
     let mut output = Vec::with_capacity(total_size as usize);
     cmaf::write_box_header(&mut output, total_size, &box_type::MOOV);
+    output.extend_from_slice(&children);
+    Ok(output)
+}
+
+/// Rewrite a trak for clear-to-encrypted: detect track type, select KID, recurse.
+fn inject_protection_trak(
+    trak_data: &[u8],
+    trak_header: &BoxHeader,
+    key_mapping: &TrackKeyMapping,
+    target_scheme: EncryptionScheme,
+    target_iv_size: u8,
+    target_pattern: (u8, u8),
+) -> Result<Vec<u8>> {
+    let payload = &trak_data[trak_header.header_size as usize..];
+
+    // Detect track type from hdlr to select the correct KID
+    let track_type = detect_track_type(payload);
+    let kid = key_mapping
+        .kid_for_track(track_type)
+        .copied()
+        .unwrap_or([0u8; 16]);
+
+    let mut children = Vec::new();
+
+    for box_result in iterate_boxes(payload) {
+        let header = box_result?;
+        let box_end = (header.offset + header.size) as usize;
+        let box_data = &payload[header.offset as usize..box_end.min(payload.len())];
+
+        match &header.box_type {
+            t if t == &box_type::MDIA || t == &box_type::MINF || t == &box_type::STBL => {
+                children.extend_from_slice(&inject_protection_container(
+                    box_data, &header, &header.box_type,
+                    &kid, target_iv_size, target_pattern, target_scheme,
+                )?);
+            }
+            t if t == &box_type::STSD => {
+                children.extend_from_slice(&inject_protection_stsd(
+                    box_data, &header, &kid, target_iv_size, target_pattern, target_scheme,
+                )?);
+            }
+            _ => {
+                children.extend_from_slice(box_data);
+            }
+        }
+    }
+
+    let total_size = 8 + children.len() as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut output, total_size, &box_type::TRAK);
     output.extend_from_slice(&children);
     Ok(output)
 }
@@ -632,10 +764,10 @@ fn inject_protection_container(
     box_data: &[u8],
     header: &BoxHeader,
     box_type_code: &[u8; 4],
-    key_set: &DrmKeySet,
-    target_scheme: EncryptionScheme,
+    kid: &[u8; 16],
     target_iv_size: u8,
     target_pattern: (u8, u8),
+    target_scheme: EncryptionScheme,
 ) -> Result<Vec<u8>> {
     let payload = &box_data[header.header_size as usize..];
     let mut children = Vec::new();
@@ -649,12 +781,12 @@ fn inject_protection_container(
             t if t == &box_type::MDIA || t == &box_type::MINF || t == &box_type::STBL => {
                 children.extend_from_slice(&inject_protection_container(
                     child_data, &child, &child.box_type,
-                    key_set, target_scheme, target_iv_size, target_pattern,
+                    kid, target_iv_size, target_pattern, target_scheme,
                 )?);
             }
             t if t == &box_type::STSD => {
                 children.extend_from_slice(&inject_protection_stsd(
-                    child_data, &child, key_set, target_iv_size, target_pattern, target_scheme,
+                    child_data, &child, kid, target_iv_size, target_pattern, target_scheme,
                 )?);
             }
             _ => {
@@ -674,7 +806,7 @@ fn inject_protection_container(
 fn inject_protection_stsd(
     stsd_data: &[u8],
     stsd_header: &BoxHeader,
-    key_set: &DrmKeySet,
+    kid: &[u8; 16],
     target_iv_size: u8,
     target_pattern: (u8, u8),
     target_scheme: EncryptionScheme,
@@ -701,13 +833,8 @@ fn inject_protection_stsd(
         // Determine the encrypted sample entry type
         let original_format = entry_header.box_type;
         if let Some(encrypted_type) = encrypted_sample_entry_type(&original_format) {
-            // Build sinf box
-            let kid = if let Some(key) = key_set.keys.first() {
-                key.kid
-            } else {
-                [0u8; 16]
-            };
-            let sinf = build_sinf(&original_format, target_scheme, &kid, target_iv_size, target_pattern);
+            // Build sinf box with per-track KID
+            let sinf = build_sinf(&original_format, target_scheme, kid, target_iv_size, target_pattern);
 
             // Rewrite: change box type to encrypted variant, append sinf
             let entry_payload = &entry_data[entry_header.header_size as usize..];
@@ -1006,6 +1133,7 @@ mod tests {
     use crate::drm::scheme::EncryptionScheme;
     use crate::drm::{system_ids, ContentKey, DrmSystemData};
     use crate::media::cmaf;
+    use crate::media::codec::TrackKeyMapping;
     use crate::media::container::ContainerFormat;
 
     fn make_key_set() -> DrmKeySet {
@@ -1030,6 +1158,10 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn make_key_mapping() -> TrackKeyMapping {
+        TrackKeyMapping::single([0x01; 16])
     }
 
     #[test]
@@ -1093,7 +1225,7 @@ mod tests {
             pssh_data: vec![0xFF],
             content_protection_data: None,
         });
-        let pssh_data = build_pssh_boxes(&key_set, EncryptionScheme::Cenc).unwrap();
+        let pssh_data = build_pssh_boxes(&key_set, &make_key_mapping(), EncryptionScheme::Cenc).unwrap();
         let mut pssh_count = 0;
         let mut pos = 0;
         while pos + 8 <= pssh_data.len() {
@@ -1119,7 +1251,7 @@ mod tests {
             pssh_data: vec![0xFF],
             content_protection_data: None,
         });
-        let pssh_data = build_pssh_boxes(&key_set, EncryptionScheme::Cbcs).unwrap();
+        let pssh_data = build_pssh_boxes(&key_set, &make_key_mapping(), EncryptionScheme::Cbcs).unwrap();
         let mut pssh_count = 0;
         let mut pos = 0;
         while pos + 8 <= pssh_data.len() {
@@ -1139,7 +1271,7 @@ mod tests {
     #[test]
     fn build_pssh_boxes_includes_key_ids() {
         let key_set = make_key_set();
-        let pssh_data = build_pssh_boxes(&key_set, EncryptionScheme::Cenc).unwrap();
+        let pssh_data = build_pssh_boxes(&key_set, &make_key_mapping(), EncryptionScheme::Cenc).unwrap();
         assert!(!pssh_data.is_empty());
         assert_eq!(&pssh_data[4..8], b"pssh");
     }
@@ -1215,7 +1347,7 @@ mod tests {
     #[test]
     fn rewrite_init_segment_empty_data() {
         let key_set = make_key_set();
-        let result = rewrite_init_segment(&[], &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default()).unwrap();
+        let result = rewrite_init_segment(&[], &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default()).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1226,7 +1358,7 @@ mod tests {
         cmaf::write_box_header(&mut data, 16, b"ftyp");
         data.extend_from_slice(b"isom\x00\x00\x02\x00");
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf).unwrap();
         assert_eq!(&result[4..8], b"ftyp");
         // ftyp is rewritten with container-format-specific brands
         let ftyp_size = u32::from_be_bytes([result[0], result[1], result[2], result[3]]) as usize;
@@ -1240,7 +1372,7 @@ mod tests {
         cmaf::write_box_header(&mut data, 16, b"ftyp");
         data.extend_from_slice(b"isom\x00\x00\x02\x00");
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf).unwrap();
         // CMAF ftyp should contain cmfc compatible brand
         assert!(result.windows(4).any(|w| w == b"cmfc"), "CMAF ftyp should contain cmfc brand");
     }
@@ -1252,7 +1384,7 @@ mod tests {
         cmaf::write_box_header(&mut data, 16, b"ftyp");
         data.extend_from_slice(b"isom\x00\x00\x02\x00");
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Fmp4).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Fmp4).unwrap();
         assert_eq!(&result[4..8], b"ftyp");
         // fMP4 ftyp should NOT contain cmfc brand
         assert!(!result.windows(4).any(|w| w == b"cmfc"), "fMP4 ftyp should not contain cmfc brand");
@@ -1271,7 +1403,7 @@ mod tests {
         cmaf::write_box_header(&mut data, moov_size, b"moov");
         data.extend_from_slice(&mvhd_data);
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default()).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::default()).unwrap();
         assert_eq!(&result[4..8], b"moov");
         let has_pssh = result.windows(4).any(|w| w == b"pssh");
         assert!(has_pssh);
@@ -1290,7 +1422,7 @@ mod tests {
         cmaf::write_box_header(&mut data, moov_size, b"moov");
         data.extend_from_slice(&mvhd_data);
 
-        let result = rewrite_init_segment(&data, &key_set, EncryptionScheme::Cbcs, 16, (1, 9), ContainerFormat::default()).unwrap();
+        let result = rewrite_init_segment(&data, &key_set, &make_key_mapping(), EncryptionScheme::Cbcs, 16, (1, 9), ContainerFormat::default()).unwrap();
         assert_eq!(&result[4..8], b"moov");
         let has_pssh = result.windows(4).any(|w| w == b"pssh");
         assert!(has_pssh);
@@ -1515,7 +1647,7 @@ mod tests {
         let init = build_clear_init(b"avc1");
         let key_set = make_key_set();
         let result = create_protection_info(
-            &init, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+            &init, &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
         ).unwrap();
 
         // Should have sinf injected
@@ -1536,7 +1668,7 @@ mod tests {
         let init = build_clear_init(b"mp4a");
         let key_set = make_key_set();
         let result = create_protection_info(
-            &init, &key_set, EncryptionScheme::Cbcs, 16, (0, 0), ContainerFormat::Cmaf,
+            &init, &key_set, &make_key_mapping(), EncryptionScheme::Cbcs, 16, (0, 0), ContainerFormat::Cmaf,
         ).unwrap();
 
         assert!(result.windows(4).any(|w| w == b"enca"));
@@ -1549,7 +1681,7 @@ mod tests {
         let init = build_clear_init(b"avc1");
         let key_set = make_key_set();
         let result = create_protection_info(
-            &init, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+            &init, &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
         ).unwrap();
 
         // schm box should contain "cenc"
@@ -1588,7 +1720,7 @@ mod tests {
         let key_set = make_key_set();
 
         let encrypted = create_protection_info(
-            &init, &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+            &init, &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
         ).unwrap();
 
         // Verify encryption was applied
@@ -1614,7 +1746,7 @@ mod tests {
     fn create_protection_info_empty_data() {
         let key_set = make_key_set();
         let result = create_protection_info(
-            &[], &key_set, EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
+            &[], &key_set, &make_key_mapping(), EncryptionScheme::Cenc, 8, (0, 0), ContainerFormat::Cmaf,
         ).unwrap();
         assert!(result.is_empty());
     }
