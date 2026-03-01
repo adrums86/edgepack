@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. The target encryption scheme and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output**: a single request can produce multiple target encryption schemes simultaneously (e.g., both CBCS and CENC), each with its own init segment, media segments, manifest, and cache keys. The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
 
 ## Build Commands
 
@@ -147,14 +147,14 @@ All HTTP transport and request handling is fully implemented:
 2. **`wasi_handler.rs`**: WASI incoming handler bridge implementing `wasi:http/incoming-handler::Guest`. Converts WASI types ↔ library types and maps errors to HTTP status codes.
 3. **`cache/redis_http.rs` → `execute_command()`**: Uses `http_client::get()` to make Upstash REST API calls. Parses JSON responses via extracted `parse_upstash_response()`.
 4. **`drm/speke.rs` → `post_cpix()`**: Uses `http_client::post()` to POST CPIX XML to license server with auth headers.
-5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. Two execution modes: `execute()` processes all segments synchronously and returns `(JobStatus, ProgressiveOutput)` with all output data in memory (used by sandbox). `execute_first()` + `execute_remaining()` is the split execution model for WASI — caches init segments, media segments, and manifest state in Redis for serving via GET handlers, with self-invocation chaining.
+5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. Two execution modes: `execute()` processes all segments synchronously and returns `(JobStatus, Vec<(EncryptionScheme, ProgressiveOutput)>)` with per-scheme output data in memory (used by sandbox). `execute_first()` + `execute_remaining()` is the split execution model for WASI — caches per-scheme init segments, media segments, and manifest state in Redis for serving via GET handlers, with self-invocation chaining. Both modes decrypt source segments once and re-encrypt for each target scheme.
 6. **`manifest/hls_input.rs` + `dash_input.rs`**: Source manifest input parsers extracting segment URLs, durations, init segment references, and live/VOD detection.
 7. **`handler/request.rs`**: All four GET handlers query Redis for cached segment data and manifest state via `HandlerContext`.
 8. **`handler/webhook.rs`**: Creates pipeline, calls `execute_first()`, fires self-invocation to `/webhook/repackage/continue`, returns 200 after first manifest publishes. Continue handler chains remaining segment processing.
 
 ## Local Sandbox
 
-The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `(JobStatus, ProgressiveOutput)` — output is written to disk directly from the `ProgressiveOutput` object, not round-tripped through cache.
+The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `(JobStatus, Vec<(EncryptionScheme, ProgressiveOutput)>)` — per-scheme output is written to disk directly from each `ProgressiveOutput` object to `sandbox/output/{content_id}/{format}_{scheme}/`, not round-tripped through cache.
 
 ### Architecture
 
@@ -180,7 +180,7 @@ cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | aw
 
 ### Output
 
-Pipeline output is written to `sandbox/output/{content_id}/{format}/` and served via the API at `/api/output/{id}/{format}/{file}` (reads directly from disk, not from cache).
+Pipeline output is written to `sandbox/output/{content_id}/{format}_{scheme}/` (e.g., `sandbox/output/sb-abc123/hls_cenc/`) and served via the API at `/api/output/{id}/{format_scheme}/{file}` (reads directly from disk, not from cache). Dual-scheme requests create separate output directories per scheme.
 
 ## Dependencies
 
@@ -209,9 +209,9 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **614 tests** total: 522 unit tests and 92 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
+The project has **652 tests** total: 538 unit tests and 114 integration tests. All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
 
-### Unit Tests (522)
+### Unit Tests (538)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -228,12 +228,12 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme, FairPlay inclusion/exclusion, container format threading through ContinuationParams
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (all 7 CMAF/ISOBMFF extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a), all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme parsing (cenc/cbcs/none), container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme/target_schemes parsing (cenc/cbcs/none, backward compat, duplicate rejection), container_format parsing (cmaf/fmp4/iso), invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgepackError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (92)
+### Integration Tests (114)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -242,6 +242,7 @@ tests/
 ├── common/
 │   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
 ├── clear_content.rs           10 tests: clear→CENC/CBCS, encrypted→clear, clear→clear (init + segment), roundtrips
+├── dual_scheme.rs             22 tests: scheme-qualified routing, cache keys, webhook multi-scheme parsing, backward compat
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
@@ -290,7 +291,7 @@ When adding new functionality, follow the existing pattern:
 | POST | `/webhook/repackage/continue` | `webhook::handle_continue` | Internal self-invocation to process remaining segments |
 | GET | `/status/{id}/{format}` | `request::handle_status_request` | Query job progress |
 
-`{format}` is `hls` or `dash`.
+`{format}` is a plain format (`hls`, `dash`) or a scheme-qualified format (`hls_cenc`, `hls_cbcs`, `dash_cenc`, `dash_cbcs`, `hls_none`, `dash_none`). Scheme-qualified routes are produced by dual-scheme requests; plain routes still work for backward compatibility (single-scheme requests).
 
 ## Environment Variables
 
@@ -308,17 +309,18 @@ When adding new functionality, follow the existing pattern:
 
 ## Redis Key Schema
 
-Keys marked with † are only written by the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) keeps output in memory via `ProgressiveOutput` and does not cache media data in Redis.
+Keys marked with † are only written by the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) keeps output in memory via `ProgressiveOutput` and does not cache media data in Redis. Keys marked with ‡ are scheme-qualified (one key per target scheme, using `{format}_{scheme}` e.g. `hls_cenc`).
 
 | Key Pattern | TTL | Content |
 |-------------|-----|---------|
 | `ep:{content_id}:keys` | 24h | Serialized DRM content keys (JSON) |
 | `ep:{content_id}:{format}:state` | 48h | JobStatus JSON (state, progress) |
-| `ep:{content_id}:{format}:manifest_state` † | 48h | ManifestState JSON (segments, phase) |
-| `ep:{content_id}:{format}:init` † | 48h | Rewritten init segment binary data |
-| `ep:{content_id}:{format}:seg:{n}` † | 48h | Rewritten media segment binary data |
+| `ep:{content_id}:{format}_{scheme}:manifest_state` †‡ | 48h | ManifestState JSON (segments, phase) |
+| `ep:{content_id}:{format}_{scheme}:init` †‡ | 48h | Rewritten init segment binary data |
+| `ep:{content_id}:{format}_{scheme}:seg:{n}` †‡ | 48h | Rewritten media segment binary data |
 | `ep:{content_id}:{format}:source` † | 48h | Source manifest metadata (segment URLs, durations, is_live) |
-| `ep:{content_id}:{format}:rewrite_params` † | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
+| `ep:{content_id}:{format}_{scheme}:rewrite_params` †‡ | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
+| `ep:{content_id}:{format}:target_schemes` † | 48h | Target schemes list (JSON array of EncryptionScheme) |
 | `ep:{content_id}:speke` | 24h | Cached SPEKE response (avoids duplicate calls) |
 
 ## Cache Security
@@ -331,7 +333,7 @@ Sensitive cache entries are protected with encryption at rest and explicit clean
 |-------------|----------|
 | `ep:{id}:keys` | Raw AES-128 content keys, KIDs, IVs |
 | `ep:{id}:speke` | Full SPEKE CPIX XML response |
-| `ep:{id}:{fmt}:rewrite_params` | Source/target encryption keys + IVs + pattern config |
+| `ep:{id}:{fmt}_{scheme}:rewrite_params` | Source/target encryption keys + IVs + pattern config (per scheme) |
 
 ### Encryption at Rest (`cache/encrypted.rs`)
 
@@ -339,12 +341,12 @@ Sensitive cache entries are protected with encryption at rest and explicit clean
 
 - **Key derivation**: `derive_key(token)` uses AES-128-ECB as a PRF — encrypts two distinct 16-byte constant blocks with the first 16 bytes of the Redis token to produce 32 bytes of key material. No SHA-256 dependency needed.
 - **Wire format**: `nonce (12 bytes) || ciphertext || tag (16 bytes)` — standard AES-GCM output.
-- **Key sensitivity**: `is_sensitive_key(key)` matches keys ending in `:keys`, `:speke`, or `:rewrite_params`.
+- **Key sensitivity**: `is_sensitive_key(key)` matches keys ending in `:keys`, `:speke`, or `:rewrite_params` (including scheme-qualified keys like `hls_cenc:rewrite_params`).
 - **Wiring**: `create_backend()` in `cache/mod.rs` automatically wraps the inner backend with `EncryptedCacheBackend`. The sandbox uses `derive_key("edgepack-sandbox")` since it has no real Redis token.
 
 ### Post-Processing Cleanup (`pipeline.rs`)
 
-`cleanup_sensitive_data()` explicitly deletes all sensitive cache entries (DRM keys, SPEKE response, rewrite params, source manifest) after the pipeline completes. It is called at three sites:
+`cleanup_sensitive_data()` explicitly deletes all sensitive cache entries (DRM keys, SPEKE response, per-scheme rewrite params, target schemes list, source manifest) after the pipeline completes. It accepts `&[EncryptionScheme]` and deletes per-scheme rewrite params for each scheme. It is called at three sites:
 
 1. **`execute()`** — after the segment loop completes (cleans up DRM keys and SPEKE response cached during key acquisition)
 2. **`execute_first()`** — inside the `if is_last` block (single-segment content)
@@ -396,12 +398,17 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Updated `ProgressiveOutput::new()` to accept `Option<ManifestDrmInfo>`
 - Result: 614 tests total (522 unit + 92 integration), including 10 new clear_content integration tests
 
-### Phase 4: Dual-Scheme Output
-- Multi-rendition: `target_schemes: Vec<EncryptionScheme>` producing separate segment sets per scheme
-- Scheme-suffixed cache keys (`ep:{id}:{fmt}:cenc:seg:{n}`)
-- Dual-encrypted segments: single segment encrypted with both CBCS and CENC (multiple sinf boxes)
-- Multi-variant HLS master playlist and multi-AdaptationSet DASH MPD
-- Estimated: ~380 new LOC, ~200 modified LOC, ~35 new tests
+### ~~Phase 4: Dual-Scheme Output~~ ✅ Complete
+- Result: 652 tests total (538 unit + 114 integration), including 22 new dual_scheme integration tests
+- Changed `RepackageRequest.target_scheme` to `target_schemes: Vec<EncryptionScheme>` with backward-compatible webhook API (`target_scheme` singular still accepted)
+- Scheme-qualified cache keys using `{format}_{scheme}` pattern (e.g. `ep:{id}:hls_cenc:seg:{n}`)
+- Scheme-qualified URL routes (e.g. `/repackage/{id}/hls_cenc/manifest`)
+- Pipeline `execute()` returns `Vec<(EncryptionScheme, ProgressiveOutput)>` — one output per scheme
+- Split execution (`execute_first()`/`execute_remaining()`) stores per-scheme continuation params, init segments, manifest state
+- Source segments decrypted once, re-encrypted for each target scheme
+- `cleanup_sensitive_data()` accepts `&[EncryptionScheme]` and deletes per-scheme rewrite params
+- Sandbox UI supports "Both (Dual-Scheme)" option, writes output per scheme
+- Webhook response includes `manifest_urls: HashMap<String, String>` mapping scheme names to URLs
 
 ### Phase 5: Full Remux (Sample-Level mdat Access)
 - Create `src/media/samples.rs` for sample-level parsing/rebuilding
@@ -417,4 +424,5 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - New error variants: `Compatibility`, `UnsupportedCodec`
 - Estimated: ~260 new LOC, ~45 modified LOC, ~30 new tests
 
-Full plan details: `.claude/plans/radiant-plotting-badger.md`
+Phase 4 plan details: `.claude/plans/crystalline-singing-bee.md`
+Full roadmap plan: `.claude/plans/radiant-plotting-badger.md`

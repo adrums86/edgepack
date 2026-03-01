@@ -96,24 +96,25 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
         }
 
         // On-demand: GET /repackage/{content_id}/{format}/manifest
+        // {format} can be "hls", "dash", "hls_cenc", "dash_cbcs", etc.
         (HttpMethod::Get, ["repackage", content_id, format, "manifest"]) => {
-            let output_format = parse_format(format)?;
-            request::handle_manifest_request(content_id, output_format, ctx)
+            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            request::handle_manifest_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
         // On-demand: GET /repackage/{content_id}/{format}/init.mp4
         (HttpMethod::Get, ["repackage", content_id, format, "init.mp4"]) => {
-            let output_format = parse_format(format)?;
-            request::handle_init_segment_request(content_id, output_format, ctx)
+            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            request::handle_init_segment_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
         // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.{ext}
         // Accepts all CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions:
         // .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a
         (HttpMethod::Get, ["repackage", content_id, format, segment_file]) => {
-            let output_format = parse_format(format)?;
+            let (output_format, scheme) = parse_format_with_scheme(format)?;
             if let Some(seg_num) = parse_segment_number(segment_file) {
-                request::handle_media_segment_request(content_id, output_format, seg_num, ctx)
+                request::handle_media_segment_request(content_id, output_format, seg_num, scheme.as_deref(), ctx)
             } else {
                 Ok(HttpResponse::not_found("unknown resource"))
             }
@@ -131,7 +132,7 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
 
         // Status: GET /status/{content_id}/{format}
         (HttpMethod::Get, ["status", content_id, format]) => {
-            let output_format = parse_format(format)?;
+            let (output_format, _scheme) = parse_format_with_scheme(format)?;
             request::handle_status_request(content_id, output_format, ctx)
         }
 
@@ -139,13 +140,41 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
     }
 }
 
-fn parse_format(s: &str) -> Result<OutputFormat> {
+/// Parse a format string that may include a scheme qualifier.
+///
+/// Examples:
+/// - `"hls"` → `(Hls, None)` (backward compat, no scheme qualifier)
+/// - `"hls_cenc"` → `(Hls, Some("cenc"))`
+/// - `"dash_cbcs"` → `(Dash, Some("cbcs"))`
+/// - `"hls_none"` → `(Hls, Some("none"))`
+fn parse_format_with_scheme(s: &str) -> Result<(OutputFormat, Option<String>)> {
+    // Try exact match first (backward compat)
     match s {
-        "hls" => Ok(OutputFormat::Hls),
-        "dash" => Ok(OutputFormat::Dash),
-        _ => Err(EdgepackError::InvalidInput(format!(
-            "unknown format: {s} (expected 'hls' or 'dash')"
-        ))),
+        "hls" => return Ok((OutputFormat::Hls, None)),
+        "dash" => return Ok((OutputFormat::Dash, None)),
+        _ => {}
+    }
+    // Try scheme-qualified: {format}_{scheme}
+    if let Some((fmt, scheme)) = s.split_once('_') {
+        let output_format = match fmt {
+            "hls" => OutputFormat::Hls,
+            "dash" => OutputFormat::Dash,
+            _ => {
+                return Err(EdgepackError::InvalidInput(format!(
+                    "unknown format: {s} (expected 'hls', 'dash', 'hls_cenc', 'dash_cbcs', etc.)"
+                )));
+            }
+        };
+        match scheme {
+            "cenc" | "cbcs" | "none" => Ok((output_format, Some(scheme.to_string()))),
+            _ => Err(EdgepackError::InvalidInput(format!(
+                "unknown scheme in format: {s} (expected 'cenc', 'cbcs', or 'none')"
+            ))),
+        }
+    } else {
+        Err(EdgepackError::InvalidInput(format!(
+            "unknown format: {s} (expected 'hls', 'dash', 'hls_cenc', 'dash_cbcs', etc.)"
+        )))
     }
 }
 
@@ -230,20 +259,41 @@ mod tests {
     use test_helpers::test_context;
 
     #[test]
-    fn parse_format_hls() {
-        assert_eq!(parse_format("hls").unwrap(), OutputFormat::Hls);
+    fn parse_format_with_scheme_plain() {
+        let (fmt, scheme) = parse_format_with_scheme("hls").unwrap();
+        assert_eq!(fmt, OutputFormat::Hls);
+        assert!(scheme.is_none());
+
+        let (fmt, scheme) = parse_format_with_scheme("dash").unwrap();
+        assert_eq!(fmt, OutputFormat::Dash);
+        assert!(scheme.is_none());
     }
 
     #[test]
-    fn parse_format_dash() {
-        assert_eq!(parse_format("dash").unwrap(), OutputFormat::Dash);
+    fn parse_format_with_scheme_qualified() {
+        let (fmt, scheme) = parse_format_with_scheme("hls_cenc").unwrap();
+        assert_eq!(fmt, OutputFormat::Hls);
+        assert_eq!(scheme.as_deref(), Some("cenc"));
+
+        let (fmt, scheme) = parse_format_with_scheme("dash_cbcs").unwrap();
+        assert_eq!(fmt, OutputFormat::Dash);
+        assert_eq!(scheme.as_deref(), Some("cbcs"));
+
+        let (fmt, scheme) = parse_format_with_scheme("hls_none").unwrap();
+        assert_eq!(fmt, OutputFormat::Hls);
+        assert_eq!(scheme.as_deref(), Some("none"));
     }
 
     #[test]
-    fn parse_format_invalid() {
-        let result = parse_format("mp4");
+    fn parse_format_with_scheme_invalid_format() {
+        let result = parse_format_with_scheme("mp4_cenc");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown format"));
+    }
+
+    #[test]
+    fn parse_format_with_scheme_invalid_scheme() {
+        let result = parse_format_with_scheme("hls_aes256");
+        assert!(result.is_err());
     }
 
     #[test]

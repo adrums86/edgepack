@@ -24,6 +24,7 @@ use edgepack::config::{
 };
 use edgepack::manifest;
 use edgepack::manifest::types::OutputFormat;
+use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::repackager::pipeline::RepackagePipeline;
 use edgepack::repackager::progressive::ProgressiveOutput;
 use edgepack::repackager::{JobStatus, RepackageRequest};
@@ -54,18 +55,16 @@ struct RepackagePayload {
     #[serde(default)]
     speke_api_key_header: String,
     output_format: String,
-    #[serde(default = "default_target_scheme")]
-    target_scheme: String,
+    #[serde(default)]
+    target_schemes: Vec<String>,
+    #[serde(default)]
+    target_scheme: Option<String>,
     #[serde(default = "default_container_format")]
     container_format: String,
 }
 
 fn default_speke_auth_type() -> String {
     "bearer".into()
-}
-
-fn default_target_scheme() -> String {
-    "cenc".into()
 }
 
 fn default_container_format() -> String {
@@ -117,20 +116,32 @@ async fn handle_repackage(
         }
     };
 
-    let target_scheme = match payload.target_scheme.as_str() {
-        "cenc" => edgepack::drm::scheme::EncryptionScheme::Cenc,
-        "cbcs" => edgepack::drm::scheme::EncryptionScheme::Cbcs,
-        "none" => edgepack::drm::scheme::EncryptionScheme::None,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "target_scheme must be 'cenc', 'cbcs', or 'none'".into(),
-                }),
-            )
-                .into_response();
-        }
+    // Resolve target schemes: target_schemes (array) > target_scheme (single) > default ["cenc"]
+    let scheme_strings = if !payload.target_schemes.is_empty() {
+        payload.target_schemes.clone()
+    } else if let Some(ref single) = payload.target_scheme {
+        vec![single.clone()]
+    } else {
+        vec!["cenc".to_string()]
     };
+    let mut target_schemes = Vec::with_capacity(scheme_strings.len());
+    for s in &scheme_strings {
+        let scheme = match s.as_str() {
+            "cenc" => EncryptionScheme::Cenc,
+            "cbcs" => EncryptionScheme::Cbcs,
+            "none" => EncryptionScheme::None,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("target_scheme must be 'cenc', 'cbcs', or 'none' (got '{s}')"),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        target_schemes.push(scheme);
+    }
 
     let container_format = match payload.container_format.as_str() {
         "cmaf" => edgepack::media::container::ContainerFormat::Cmaf,
@@ -147,9 +158,10 @@ async fn handle_repackage(
         }
     };
 
-    // SPEKE configuration — only needed when target scheme requires encryption.
+    // SPEKE configuration — only needed when any target scheme requires encryption.
     // For clear (None) output, use a dummy SPEKE config since it won't be called.
-    let (speke_url, speke_auth) = if target_scheme.is_encrypted() {
+    let any_target_encrypted = target_schemes.iter().any(|s| s.is_encrypted());
+    let (speke_url, speke_auth) = if any_target_encrypted {
         let url = match edgepack::url::Url::parse(&payload.speke_url) {
             Ok(u) => u,
             Err(e) => {
@@ -246,7 +258,7 @@ async fn handle_repackage(
         content_id: content_id.clone(),
         source_url,
         output_format,
-        target_scheme,
+        target_schemes: target_schemes.clone(),
         container_format,
         key_ids: vec![],
     };
@@ -277,16 +289,20 @@ async fn handle_repackage(
         );
         let pipeline = RepackagePipeline::new(config, Box::new(encrypted_cache));
         match pipeline.execute(&request) {
-            Ok((status, output)) => {
+            Ok((status, outputs)) => {
                 eprintln!(
-                    "  Pipeline complete: {}/{} — {} segments",
+                    "  Pipeline complete: {}/{} — {} segments, {} scheme(s)",
                     status.content_id,
                     fmt_str,
-                    status.segments_completed
+                    status.segments_completed,
+                    outputs.len()
                 );
-                // Write output to disk
-                if let Err(e) = write_output_to_disk(&cid, fmt, &output) {
-                    eprintln!("  Warning: failed to write output to disk: {e}");
+                // Write output per scheme
+                for (scheme, output) in &outputs {
+                    let scheme_str = scheme.scheme_type_str();
+                    if let Err(e) = write_output_to_disk(&cid, fmt, scheme_str, output) {
+                        eprintln!("  Warning: failed to write {scheme_str} output to disk: {e}");
+                    }
                 }
             }
             Err(e) => {
@@ -330,7 +346,7 @@ async fn handle_status(
             Ok(status) => {
                 let state_str = format!("{:?}", status.state);
                 let output_dir = if state_str == "Complete" {
-                    Some(format!("sandbox/output/{content_id}/{fmt}/"))
+                    Some(format!("sandbox/output/{content_id}/{fmt}_*/"))
                 } else {
                     None
                 };
@@ -371,16 +387,15 @@ async fn handle_status(
 }
 
 async fn handle_output(
-    Path((content_id, format, file)): Path<(String, String, String)>,
+    Path((content_id, format_scheme, file)): Path<(String, String, String)>,
 ) -> Response {
-    let fmt = match format.as_str() {
-        "hls" | "dash" => format.as_str(),
-        _ => {
-            return (StatusCode::BAD_REQUEST, "invalid format").into_response();
-        }
-    };
+    // format_scheme can be "hls_cenc", "dash_cbcs", etc.
+    let valid = format_scheme.starts_with("hls") || format_scheme.starts_with("dash");
+    if !valid {
+        return (StatusCode::BAD_REQUEST, "invalid format").into_response();
+    }
 
-    let out_dir = PathBuf::from(format!("sandbox/output/{content_id}/{fmt}"));
+    let out_dir = PathBuf::from(format!("sandbox/output/{content_id}/{format_scheme}"));
     let file_path = out_dir.join(&file);
 
     // For bare "manifest" request, try both extensions
@@ -465,6 +480,7 @@ async fn start_local_file_server(path: &str) -> Result<String, String> {
 fn write_output_to_disk(
     content_id: &str,
     format: OutputFormat,
+    scheme: &str,
     output: &ProgressiveOutput,
 ) -> Result<(), String> {
     let fmt_str = match format {
@@ -472,7 +488,7 @@ fn write_output_to_disk(
         OutputFormat::Dash => "dash",
     };
 
-    let out_dir = PathBuf::from(format!("sandbox/output/{content_id}/{fmt_str}"));
+    let out_dir = PathBuf::from(format!("sandbox/output/{content_id}/{fmt_str}_{scheme}"));
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("create output dir: {e}"))?;
 
@@ -782,6 +798,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
     <div class="radio-group">
       <label><input type="radio" name="target-scheme" value="cenc" checked> CENC (AES-CTR)</label>
       <label><input type="radio" name="target-scheme" value="cbcs"> CBCS (AES-CBC)</label>
+      <label><input type="radio" name="target-scheme" value="both"> Both (Dual-Scheme)</label>
       <label><input type="radio" name="target-scheme" value="none"> None (Clear)</label>
     </div>
 
@@ -869,6 +886,7 @@ document.querySelectorAll('input[name="target-scheme"]').forEach(radio => {
       spekeSection.classList.add('hidden');
       clearHint.classList.remove('hidden');
     } else {
+      // 'cenc', 'cbcs', and 'both' all need SPEKE
       spekeSection.classList.remove('hidden');
       clearHint.classList.add('hidden');
     }
@@ -883,8 +901,10 @@ async function startRepackage() {
   btn.textContent = 'Starting...';
 
   const outputFormat = document.querySelector('input[name="output-format"]:checked').value;
-  const targetScheme = document.querySelector('input[name="target-scheme"]:checked').value;
+  const targetSchemeValue = document.querySelector('input[name="target-scheme"]:checked').value;
   const containerFormat = document.querySelector('input[name="container-format"]:checked').value;
+
+  const targetSchemes = targetSchemeValue === 'both' ? ['cenc', 'cbcs'] : [targetSchemeValue];
 
   const body = {
     source_url: sourceInput.value,
@@ -893,7 +913,7 @@ async function startRepackage() {
     speke_auth_value: authValue.value,
     speke_api_key_header: document.getElementById('api-key-header').value,
     output_format: outputFormat,
-    target_scheme: targetScheme,
+    target_schemes: targetSchemes,
     container_format: containerFormat,
   };
 

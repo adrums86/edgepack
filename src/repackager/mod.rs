@@ -15,9 +15,10 @@ pub struct RepackageRequest {
     pub source_url: String,
     /// Desired output format.
     pub output_format: OutputFormat,
-    /// Target encryption scheme (default: CENC for backward compatibility).
-    #[serde(default = "default_target_scheme")]
-    pub target_scheme: EncryptionScheme,
+    /// Target encryption schemes. Multiple schemes produce separate output per scheme.
+    /// Default: `[Cenc]` for backward compatibility.
+    #[serde(default = "default_target_schemes")]
+    pub target_schemes: Vec<EncryptionScheme>,
     /// Target container format (default: CMAF for backward compatibility).
     #[serde(default)]
     pub container_format: ContainerFormat,
@@ -25,8 +26,8 @@ pub struct RepackageRequest {
     pub key_ids: Vec<String>,
 }
 
-fn default_target_scheme() -> EncryptionScheme {
-    EncryptionScheme::Cenc
+fn default_target_schemes() -> Vec<EncryptionScheme> {
+    vec![EncryptionScheme::Cenc]
 }
 
 /// Status of a repackaging job.
@@ -64,13 +65,13 @@ mod tests {
             content_id: "movie-123".to_string(),
             source_url: "https://cdn.example.com/manifest.m3u8".to_string(),
             output_format: OutputFormat::Hls,
-            target_scheme: EncryptionScheme::Cenc,
+            target_schemes: vec![EncryptionScheme::Cenc],
             container_format: ContainerFormat::default(),
             key_ids: vec!["aabbccdd".to_string()],
         };
         assert_eq!(req.content_id, "movie-123");
         assert_eq!(req.output_format, OutputFormat::Hls);
-        assert_eq!(req.target_scheme, EncryptionScheme::Cenc);
+        assert_eq!(req.target_schemes, vec![EncryptionScheme::Cenc]);
         assert_eq!(req.container_format, ContainerFormat::Cmaf);
         assert_eq!(req.key_ids.len(), 1);
     }
@@ -81,7 +82,7 @@ mod tests {
             content_id: "test".into(),
             source_url: "https://example.com/source.mpd".into(),
             output_format: OutputFormat::Dash,
-            target_scheme: EncryptionScheme::Cbcs,
+            target_schemes: vec![EncryptionScheme::Cbcs],
             container_format: ContainerFormat::Fmp4,
             key_ids: vec![],
         };
@@ -89,18 +90,35 @@ mod tests {
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, "test");
         assert_eq!(parsed.output_format, OutputFormat::Dash);
-        assert_eq!(parsed.target_scheme, EncryptionScheme::Cbcs);
+        assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cbcs]);
         assert_eq!(parsed.container_format, ContainerFormat::Fmp4);
         assert!(parsed.key_ids.is_empty());
     }
 
     #[test]
-    fn repackage_request_default_target_scheme() {
-        // When target_scheme is missing from JSON, it should default to Cenc
+    fn repackage_request_default_target_schemes() {
+        // When target_schemes is missing from JSON, it should default to [Cenc]
         let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
         let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.target_scheme, EncryptionScheme::Cenc);
+        assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cenc]);
         assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
+    }
+
+    #[test]
+    fn repackage_request_multi_scheme() {
+        let req = RepackageRequest {
+            content_id: "dual".into(),
+            source_url: "https://example.com/source.m3u8".into(),
+            output_format: OutputFormat::Hls,
+            target_schemes: vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs],
+            container_format: ContainerFormat::default(),
+            key_ids: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.target_schemes.len(), 2);
+        assert_eq!(parsed.target_schemes[0], EncryptionScheme::Cenc);
+        assert_eq!(parsed.target_schemes[1], EncryptionScheme::Cbcs);
     }
 
     #[test]
@@ -162,7 +180,7 @@ mod tests {
             content_id: "empty".into(),
             source_url: "https://example.com/source".into(),
             output_format: OutputFormat::Hls,
-            target_scheme: EncryptionScheme::Cenc,
+            target_schemes: vec![EncryptionScheme::Cenc],
             container_format: ContainerFormat::default(),
             key_ids: vec![],
         };

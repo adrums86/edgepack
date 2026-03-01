@@ -46,6 +46,16 @@ impl EncryptionScheme {
         }
     }
 
+    /// Parse an encryption scheme from a string value ("cenc", "cbcs", "none").
+    pub fn from_str_value(s: &str) -> Option<Self> {
+        match s {
+            "cenc" => Some(EncryptionScheme::Cenc),
+            "cbcs" => Some(EncryptionScheme::Cbcs),
+            "none" => Some(EncryptionScheme::None),
+            _ => None,
+        }
+    }
+
     /// Returns the scheme type as a string (for manifests and logging).
     pub fn scheme_type_str(&self) -> &'static str {
         match self {
@@ -310,6 +320,28 @@ mod tests {
         let json = serde_json::to_string(&scheme).unwrap();
         let parsed: EncryptionScheme = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, scheme);
+    }
+
+    #[test]
+    fn from_str_value_valid() {
+        assert_eq!(EncryptionScheme::from_str_value("cenc"), Some(EncryptionScheme::Cenc));
+        assert_eq!(EncryptionScheme::from_str_value("cbcs"), Some(EncryptionScheme::Cbcs));
+        assert_eq!(EncryptionScheme::from_str_value("none"), Some(EncryptionScheme::None));
+    }
+
+    #[test]
+    fn from_str_value_invalid() {
+        assert_eq!(EncryptionScheme::from_str_value("aes256"), Option::None);
+        assert_eq!(EncryptionScheme::from_str_value(""), Option::None);
+        assert_eq!(EncryptionScheme::from_str_value("CENC"), Option::None);
+    }
+
+    #[test]
+    fn from_str_value_roundtrip() {
+        for scheme in [EncryptionScheme::Cenc, EncryptionScheme::Cbcs, EncryptionScheme::None] {
+            let s = scheme.scheme_type_str();
+            assert_eq!(EncryptionScheme::from_str_value(s), Some(scheme));
+        }
     }
 
     #[test]

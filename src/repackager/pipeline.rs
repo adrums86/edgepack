@@ -35,12 +35,12 @@ impl RepackagePipeline {
 
     /// Execute the full repackaging pipeline (processes all segments in one invocation).
     ///
-    /// This is the original entry point. For WASI environments with request timeouts,
-    /// prefer `execute_first()` + `execute_remaining()` for chunked processing.
-    pub fn execute(&self, request: &RepackageRequest) -> Result<(JobStatus, ProgressiveOutput)> {
+    /// Produces one `ProgressiveOutput` per target scheme. For WASI environments with
+    /// request timeouts, prefer `execute_first()` + `execute_remaining()` for chunked processing.
+    pub fn execute(&self, request: &RepackageRequest) -> Result<(JobStatus, Vec<(EncryptionScheme, ProgressiveOutput)>)> {
         let content_id = &request.content_id;
         let format = request.output_format;
-        let target_scheme = request.target_scheme;
+        let target_schemes = &request.target_schemes;
         let container_format = request.container_format;
 
         // Update job state: FetchingKeys
@@ -64,20 +64,18 @@ impl RepackagePipeline {
             EncryptionScheme::None
         };
 
-        let target_iv_size = target_scheme.default_iv_size();
-        let target_pattern = target_scheme.default_video_pattern();
         let source_pattern = protection_info.as_ref().map(|info| (
             info.tenc.default_crypt_byte_block,
             info.tenc.default_skip_byte_block,
         )).unwrap_or((0, 0));
 
         // Step 3: Conditional SPEKE — only needed when either side is encrypted
-        let needs_keys = source_scheme.is_encrypted() || target_scheme.is_encrypted();
-        let (key_set, source_key, target_key) = if needs_keys {
+        let any_target_encrypted = target_schemes.iter().any(|s| s.is_encrypted());
+        let needs_keys = source_scheme.is_encrypted() || any_target_encrypted;
+        let (key_set, source_key, content_key) = if needs_keys {
             let key_ids = if let Some(ref info) = protection_info {
                 vec![info.tenc.default_kid]
             } else {
-                // Clear-to-encrypted: derive KID from content_id
                 let kid = derive_kid_from_content_id(content_id);
                 vec![kid]
             };
@@ -85,48 +83,54 @@ impl RepackagePipeline {
             let kid = key_ids[0];
             let key = find_key_for_kid(&ks, &kid)?;
             let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
-            let tgt = if target_scheme.is_encrypted() { Some(key) } else { None };
-            (Some(ks), src, tgt)
+            (Some(ks), src, Some(key))
         } else {
             (None, None, None)
         };
 
-        // Step 4: Rewrite init segment based on source/target encryption
-        let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
-            (true, true) => {
+        // Step 4: Per-scheme init rewriting and progressive output setup
+        let fmt = format_str(format);
+        let kid = protection_info.as_ref()
+            .map(|info| info.tenc.default_kid)
+            .unwrap_or_else(|| derive_kid_from_content_id(content_id));
+
+        let mut outputs: Vec<(EncryptionScheme, ProgressiveOutput)> = Vec::with_capacity(target_schemes.len());
+        for &target_scheme in target_schemes {
+            let target_iv_size = target_scheme.default_iv_size();
+            let target_pattern = target_scheme.default_video_pattern();
+
+            let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
+                (true, true) => {
+                    let ks = key_set.as_ref().unwrap();
+                    init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                }
+                (false, true) => {
+                    let ks = key_set.as_ref().unwrap();
+                    init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                }
+                (true, false) => {
+                    init::strip_protection_info(&init_data, container_format)?
+                }
+                (false, false) => {
+                    init::rewrite_ftyp_only(&init_data, container_format)?
+                }
+            };
+
+            let scheme_str = target_scheme.scheme_type_str();
+            let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
+            let drm_info = if target_scheme.is_encrypted() {
                 let ks = key_set.as_ref().unwrap();
-                init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
-            }
-            (false, true) => {
-                let ks = key_set.as_ref().unwrap();
-                init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
-            }
-            (true, false) => {
-                init::strip_protection_info(&init_data, container_format)?
-            }
-            (false, false) => {
-                init::rewrite_ftyp_only(&init_data, container_format)?
-            }
-        };
+                Some(build_manifest_drm_info(ks, &kid, target_scheme))
+            } else {
+                None
+            };
+            let mut progressive =
+                ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
+            progressive.set_init_segment(new_init);
+            outputs.push((target_scheme, progressive));
+        }
 
-        // Step 5: Set up progressive output
-        let base_url = format!("/repackage/{content_id}/{}/", format_str(format));
-        let drm_info = if target_scheme.is_encrypted() {
-            let ks = key_set.as_ref().unwrap();
-            let kid = protection_info.as_ref()
-                .map(|info| info.tenc.default_kid)
-                .unwrap_or_else(|| derive_kid_from_content_id(content_id));
-            Some(build_manifest_drm_info(ks, &kid, target_scheme))
-        } else {
-            None
-        };
-        let mut progressive =
-            ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
-
-        // Register init segment with progressive output
-        progressive.set_init_segment(new_init);
-
-        // Step 6: Process each media segment
+        // Step 5: Process each media segment
         let source_iv_size = protection_info.as_ref()
             .map(|info| info.tenc.default_per_sample_iv_size)
             .unwrap_or(0);
@@ -143,35 +147,34 @@ impl RepackagePipeline {
 
         for (i, segment_url) in source.segment_urls.iter().enumerate() {
             let seg_data = self.fetch_segment(segment_url)?;
-
-            let params = SegmentRewriteParams {
-                source_key: source_key.clone(),
-                target_key: target_key.clone(),
-                source_scheme,
-                target_scheme,
-                source_iv_size,
-                target_iv_size,
-                source_pattern,
-                target_pattern,
-                constant_iv: constant_iv.clone(),
-                segment_number: i as u32,
-            };
-
-            let new_segment = segment::rewrite_segment(&seg_data, &params)?;
-
-            let duration = source
-                .segment_durations
-                .get(i)
-                .copied()
-                .unwrap_or(6.0);
-
+            let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
             let is_last = i == source.segment_urls.len() - 1 && !source.is_live;
 
-            // Add to progressive output
-            progressive.add_segment(i as u32, new_segment, duration);
+            // Re-encrypt for each target scheme
+            for (target_scheme, progressive) in outputs.iter_mut() {
+                let target_iv_size = target_scheme.default_iv_size();
+                let target_pattern = target_scheme.default_video_pattern();
+                let target_key = if target_scheme.is_encrypted() { content_key.clone() } else { None };
 
-            if is_last {
-                progressive.finalize();
+                let params = SegmentRewriteParams {
+                    source_key: source_key.clone(),
+                    target_key,
+                    source_scheme,
+                    target_scheme: *target_scheme,
+                    source_iv_size,
+                    target_iv_size,
+                    source_pattern,
+                    target_pattern,
+                    constant_iv: constant_iv.clone(),
+                    segment_number: i as u32,
+                };
+
+                let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+                progressive.add_segment(i as u32, new_segment, duration);
+
+                if is_last {
+                    progressive.finalize();
+                }
             }
 
             self.update_job_state(
@@ -183,9 +186,9 @@ impl RepackagePipeline {
             )?;
         }
 
-        // Clean up sensitive cache entries (skip if no keys were fetched)
+        // Clean up sensitive cache entries
         if needs_keys {
-            self.cleanup_sensitive_data(content_id, format);
+            self.cleanup_sensitive_data(content_id, format, target_schemes);
         }
 
         let status = JobStatus {
@@ -195,18 +198,18 @@ impl RepackagePipeline {
             segments_completed: source.segment_urls.len() as u32,
             segments_total: Some(source.segment_urls.len() as u32),
         };
-        Ok((status, progressive))
+        Ok((status, outputs))
     }
 
     /// Execute the pipeline through the first segment, producing a live manifest.
     ///
     /// This is the first half of the split execution model for WASI environments.
-    /// After this returns, the manifest URL is immediately usable. The caller should
-    /// chain `execute_remaining()` via self-invocation for the rest.
+    /// After this returns, per-scheme manifest URLs are immediately usable. The caller
+    /// should chain `execute_remaining()` via self-invocation for the rest.
     pub fn execute_first(&self, request: &RepackageRequest) -> Result<JobStatus> {
         let content_id = &request.content_id;
         let format = request.output_format;
-        let target_scheme = request.target_scheme;
+        let target_schemes = &request.target_schemes;
         let container_format = request.container_format;
         let fmt = format_str(format);
         let ttl = self.config.cache.job_state_ttl;
@@ -221,6 +224,12 @@ impl RepackagePipeline {
             .map_err(|e| EdgepackError::Cache(format!("serialize source manifest: {e}")))?;
         self.cache
             .set(&CacheKeys::source_manifest(content_id, &fmt), &source_json, ttl)?;
+
+        // Store target schemes list for continuation
+        let schemes_json = serde_json::to_vec(target_schemes)
+            .map_err(|e| EdgepackError::Cache(format!("serialize target schemes: {e}")))?;
+        self.cache
+            .set(&CacheKeys::target_schemes(content_id, &fmt), &schemes_json, ttl)?;
 
         // Step 2: Fetch init segment and parse protection info
         let init_data = self.fetch_segment(&source.init_segment_url)?;
@@ -237,16 +246,15 @@ impl RepackagePipeline {
             EncryptionScheme::None
         };
 
-        let target_iv_size = target_scheme.default_iv_size();
-        let target_pattern = target_scheme.default_video_pattern();
         let source_pattern = protection_info.as_ref().map(|info| (
             info.tenc.default_crypt_byte_block,
             info.tenc.default_skip_byte_block,
         )).unwrap_or((0, 0));
 
         // Step 3: Conditional SPEKE
-        let needs_keys = source_scheme.is_encrypted() || target_scheme.is_encrypted();
-        let (key_set, source_key, target_key) = if needs_keys {
+        let any_target_encrypted = target_schemes.iter().any(|s| s.is_encrypted());
+        let needs_keys = source_scheme.is_encrypted() || any_target_encrypted;
+        let (key_set, source_key, content_key) = if needs_keys {
             let key_ids = if let Some(ref info) = protection_info {
                 vec![info.tenc.default_kid]
             } else {
@@ -257,123 +265,147 @@ impl RepackagePipeline {
             let kid = key_ids[0];
             let key = find_key_for_kid(&ks, &kid)?;
             let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
-            let tgt = if target_scheme.is_encrypted() { Some(key) } else { None };
-            (Some(ks), src, tgt)
+            (Some(ks), src, Some(key))
         } else {
             (None, None, None)
         };
 
-        // Step 4: Build and store rewrite parameters for continuation
+        // Step 4: Source IV info
         let source_iv_size = protection_info.as_ref()
             .map(|info| info.tenc.default_per_sample_iv_size)
             .unwrap_or(0);
         let constant_iv = protection_info.as_ref()
             .and_then(|info| info.tenc.default_constant_iv.clone());
 
-        let continuation = ContinuationParams {
-            source_key: source_key.as_ref().map(|k| CachedKey {
-                kid: k.kid.to_vec(),
-                key: k.key.clone(),
-                iv: k.iv.clone(),
-            }),
-            target_key: target_key.as_ref().map(|k| CachedKey {
-                kid: k.kid.to_vec(),
-                key: k.key.clone(),
-                iv: k.iv.clone(),
-            }),
-            source_scheme,
-            target_scheme,
-            source_iv_size,
-            target_iv_size,
-            source_pattern,
-            target_pattern,
-            constant_iv: constant_iv.clone(),
-            container_format,
-        };
-        let cont_json = serde_json::to_vec(&continuation)
-            .map_err(|e| EdgepackError::Cache(format!("serialize rewrite params: {e}")))?;
-        self.cache
-            .set(&CacheKeys::rewrite_params(content_id, &fmt), &cont_json, ttl)?;
+        let kid = protection_info.as_ref()
+            .map(|info| info.tenc.default_kid)
+            .unwrap_or_else(|| derive_kid_from_content_id(content_id));
 
-        // Step 5: Rewrite init segment
-        let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
-            (true, true) => {
-                let ks = key_set.as_ref().unwrap();
-                init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
-            }
-            (false, true) => {
-                let ks = key_set.as_ref().unwrap();
-                init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
-            }
-            (true, false) => {
-                init::strip_protection_info(&init_data, container_format)?
-            }
-            (false, false) => {
-                init::rewrite_ftyp_only(&init_data, container_format)?
-            }
-        };
-
-        // Store init segment in Redis
-        self.cache
-            .set(&CacheKeys::init_segment(content_id, &fmt), &new_init, ttl)?;
-
-        // Step 6: Set up progressive output
-        let base_url = format!("/repackage/{content_id}/{fmt}/");
-        let drm_info = if target_scheme.is_encrypted() {
-            let ks = key_set.as_ref().unwrap();
-            let kid = protection_info.as_ref()
-                .map(|info| info.tenc.default_kid)
-                .unwrap_or_else(|| derive_kid_from_content_id(content_id));
-            Some(build_manifest_drm_info(ks, &kid, target_scheme))
-        } else {
-            None
-        };
-        let mut progressive =
-            ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
-        progressive.set_init_segment(new_init);
-
-        // Step 7: Process first media segment
+        // Step 5: Fetch first segment (once, shared across all schemes)
         self.update_job_state(content_id, format, JobState::Processing, 0, Some(total))?;
-
         let seg_data = self.fetch_segment(&source.segment_urls[0])?;
-        let params = SegmentRewriteParams {
-            source_key,
-            target_key,
-            source_scheme,
-            target_scheme,
-            source_iv_size,
-            target_iv_size,
-            source_pattern,
-            target_pattern,
-            constant_iv,
-            segment_number: 0,
-        };
-        let new_segment = segment::rewrite_segment(&seg_data, &params)?;
-
-        // Store segment in Redis
-        self.cache.set(
-            &CacheKeys::media_segment(content_id, &fmt, 0),
-            &new_segment,
-            ttl,
-        )?;
-
+        let first_duration = source.segment_durations.first().copied().unwrap_or(6.0);
         let is_last = source.segment_urls.len() == 1 && !source.is_live;
 
-        progressive.add_segment(0, new_segment, source.segment_durations.first().copied().unwrap_or(6.0));
-        if is_last {
-            progressive.finalize();
-        }
+        // Step 6: Per-scheme — continuation params, init rewrite, first segment, manifest state
+        for &target_scheme in target_schemes {
+            let target_iv_size = target_scheme.default_iv_size();
+            let target_pattern = target_scheme.default_video_pattern();
+            let target_key = if target_scheme.is_encrypted() { content_key.clone() } else { None };
+            let scheme_str = target_scheme.scheme_type_str();
 
-        // Save manifest state
-        let manifest_state = progressive.manifest_state();
-        let state_json = serde_json::to_vec(manifest_state)
-            .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
-        self.cache
-            .set(&CacheKeys::manifest_state(content_id, &fmt), &state_json, ttl)?;
+            // Build and store rewrite parameters for continuation
+            let continuation = ContinuationParams {
+                source_key: source_key.as_ref().map(|k| CachedKey {
+                    kid: k.kid.to_vec(),
+                    key: k.key.clone(),
+                    iv: k.iv.clone(),
+                }),
+                target_key: target_key.as_ref().map(|k| CachedKey {
+                    kid: k.kid.to_vec(),
+                    key: k.key.clone(),
+                    iv: k.iv.clone(),
+                }),
+                source_scheme,
+                target_scheme,
+                source_iv_size,
+                target_iv_size,
+                source_pattern,
+                target_pattern,
+                constant_iv: constant_iv.clone(),
+                container_format,
+            };
+            let cont_json = serde_json::to_vec(&continuation)
+                .map_err(|e| EdgepackError::Cache(format!("serialize rewrite params: {e}")))?;
+            self.cache.set(
+                &CacheKeys::rewrite_params_for_scheme(content_id, &fmt, scheme_str),
+                &cont_json,
+                ttl,
+            )?;
+
+            // Rewrite init segment
+            let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
+                (true, true) => {
+                    let ks = key_set.as_ref().unwrap();
+                    init::rewrite_init_segment(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                }
+                (false, true) => {
+                    let ks = key_set.as_ref().unwrap();
+                    init::create_protection_info(&init_data, ks, target_scheme, target_iv_size, target_pattern, container_format)?
+                }
+                (true, false) => {
+                    init::strip_protection_info(&init_data, container_format)?
+                }
+                (false, false) => {
+                    init::rewrite_ftyp_only(&init_data, container_format)?
+                }
+            };
+
+            // Store init segment
+            self.cache.set(
+                &CacheKeys::init_segment_for_scheme(content_id, &fmt, scheme_str),
+                &new_init,
+                ttl,
+            )?;
+
+            // Set up progressive output
+            let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
+            let drm_info = if target_scheme.is_encrypted() {
+                let ks = key_set.as_ref().unwrap();
+                Some(build_manifest_drm_info(ks, &kid, target_scheme))
+            } else {
+                None
+            };
+            let mut progressive = ProgressiveOutput::new(
+                content_id.clone(),
+                format,
+                base_url,
+                drm_info,
+                container_format,
+            );
+            progressive.set_init_segment(new_init);
+
+            // Process first segment for this scheme
+            let params = SegmentRewriteParams {
+                source_key: source_key.clone(),
+                target_key,
+                source_scheme,
+                target_scheme,
+                source_iv_size,
+                target_iv_size,
+                source_pattern,
+                target_pattern,
+                constant_iv: constant_iv.clone(),
+                segment_number: 0,
+            };
+            let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+
+            // Store segment
+            self.cache.set(
+                &CacheKeys::media_segment_for_scheme(content_id, &fmt, scheme_str, 0),
+                &new_segment,
+                ttl,
+            )?;
+
+            progressive.add_segment(0, new_segment, first_duration);
+            if is_last {
+                progressive.finalize();
+            }
+
+            // Save manifest state
+            let manifest_state = progressive.manifest_state();
+            let state_json = serde_json::to_vec(manifest_state)
+                .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
+            self.cache.set(
+                &CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str),
+                &state_json,
+                ttl,
+            )?;
+        }
 
         let state = if is_last {
             if needs_keys {
-                self.cleanup_sensitive_data(content_id, format);
+                self.cleanup_sensitive_data(content_id, format, target_schemes);
             }
             JobState::Complete
         } else {
@@ -392,8 +424,8 @@ impl RepackagePipeline {
 
     /// Execute the next segment in the pipeline, continuing from stored state.
     ///
-    /// Loads source manifest, rewrite params, and manifest state from Redis,
-    /// processes the next segment, and updates state. Returns the updated status.
+    /// Loads source manifest, target schemes, per-scheme rewrite params and manifest
+    /// state from Redis, processes the next segment for each scheme, and updates state.
     pub fn execute_remaining(&self, content_id: &str, format: OutputFormat) -> Result<JobStatus> {
         let fmt = format_str(format);
         let ttl = self.config.cache.job_state_ttl;
@@ -410,31 +442,32 @@ impl RepackagePipeline {
         let source: SourceManifest = serde_json::from_slice(&source_data)
             .map_err(|e| EdgepackError::Cache(format!("deserialize source manifest: {e}")))?;
 
-        // Load rewrite params
-        let params_data = self
+        // Load target schemes list
+        let schemes_data = self
             .cache
-            .get(&CacheKeys::rewrite_params(content_id, &fmt))?
+            .get(&CacheKeys::target_schemes(content_id, &fmt))?
             .ok_or_else(|| {
                 EdgepackError::Cache(format!(
-                    "rewrite params not found in cache for {content_id}/{fmt}"
+                    "target schemes not found in cache for {content_id}/{fmt}"
                 ))
             })?;
-        let continuation: ContinuationParams = serde_json::from_slice(&params_data)
-            .map_err(|e| EdgepackError::Cache(format!("deserialize rewrite params: {e}")))?;
+        let target_schemes: Vec<EncryptionScheme> = serde_json::from_slice(&schemes_data)
+            .map_err(|e| EdgepackError::Cache(format!("deserialize target schemes: {e}")))?;
 
-        // Load current manifest state
-        let state_data = self
+        // Use first scheme's manifest state to determine progress (all schemes are in sync)
+        let first_scheme_str = target_schemes[0].scheme_type_str();
+        let first_state_data = self
             .cache
-            .get(&CacheKeys::manifest_state(content_id, &fmt))?
+            .get(&CacheKeys::manifest_state_for_scheme(content_id, &fmt, first_scheme_str))?
             .ok_or_else(|| {
                 EdgepackError::Cache(format!(
-                    "manifest state not found in cache for {content_id}/{fmt}"
+                    "manifest state not found in cache for {content_id}/{fmt}_{first_scheme_str}"
                 ))
             })?;
-        let mut manifest_state: ManifestState = serde_json::from_slice(&state_data)
+        let first_manifest_state: ManifestState = serde_json::from_slice(&first_state_data)
             .map_err(|e| EdgepackError::Cache(format!("deserialize manifest state: {e}")))?;
 
-        let segments_done = manifest_state.segments.len();
+        let segments_done = first_manifest_state.segments.len();
         let total = source.segment_urls.len();
 
         if segments_done >= total {
@@ -448,67 +481,100 @@ impl RepackagePipeline {
             });
         }
 
-        // Process next segment
+        // Fetch next source segment (once, shared across all schemes)
         let i = segments_done;
         let seg_data = self.fetch_segment(&source.segment_urls[i])?;
-
-        let source_key = continuation.source_key.as_ref().map(restore_content_key);
-        let target_key = continuation.target_key.as_ref().map(restore_content_key);
-
-        let params = SegmentRewriteParams {
-            source_key,
-            target_key,
-            source_scheme: continuation.source_scheme,
-            target_scheme: continuation.target_scheme,
-            source_iv_size: continuation.source_iv_size,
-            target_iv_size: continuation.target_iv_size,
-            source_pattern: continuation.source_pattern,
-            target_pattern: continuation.target_pattern,
-            constant_iv: continuation.constant_iv.clone(),
-            segment_number: i as u32,
-        };
-
-        let new_segment = segment::rewrite_segment(&seg_data, &params)?;
-
-        // Store in Redis
-        self.cache.set(
-            &CacheKeys::media_segment(content_id, &fmt, i as u32),
-            &new_segment,
-            ttl,
-        )?;
-
-        // Update manifest state
-        let ext = continuation.container_format.video_segment_extension();
-        let uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
         let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
-
-        manifest_state.segments.push(SegmentInfo {
-            number: i as u32,
-            duration,
-            uri,
-            byte_size: new_segment.len() as u64,
-        });
-        if duration > manifest_state.target_duration {
-            manifest_state.target_duration = duration;
-        }
-
         let is_last = i == total - 1 && !source.is_live;
-        if is_last {
-            manifest_state.phase = ManifestPhase::Complete;
-        }
 
-        // Save updated manifest state
-        let state_json = serde_json::to_vec(&manifest_state)
-            .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
-        self.cache
-            .set(&CacheKeys::manifest_state(content_id, &fmt), &state_json, ttl)?;
+        // Process for each target scheme
+        let mut needs_keys = false;
+        for target_scheme in &target_schemes {
+            let scheme_str = target_scheme.scheme_type_str();
+
+            // Load continuation params for this scheme
+            let params_data = self
+                .cache
+                .get(&CacheKeys::rewrite_params_for_scheme(content_id, &fmt, scheme_str))?
+                .ok_or_else(|| {
+                    EdgepackError::Cache(format!(
+                        "rewrite params not found in cache for {content_id}/{fmt}_{scheme_str}"
+                    ))
+                })?;
+            let continuation: ContinuationParams = serde_json::from_slice(&params_data)
+                .map_err(|e| EdgepackError::Cache(format!("deserialize rewrite params: {e}")))?;
+
+            if continuation.source_scheme.is_encrypted() || continuation.target_scheme.is_encrypted() {
+                needs_keys = true;
+            }
+
+            let source_key = continuation.source_key.as_ref().map(restore_content_key);
+            let target_key = continuation.target_key.as_ref().map(restore_content_key);
+
+            let params = SegmentRewriteParams {
+                source_key,
+                target_key,
+                source_scheme: continuation.source_scheme,
+                target_scheme: continuation.target_scheme,
+                source_iv_size: continuation.source_iv_size,
+                target_iv_size: continuation.target_iv_size,
+                source_pattern: continuation.source_pattern,
+                target_pattern: continuation.target_pattern,
+                constant_iv: continuation.constant_iv.clone(),
+                segment_number: i as u32,
+            };
+
+            let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+
+            // Store segment
+            self.cache.set(
+                &CacheKeys::media_segment_for_scheme(content_id, &fmt, scheme_str, i as u32),
+                &new_segment,
+                ttl,
+            )?;
+
+            // Load and update manifest state for this scheme
+            let state_data = self
+                .cache
+                .get(&CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str))?
+                .ok_or_else(|| {
+                    EdgepackError::Cache(format!(
+                        "manifest state not found in cache for {content_id}/{fmt}_{scheme_str}"
+                    ))
+                })?;
+            let mut manifest_state: ManifestState = serde_json::from_slice(&state_data)
+                .map_err(|e| EdgepackError::Cache(format!("deserialize manifest state: {e}")))?;
+
+            let ext = continuation.container_format.video_segment_extension();
+            let uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
+
+            manifest_state.segments.push(SegmentInfo {
+                number: i as u32,
+                duration,
+                uri,
+                byte_size: new_segment.len() as u64,
+            });
+            if duration > manifest_state.target_duration {
+                manifest_state.target_duration = duration;
+            }
+            if is_last {
+                manifest_state.phase = ManifestPhase::Complete;
+            }
+
+            // Save updated manifest state
+            let state_json = serde_json::to_vec(&manifest_state)
+                .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
+            self.cache.set(
+                &CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str),
+                &state_json,
+                ttl,
+            )?;
+        }
 
         let completed = (i + 1) as u32;
-        let needs_keys = continuation.source_scheme.is_encrypted() || continuation.target_scheme.is_encrypted();
         let state = if is_last {
-            // Final segment: clean up sensitive cache data (only if keys were used)
             if needs_keys {
-                self.cleanup_sensitive_data(content_id, format);
+                self.cleanup_sensitive_data(content_id, format, &target_schemes);
             }
             JobState::Complete
         } else {
@@ -616,18 +682,23 @@ impl RepackagePipeline {
 
     /// Delete all sensitive cache entries for a completed job.
     ///
-    /// Removes DRM keys, SPEKE response, rewrite params, and source manifest
-    /// metadata. Non-sensitive data (job state, manifest state, init/media
-    /// segments) is left for CDN serving.
+    /// Removes DRM keys, SPEKE response, per-scheme rewrite params, target schemes
+    /// list, and source manifest metadata. Non-sensitive data (job state, manifest
+    /// state, init/media segments) is left for CDN serving.
     ///
     /// Cleanup errors are intentionally swallowed — they must not prevent
     /// the pipeline from reporting success to the caller.
-    fn cleanup_sensitive_data(&self, content_id: &str, format: OutputFormat) {
+    fn cleanup_sensitive_data(&self, content_id: &str, format: OutputFormat, target_schemes: &[EncryptionScheme]) {
         let fmt = format_str(format);
         let _ = self.cache.delete(&CacheKeys::drm_keys(content_id));
         let _ = self.cache.delete(&CacheKeys::speke_response(content_id));
-        let _ = self.cache.delete(&CacheKeys::rewrite_params(content_id, &fmt));
         let _ = self.cache.delete(&CacheKeys::source_manifest(content_id, &fmt));
+        let _ = self.cache.delete(&CacheKeys::target_schemes(content_id, &fmt));
+        // Delete per-scheme rewrite params
+        for scheme in target_schemes {
+            let scheme_str = scheme.scheme_type_str();
+            let _ = self.cache.delete(&CacheKeys::rewrite_params_for_scheme(content_id, &fmt, scheme_str));
+        }
     }
 }
 
@@ -1171,14 +1242,15 @@ mod tests {
         let (cache, deleted) = SpyCacheBackend::new();
         let pipeline = RepackagePipeline::new(make_test_config(), Box::new(cache));
 
-        pipeline.cleanup_sensitive_data("my-content", OutputFormat::Hls);
+        pipeline.cleanup_sensitive_data("my-content", OutputFormat::Hls, &[EncryptionScheme::Cenc]);
 
         let keys = deleted.lock().unwrap();
-        assert_eq!(keys.len(), 4);
+        assert_eq!(keys.len(), 5);
         assert!(keys.contains(&"ep:my-content:keys".to_string()));
         assert!(keys.contains(&"ep:my-content:speke".to_string()));
-        assert!(keys.contains(&"ep:my-content:hls:rewrite_params".to_string()));
         assert!(keys.contains(&"ep:my-content:hls:source".to_string()));
+        assert!(keys.contains(&"ep:my-content:hls:target_schemes".to_string()));
+        assert!(keys.contains(&"ep:my-content:hls_cenc:rewrite_params".to_string()));
     }
 
     #[test]
@@ -1186,14 +1258,32 @@ mod tests {
         let (cache, deleted) = SpyCacheBackend::new();
         let pipeline = RepackagePipeline::new(make_test_config(), Box::new(cache));
 
-        pipeline.cleanup_sensitive_data("content-42", OutputFormat::Dash);
+        pipeline.cleanup_sensitive_data("content-42", OutputFormat::Dash, &[EncryptionScheme::Cbcs]);
 
         let keys = deleted.lock().unwrap();
-        assert_eq!(keys.len(), 4);
+        assert_eq!(keys.len(), 5);
         assert!(keys.contains(&"ep:content-42:keys".to_string()));
         assert!(keys.contains(&"ep:content-42:speke".to_string()));
-        assert!(keys.contains(&"ep:content-42:dash:rewrite_params".to_string()));
         assert!(keys.contains(&"ep:content-42:dash:source".to_string()));
+        assert!(keys.contains(&"ep:content-42:dash:target_schemes".to_string()));
+        assert!(keys.contains(&"ep:content-42:dash_cbcs:rewrite_params".to_string()));
+    }
+
+    #[test]
+    fn cleanup_deletes_per_scheme_rewrite_params_dual() {
+        let (cache, deleted) = SpyCacheBackend::new();
+        let pipeline = RepackagePipeline::new(make_test_config(), Box::new(cache));
+
+        pipeline.cleanup_sensitive_data(
+            "dual-content",
+            OutputFormat::Hls,
+            &[EncryptionScheme::Cenc, EncryptionScheme::Cbcs],
+        );
+
+        let keys = deleted.lock().unwrap();
+        assert_eq!(keys.len(), 6);
+        assert!(keys.contains(&"ep:dual-content:hls_cenc:rewrite_params".to_string()));
+        assert!(keys.contains(&"ep:dual-content:hls_cbcs:rewrite_params".to_string()));
     }
 
     #[test]
@@ -1201,12 +1291,15 @@ mod tests {
         let (cache, deleted) = SpyCacheBackend::new();
         let pipeline = RepackagePipeline::new(make_test_config(), Box::new(cache));
 
-        pipeline.cleanup_sensitive_data("abc", OutputFormat::Hls);
+        pipeline.cleanup_sensitive_data("abc", OutputFormat::Hls, &[EncryptionScheme::Cenc]);
 
         let keys = deleted.lock().unwrap();
         // Should NOT contain state, manifest_state, init, or segment keys
         for key in keys.iter() {
-            assert!(!key.contains(":state"), "should not delete job state: {key}");
+            assert!(
+                !key.ends_with(":state"),
+                "should not delete job state: {key}"
+            );
             assert!(
                 !key.contains(":manifest_state"),
                 "should not delete manifest state: {key}"
@@ -1243,6 +1336,6 @@ mod tests {
         let pipeline = RepackagePipeline::new(make_test_config(), Box::new(FailingDeleteCache));
 
         // Should not panic — errors are swallowed with `let _ =`
-        pipeline.cleanup_sensitive_data("test", OutputFormat::Hls);
+        pipeline.cleanup_sensitive_data("test", OutputFormat::Hls, &[EncryptionScheme::Cenc]);
     }
 }

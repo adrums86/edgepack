@@ -8,6 +8,9 @@ use crate::repackager::{JobState, JobStatus, RepackageRequest};
 use serde::{Deserialize, Serialize};
 
 /// Webhook payload for triggering a repackaging job.
+///
+/// Accepts either `target_schemes` (array) or `target_scheme` (single string, backward compat).
+/// If both are provided, `target_schemes` takes precedence. If neither, defaults to `["cenc"]`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WebhookPayload {
     /// Unique content identifier.
@@ -16,9 +19,12 @@ pub struct WebhookPayload {
     pub source_url: String,
     /// Output format: "hls" or "dash".
     pub format: String,
-    /// Target encryption scheme: "cenc" or "cbcs" (default: "cenc").
-    #[serde(default = "default_target_scheme_str")]
-    pub target_scheme: String,
+    /// Target encryption schemes (array). Takes precedence over `target_scheme`.
+    #[serde(default)]
+    pub target_schemes: Vec<String>,
+    /// Target encryption scheme (single, backward compat). Used when `target_schemes` is empty.
+    #[serde(default)]
+    pub target_scheme: Option<String>,
     /// Target container format: "cmaf" or "fmp4" (default: "cmaf").
     #[serde(default = "default_container_format_str")]
     pub container_format: String,
@@ -27,8 +33,19 @@ pub struct WebhookPayload {
     pub key_ids: Vec<String>,
 }
 
-fn default_target_scheme_str() -> String {
-    "cenc".to_string()
+impl WebhookPayload {
+    /// Resolve the effective list of target scheme strings.
+    ///
+    /// Priority: `target_schemes` (if non-empty) > `target_scheme` (if present) > default `["cenc"]`.
+    pub fn resolved_target_schemes(&self) -> Vec<String> {
+        if !self.target_schemes.is_empty() {
+            self.target_schemes.clone()
+        } else if let Some(ref single) = self.target_scheme {
+            vec![single.clone()]
+        } else {
+            vec!["cenc".to_string()]
+        }
+    }
 }
 
 fn default_container_format_str() -> String {
@@ -41,7 +58,8 @@ pub struct WebhookResponse {
     pub status: String,
     pub content_id: String,
     pub format: String,
-    pub manifest_url: String,
+    /// Manifest URLs keyed by scheme name (e.g. {"cenc": "/repackage/id/hls_cenc/manifest"}).
+    pub manifest_urls: std::collections::HashMap<String, String>,
     pub segments_completed: u32,
     pub segments_total: Option<u32>,
 }
@@ -84,17 +102,32 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         ));
     }
 
-    // Parse target encryption scheme
-    let target_scheme = match payload.target_scheme.as_str() {
-        "cenc" => EncryptionScheme::Cenc,
-        "cbcs" => EncryptionScheme::Cbcs,
-        "none" => EncryptionScheme::None,
-        other => {
+    // Parse target encryption schemes
+    let scheme_strings = payload.resolved_target_schemes();
+    if scheme_strings.is_empty() {
+        return Err(EdgepackError::InvalidInput(
+            "at least one target scheme is required".into(),
+        ));
+    }
+    let mut target_schemes = Vec::with_capacity(scheme_strings.len());
+    for s in &scheme_strings {
+        let scheme = match s.as_str() {
+            "cenc" => EncryptionScheme::Cenc,
+            "cbcs" => EncryptionScheme::Cbcs,
+            "none" => EncryptionScheme::None,
+            other => {
+                return Err(EdgepackError::InvalidInput(format!(
+                    "invalid target_scheme: {other} (expected 'cenc', 'cbcs', or 'none')"
+                )));
+            }
+        };
+        if target_schemes.contains(&scheme) {
             return Err(EdgepackError::InvalidInput(format!(
-                "invalid target_scheme: {other} (expected 'cenc', 'cbcs', or 'none')"
+                "duplicate target_scheme: {s}"
             )));
         }
-    };
+        target_schemes.push(scheme);
+    }
 
     // Parse container format
     let container_format = crate::media::container::ContainerFormat::from_str_value(
@@ -111,7 +144,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
         output_format,
-        target_scheme,
+        target_schemes: target_schemes.clone(),
         container_format,
         key_ids: payload.key_ids,
     };
@@ -150,16 +183,21 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         );
     }
 
-    let manifest_path = format!(
-        "/repackage/{}/{}/manifest",
-        payload.content_id, payload.format
-    );
+    let mut manifest_urls = std::collections::HashMap::new();
+    for scheme in &target_schemes {
+        let scheme_str = scheme.scheme_type_str();
+        let manifest_path = format!(
+            "/repackage/{}/{}_{}/manifest",
+            payload.content_id, payload.format, scheme_str
+        );
+        manifest_urls.insert(scheme_str.to_string(), manifest_path);
+    }
 
     let response = WebhookResponse {
         status: "processing".to_string(),
         content_id: payload.content_id,
         format: payload.format,
-        manifest_url: manifest_path,
+        manifest_urls,
         segments_completed: job_status.segments_completed,
         segments_total: job_status.segments_total,
     };
@@ -396,14 +434,15 @@ mod tests {
             content_id: "c1".into(),
             source_url: "https://example.com".into(),
             format: "hls".into(),
-            target_scheme: "cenc".into(),
+            target_schemes: vec!["cenc".into()],
+            target_scheme: None,
             container_format: "cmaf".into(),
             key_ids: vec!["aabb".into()],
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, "c1");
-        assert_eq!(parsed.target_scheme, "cenc");
+        assert_eq!(parsed.resolved_target_schemes(), vec!["cenc"]);
         assert_eq!(parsed.container_format, "cmaf");
         assert_eq!(parsed.key_ids.len(), 1);
     }
@@ -413,27 +452,43 @@ mod tests {
         let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
         assert!(parsed.key_ids.is_empty());
-        assert_eq!(parsed.target_scheme, "cenc");
+        assert_eq!(parsed.resolved_target_schemes(), vec!["cenc"]);
         assert_eq!(parsed.container_format, "cmaf");
     }
 
     #[test]
-    fn webhook_payload_cbcs_target_scheme() {
+    fn webhook_payload_backward_compat_single_scheme() {
+        // Old API: target_scheme (singular) still works
         let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","target_scheme":"cbcs"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.target_scheme, "cbcs");
+        assert_eq!(parsed.resolved_target_schemes(), vec!["cbcs"]);
+    }
+
+    #[test]
+    fn webhook_payload_multi_scheme() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","target_schemes":["cenc","cbcs"]}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.resolved_target_schemes(), vec!["cenc", "cbcs"]);
+    }
+
+    #[test]
+    fn webhook_payload_target_schemes_takes_precedence() {
+        // If both target_scheme and target_schemes are set, target_schemes wins
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","target_scheme":"none","target_schemes":["cenc","cbcs"]}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.resolved_target_schemes(), vec!["cenc", "cbcs"]);
     }
 
     #[test]
     fn webhook_payload_fmp4_container_format() {
-        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","container_format":"fmp4"}"#;
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","container_format":"fmp4","target_scheme":"cenc"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.container_format, "fmp4");
     }
 
     #[test]
     fn webhook_payload_iso_container_format() {
-        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","container_format":"iso"}"#;
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","container_format":"iso","target_scheme":"cenc"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.container_format, "iso");
     }
@@ -479,7 +534,7 @@ mod tests {
     fn webhook_payload_none_target_scheme() {
         let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","target_scheme":"none"}"#;
         let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.target_scheme, "none");
+        assert_eq!(parsed.resolved_target_schemes(), vec!["none"]);
     }
 
     #[test]
@@ -521,19 +576,36 @@ mod tests {
 
     #[test]
     fn webhook_response_serde() {
+        let mut manifest_urls = std::collections::HashMap::new();
+        manifest_urls.insert("cenc".into(), "/repackage/c1/hls_cenc/manifest".into());
         let resp = WebhookResponse {
             status: "processing".into(),
             content_id: "c1".into(),
             format: "hls".into(),
-            manifest_url: "/repackage/c1/hls/manifest".into(),
+            manifest_urls,
             segments_completed: 1,
             segments_total: Some(10),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: WebhookResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.status, "processing");
-        assert_eq!(parsed.manifest_url, "/repackage/c1/hls/manifest");
+        assert_eq!(parsed.manifest_urls.get("cenc").unwrap(), "/repackage/c1/hls_cenc/manifest");
         assert_eq!(parsed.segments_completed, 1);
+    }
+
+    #[test]
+    fn webhook_duplicate_target_scheme_rejected() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "target_schemes": ["cenc", "cenc"]
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate target_scheme"));
     }
 
     #[test]

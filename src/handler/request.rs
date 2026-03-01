@@ -9,13 +9,19 @@ use crate::repackager::JobStatus;
 ///
 /// Looks up ManifestState from Redis, renders it, and returns with
 /// appropriate cache headers based on whether the manifest is live or complete.
+/// When `scheme` is provided, uses scheme-qualified cache keys.
 pub fn handle_manifest_request(
     content_id: &str,
     format: OutputFormat,
+    scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
     let fmt = format_str(format);
-    let key = CacheKeys::manifest_state(content_id, fmt);
+    let key = if let Some(s) = scheme {
+        CacheKeys::manifest_state_for_scheme(content_id, fmt, s)
+    } else {
+        CacheKeys::manifest_state(content_id, fmt)
+    };
 
     let state_bytes = match ctx.cache.get(&key)? {
         Some(data) => data,
@@ -57,10 +63,15 @@ pub fn handle_manifest_request(
 pub fn handle_init_segment_request(
     content_id: &str,
     format: OutputFormat,
+    scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
     let fmt = format_str(format);
-    let key = CacheKeys::init_segment(content_id, fmt);
+    let key = if let Some(s) = scheme {
+        CacheKeys::init_segment_for_scheme(content_id, fmt, s)
+    } else {
+        CacheKeys::init_segment(content_id, fmt)
+    };
 
     match ctx.cache.get(&key)? {
         Some(data) => Ok(HttpResponse::ok_with_cache(
@@ -84,10 +95,15 @@ pub fn handle_media_segment_request(
     content_id: &str,
     format: OutputFormat,
     segment_number: u32,
+    scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
     let fmt = format_str(format);
-    let key = CacheKeys::media_segment(content_id, fmt, segment_number);
+    let key = if let Some(s) = scheme {
+        CacheKeys::media_segment_for_scheme(content_id, fmt, s, segment_number)
+    } else {
+        CacheKeys::media_segment(content_id, fmt, segment_number)
+    };
 
     match ctx.cache.get(&key)? {
         Some(data) => Ok(HttpResponse::ok_with_cache(
@@ -140,7 +156,7 @@ mod tests {
     #[test]
     fn handle_manifest_request_hls_not_found() {
         let ctx = test_context();
-        let resp = handle_manifest_request("content-1", OutputFormat::Hls, &ctx).unwrap();
+        let resp = handle_manifest_request("content-1", OutputFormat::Hls, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("manifest not found"));
     }
@@ -148,15 +164,22 @@ mod tests {
     #[test]
     fn handle_manifest_request_dash_not_found() {
         let ctx = test_context();
-        let resp = handle_manifest_request("content-2", OutputFormat::Dash, &ctx).unwrap();
+        let resp = handle_manifest_request("content-2", OutputFormat::Dash, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("dash"));
     }
 
     #[test]
+    fn handle_manifest_request_with_scheme_not_found() {
+        let ctx = test_context();
+        let resp = handle_manifest_request("content-1", OutputFormat::Hls, Some("cenc"), &ctx).unwrap();
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
     fn handle_init_segment_request_not_found() {
         let ctx = test_context();
-        let resp = handle_init_segment_request("content-1", OutputFormat::Hls, &ctx).unwrap();
+        let resp = handle_init_segment_request("content-1", OutputFormat::Hls, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("init segment not found"));
     }
@@ -165,7 +188,7 @@ mod tests {
     fn handle_media_segment_request_not_found() {
         let ctx = test_context();
         let resp =
-            handle_media_segment_request("content-1", OutputFormat::Hls, 5, &ctx).unwrap();
+            handle_media_segment_request("content-1", OutputFormat::Hls, 5, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("segment 5 not found"));
     }
@@ -173,10 +196,10 @@ mod tests {
     #[test]
     fn handle_media_segment_request_different_numbers() {
         let ctx = test_context();
-        let resp = handle_media_segment_request("c", OutputFormat::Dash, 0, &ctx).unwrap();
+        let resp = handle_media_segment_request("c", OutputFormat::Dash, 0, None, &ctx).unwrap();
         assert!(String::from_utf8_lossy(&resp.body).contains("segment 0"));
 
-        let resp = handle_media_segment_request("c", OutputFormat::Dash, 42, &ctx).unwrap();
+        let resp = handle_media_segment_request("c", OutputFormat::Dash, 42, None, &ctx).unwrap();
         assert!(String::from_utf8_lossy(&resp.body).contains("segment 42"));
     }
 

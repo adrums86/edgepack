@@ -82,6 +82,42 @@ impl CacheKeys {
     pub fn rewrite_params(content_id: &str, format: &str) -> String {
         format!("ep:{content_id}:{format}:rewrite_params")
     }
+
+    /// Target schemes list for continuation chaining (stored during execute_first).
+    pub fn target_schemes(content_id: &str, format: &str) -> String {
+        format!("ep:{content_id}:{format}:target_schemes")
+    }
+
+    // --- Scheme-qualified key builders (Phase 4: Dual-Scheme Output) ---
+
+    /// Build a scheme-qualified format string: e.g. "hls_cenc", "dash_cbcs".
+    fn scheme_fmt(format: &str, scheme: &str) -> String {
+        format!("{format}_{scheme}")
+    }
+
+    /// Progressive manifest state for a specific scheme.
+    pub fn manifest_state_for_scheme(content_id: &str, format: &str, scheme: &str) -> String {
+        let sf = Self::scheme_fmt(format, scheme);
+        format!("ep:{content_id}:{sf}:manifest_state")
+    }
+
+    /// Rewritten init segment for a specific scheme.
+    pub fn init_segment_for_scheme(content_id: &str, format: &str, scheme: &str) -> String {
+        let sf = Self::scheme_fmt(format, scheme);
+        format!("ep:{content_id}:{sf}:init")
+    }
+
+    /// Rewritten media segment for a specific scheme.
+    pub fn media_segment_for_scheme(content_id: &str, format: &str, scheme: &str, number: u32) -> String {
+        let sf = Self::scheme_fmt(format, scheme);
+        format!("ep:{content_id}:{sf}:seg:{number}")
+    }
+
+    /// Rewrite parameters for a specific scheme (continuation chaining).
+    pub fn rewrite_params_for_scheme(content_id: &str, format: &str, scheme: &str) -> String {
+        let sf = Self::scheme_fmt(format, scheme);
+        format!("ep:{content_id}:{sf}:rewrite_params")
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +173,70 @@ mod tests {
     #[test]
     fn cache_keys_rewrite_params() {
         assert_eq!(CacheKeys::rewrite_params("abc", "dash"), "ep:abc:dash:rewrite_params");
+    }
+
+    #[test]
+    fn cache_keys_target_schemes() {
+        assert_eq!(CacheKeys::target_schemes("abc", "hls"), "ep:abc:hls:target_schemes");
+        assert_eq!(CacheKeys::target_schemes("abc", "dash"), "ep:abc:dash:target_schemes");
+    }
+
+    // --- Scheme-qualified key tests ---
+
+    #[test]
+    fn cache_keys_manifest_state_for_scheme() {
+        assert_eq!(
+            CacheKeys::manifest_state_for_scheme("abc", "hls", "cenc"),
+            "ep:abc:hls_cenc:manifest_state"
+        );
+        assert_eq!(
+            CacheKeys::manifest_state_for_scheme("abc", "dash", "cbcs"),
+            "ep:abc:dash_cbcs:manifest_state"
+        );
+    }
+
+    #[test]
+    fn cache_keys_init_segment_for_scheme() {
+        assert_eq!(
+            CacheKeys::init_segment_for_scheme("abc", "hls", "cenc"),
+            "ep:abc:hls_cenc:init"
+        );
+        assert_eq!(
+            CacheKeys::init_segment_for_scheme("abc", "dash", "cbcs"),
+            "ep:abc:dash_cbcs:init"
+        );
+    }
+
+    #[test]
+    fn cache_keys_media_segment_for_scheme() {
+        assert_eq!(
+            CacheKeys::media_segment_for_scheme("abc", "hls", "cenc", 0),
+            "ep:abc:hls_cenc:seg:0"
+        );
+        assert_eq!(
+            CacheKeys::media_segment_for_scheme("abc", "dash", "cbcs", 42),
+            "ep:abc:dash_cbcs:seg:42"
+        );
+    }
+
+    #[test]
+    fn cache_keys_rewrite_params_for_scheme() {
+        assert_eq!(
+            CacheKeys::rewrite_params_for_scheme("abc", "hls", "cenc"),
+            "ep:abc:hls_cenc:rewrite_params"
+        );
+        assert_eq!(
+            CacheKeys::rewrite_params_for_scheme("abc", "dash", "cbcs"),
+            "ep:abc:dash_cbcs:rewrite_params"
+        );
+    }
+
+    #[test]
+    fn cache_keys_scheme_fmt_different_from_unqualified() {
+        // Scheme-qualified keys should differ from unqualified keys
+        let unqualified = CacheKeys::init_segment("abc", "hls");
+        let qualified = CacheKeys::init_segment_for_scheme("abc", "hls", "cenc");
+        assert_ne!(unqualified, qualified);
     }
 
     #[test]
