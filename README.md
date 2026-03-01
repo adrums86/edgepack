@@ -424,48 +424,103 @@ The runtime is fully implemented and compiles to a functional WASM component. Al
 
 ## Roadmap
 
-Phases 1–4 are complete. The following phases are planned next.
+Phases 1–4 are complete. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. Critical path: **Phase 5 → Phase 8 → Phase 17**.
 
-### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅
+### Completed
 
-- [x] `ContainerFormat` enum (CMAF/fMP4/ISO) with brand/extension/DASH profile helpers
-- [x] ftyp box rewriting, container_format wired through request/manifest pipeline
-- [x] Route handler accepts all 7 CMAF/ISOBMFF segment extensions
+| Phase | Name | Status |
+|-------|------|--------|
+| 1 | Core CBCS→CENC Conversion | ✅ |
+| 2 | Container Format Flexibility (CMAF + fMP4 + ISO) | ✅ |
+| 3 | Unencrypted Input Support (clear content paths) | ✅ |
+| 4 | Dual-Scheme Output (multi-rendition per request) | ✅ |
 
-### ~~Phase 3: Unencrypted Input Support~~ ✅
+### Phase 5: Multi-Key DRM & Codec Awareness — P0
 
-- [x] `EncryptionScheme::None` variant with four-way init/segment dispatch
-- [x] sinf injection (clear→encrypted), sinf stripping (encrypted→clear), ftyp-only rewrite (clear→clear)
-- [x] Conditional SPEKE key acquisition (skipped when both source and target are clear)
-
-### ~~Phase 4: Dual-Scheme Output~~ ✅
-
-- [x] `target_schemes: Vec<EncryptionScheme>` for multi-rendition output (one rendition per scheme)
-- [x] Scheme-qualified cache keys (`ep:{id}:{fmt}_{scheme}:seg:{n}`) and route paths (`hls_cenc`, `dash_cbcs`)
-- [x] Decrypt source once, re-encrypt per target scheme in pipeline (`execute`, `execute_first`, `execute_remaining`)
-- [x] Per-scheme init segments, media segments, manifests, and continuation params
-- [x] Backward-compatible single `target_scheme` field and plain format paths
-- [x] 22 integration tests for dual-scheme routing, cache keys, webhooks, and validation
-
-### Phase 5: Multi-Key PSSH (Layered & Per-Track Keys)
-
-- [ ] Support multiple content key IDs per request for per-track (audio/video) or per-scheme keying
-- [ ] Multi-key PSSH box generation — embed CBCS and CENC key IDs in a single init segment for layered encryption
 - [ ] Multi-key SPEKE requests — fetch keys for multiple KIDs in a single CPIX exchange
-- [ ] Per-track sinf/tenc — assign different keys to different sample entries (e.g., audio key ≠ video key)
-- [ ] Manifest signaling for multi-key content (multiple `#EXT-X-KEY` / `<ContentProtection>` per representation)
+- [ ] Per-track sinf/tenc — assign different keys to video vs audio sample entries
+- [ ] Multi-key PSSH generation — embed multiple KIDs in PSSH v1 boxes
+- [ ] Codec string extraction from stsd — parse `avcC`, `hvcC`, `vpcC`, `av1C` → codec strings (e.g., `avc1.64001f`)
+- [ ] Timescale parsing from `mdhd`/`mvhd` for accurate duration computation
 
-### Phase 6: Full Remux (Sample-Level mdat Access)
+### Phase 6: Subtitle & Text Track Pass-Through — P0
 
-- [ ] Sample-level parsing and rebuilding from mdat + trun + senc
-- [ ] Segment boundary restructuring at sync points
-- [ ] Timescale parsing from mdhd/mvhd boxes
+- [ ] WebVTT in fMP4 (`wvtt` sample entries) and TTML/EBU-TT (`stpp` sample entries)
+- [ ] CEA-608/708 pass-through with manifest signaling
+- [ ] HLS subtitle rendition groups (`#EXT-X-MEDIA:TYPE=SUBTITLES`) and DASH subtitle AdaptationSets
 
-### Phase 7: Compatibility Validation & Hardening
+### Phase 7: SCTE-35 Ad Markers & Multi-Period DASH — P1
 
-- [ ] Compatibility checker (e.g. Chromium 53: CENC-only, H.264+AAC, fMP4)
-- [ ] Codec detection from stsd sample entries
-- [ ] Pipeline validation hooks for incompatible configs
+- [ ] SCTE-35 splice info parsing from `emsg` boxes in media segments
+- [ ] HLS ad marker output (`#EXT-X-DATERANGE` or `#EXT-X-CUE-OUT/IN`, configurable)
+- [ ] Multi-period DASH — split MPD at SCTE-35 boundaries with `EventStream` elements
+- [ ] Pass-through mode for downstream ad servers
+
+### Phase 8: JIT Packaging (On-Demand GET) — P0
+
+- [ ] Manifest-on-GET — fetch source manifest, rewrite segment URLs, return immediately
+- [ ] Init-on-GET / Segment-on-GET — fetch, transform, cache, serve on first request
+- [ ] Request coalescing — Redis-based locking for concurrent segment requests
+- [ ] Hybrid mode — JIT (GET-triggered) and proactive (webhook) coexist
+- [ ] Configuration endpoint for source resolution per content_id
+
+### Phase 9: LL-HLS & LL-DASH — P1
+
+- [ ] LL-HLS partial segments (`#EXT-X-PART`, `#EXT-X-PRELOAD-HINT`, `#EXT-X-SERVER-CONTROL`)
+- [ ] Delta manifest updates (`#EXT-X-SKIP`)
+- [ ] LL-DASH chunked transfer with `availabilityTimeOffset`
+- [ ] CMAF chunk boundary detection
+
+### Phase 10: MPEG-TS Input — P1
+
+- [ ] MPEG-TS demuxer — PES/TS packet parser for H.264/H.265 NAL units and AAC/AC-3 audio
+- [ ] TS-to-CMAF transmuxer — convert elementary streams to fMP4 fragments
+- [ ] Init segment synthesis from codec config (SPS/PPS, AudioSpecificConfig)
+- [ ] HLS-TS manifest parsing and AES-128 segment-level decryption
+
+### Phase 11: Advanced DRM — P1
+
+- [ ] Key rotation at segment boundaries with per-period SPEKE requests
+- [ ] Clear lead — configurable unencrypted lead-in duration
+- [ ] ClearKey DRM system support
+- [ ] Raw key mode — accept keys directly without SPEKE
+
+### Phase 12: Trick Play & I-Frame Playlists — P2
+
+- [ ] HLS `#EXT-X-I-FRAMES-ONLY` playlists from trun sync sample flags
+- [ ] DASH trick play Representation with `@maxPlayoutRate`
+
+### Phase 13: DVR Window & Time-Shift — P2
+
+- [ ] Sliding window manifests with configurable time-shift buffer
+- [ ] `#EXT-X-PROGRAM-DATE-TIME` / `@availabilityStartTime` for DVR
+- [ ] Live-to-VOD manifest freezing
+
+### Phase 14: Content Steering & CDN Optimization — P2
+
+- [ ] HLS `#EXT-X-CONTENT-STEERING` with per-CDN pathway IDs
+- [ ] DASH Content Steering (`ServiceDescription`, `ContentSteering`)
+- [ ] Edge location awareness via CDN headers
+
+### Phase 15: TS Segment Output — P2
+
+- [ ] CMAF-to-TS muxer (PES packets, PAT/PMT, 188-byte TS)
+- [ ] HLS-TS manifests (no `#EXT-X-MAP`, `.ts` extensions, `AES-128` encryption)
+
+### Phase 16: Compatibility Validation & Hardening — P1 (parallel)
+
+- [ ] Codec compatibility matrix (valid codec+DRM+scheme+container combinations)
+- [ ] Pipeline validation hooks for early rejection of incompatible configs
+- [ ] HDR metadata preservation validation (Dolby Vision, HDR10, HDR10+)
+- [ ] Conformance test suite against real-world CMAF fixtures
+
+### Phase 17: CDN Provider Adapters & Binary Optimization — P0
+
+- [ ] Cloudflare Workers adapter (KV caching, `waitUntil()`)
+- [ ] Fastly Compute adapter (core cache, secret store)
+- [ ] AWS Lambda@Edge adapter (DynamoDB/ElastiCache, IAM secrets)
+- [ ] WASI Preview 1 fallback shim
+- [ ] Binary size profiling with `twiggy` and `wasm-opt`
 
 ## License
 

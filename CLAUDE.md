@@ -410,24 +410,68 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Sandbox UI supports "Both (Dual-Scheme)" option, writes output per scheme
 - Webhook response includes `manifest_urls: HashMap<String, String>` mapping scheme names to URLs
 
-### Phase 5: Multi-Key PSSH (Layered & Per-Track Keys)
-- Support multiple content key IDs per request for per-track (audio/video) or per-scheme keying
-- Multi-key PSSH box generation — embed CBCS and CENC key IDs in a single init segment for layered encryption
-- Multi-key SPEKE requests — fetch keys for multiple KIDs in a single CPIX exchange
-- Per-track sinf/tenc — assign different keys to different sample entries (e.g., audio key ≠ video key)
-- Manifest signaling for multi-key content (multiple `#EXT-X-KEY` / `<ContentProtection>` per representation)
+### Phase 5: Multi-Key DRM & Codec Awareness — P0
+- Multi-key SPEKE requests for multiple KIDs in a single CPIX exchange
+- Per-track sinf/tenc via `hdlr` box parsing (video vs audio keying)
+- Multi-key PSSH v1 generation, per-track manifest signaling
+- Codec string extraction from stsd (`avcC`, `hvcC`, `vpcC`, `av1C` → codec strings)
+- Timescale parsing from `mdhd`/`mvhd`
+- New: `src/media/codec.rs`
 
-### Phase 6: Full Remux (Sample-Level mdat Access)
-- Create `src/media/samples.rs` for sample-level parsing/rebuilding
-- Segment boundary restructuring at sync points
-- Timescale parsing from mdhd/mvhd boxes
-- Variable segment count support in progressive output
+### Phase 6: Subtitle & Text Track Pass-Through — P0
+- WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4
+- CEA-608/708 manifest signaling (pass-through is automatic)
+- HLS subtitle rendition groups, DASH subtitle AdaptationSets
 
-### Phase 7: Compatibility Validation & Hardening
-- Create `src/media/compat.rs` for target compatibility checking (e.g. Chromium 53+)
-- Codec detection from stsd sample entries
-- Pipeline validation hooks for early rejection of incompatible configs
-- New error variants: `Compatibility`, `UnsupportedCodec`
+### Phase 7: SCTE-35 Ad Markers & Multi-Period DASH — P1
+- Parse `emsg` boxes for SCTE-35 splice info
+- HLS ad markers (`#EXT-X-DATERANGE` or `#EXT-X-CUE-OUT/IN`)
+- Multi-period DASH at SCTE-35 boundaries
+- New: `src/media/scte35.rs`
 
-Phase 4 plan details: `.claude/plans/crystalline-singing-bee.md`
-Full roadmap plan: `.claude/plans/radiant-plotting-badger.md`
+### Phase 8: JIT Packaging (On-Demand GET) — P0
+- Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging)
+- Request coalescing via Redis locking
+- Hybrid mode (JIT + proactive webhook coexist)
+- Configuration endpoint for source resolution
+
+### Phase 9: LL-HLS & LL-DASH — P1
+- LL-HLS (`#EXT-X-PART`, `#EXT-X-PRELOAD-HINT`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-SKIP`)
+- LL-DASH chunked transfer with `availabilityTimeOffset`
+- New: `src/media/chunk.rs`
+
+### Phase 10: MPEG-TS Input — P1
+- TS demuxer (PES/TS packets, PAT/PMT, H.264/H.265/AAC extraction)
+- TS-to-CMAF transmuxer, init segment synthesis from codec config
+- AES-128 segment-level decryption for HLS-TS
+- New: `src/media/ts.rs`, `src/media/transmux.rs`
+- Binary size trigger: feature-gated with `--features ts`
+
+### Phase 11: Advanced DRM — P1
+- Key rotation, clear lead, ClearKey DRM, raw key mode
+
+### Phase 12: Trick Play & I-Frame Playlists — P2
+- HLS `#EXT-X-I-FRAMES-ONLY`, DASH trick play Representation
+
+### Phase 13: DVR Window & Time-Shift — P2
+- Sliding window manifests, DVR start-over, live-to-VOD
+
+### Phase 14: Content Steering & CDN Optimization — P2
+- HLS/DASH content steering, edge location awareness
+
+### Phase 15: TS Segment Output — P2
+- CMAF-to-TS muxer, HLS-TS manifests, AES-128 segment encryption
+- New: `src/media/ts_mux.rs`
+
+### Phase 16: Compatibility Validation & Hardening — P1 (parallel)
+- Codec compatibility matrix, pipeline validation hooks
+- HDR metadata preservation validation
+- New: `src/media/compat.rs`, conformance test suite
+
+### Phase 17: CDN Provider Adapters & Binary Optimization — P0
+- Cloudflare Workers, Fastly Compute, AWS Lambda@Edge, Vercel adapters
+- WASI Preview 1 fallback shim
+- Binary profiling with `twiggy` + `wasm-opt`
+
+Critical path: **Phase 5 → Phase 8 → Phase 17**
+Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`
