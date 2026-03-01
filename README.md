@@ -42,10 +42,20 @@ cargo build
 cargo build --release
 ```
 
-Output WASM binary (<600 KB):
+Output WASM binary:
 ```
 target/wasm32-wasip2/release/edgepack.wasm
 ```
+
+#### Binary Size by Build Variant
+
+| Build | Command | Size | Functions | Cold Start Impact |
+|-------|---------|------|-----------|-------------------|
+| Base (no features) | `cargo build --release` | ~580 KB | ~1,792 | Baseline |
+| JIT-only | `cargo build --release --features jit` | ~613 KB | ~1,849 | +33 KB, +57 fns |
+| Full | `cargo build --release --features jit,cloudflare` | ~618 KB | ~1,860 | +38 KB, +68 fns |
+
+Per-feature binary size tests enforce limits (600 KB base, 650 KB JIT/full) and report WASM function counts as a cold start proxy.
 
 ### Running Tests
 
@@ -67,7 +77,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **825 tests** (648 unit tests + 177 integration tests) covering every module, plus a binary size guard ensuring the release WASM stays under 600 KB. To run tests for a specific module:
+The project includes **827 tests** (648 unit tests + 179 integration tests) covering every module, plus per-feature binary size guards for each build variant. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -98,7 +108,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryptio
 | `handler` | 69 | HTTP routing, path parsing incl. scheme-qualified formats (`hls_cenc`, `dash_cbcs`), segment number parsing (all 7 extensions), webhook validation (target_schemes array, backward compat, duplicate/invalid rejection), response construction |
 | `http_client` | 5 | Response construction, native stub errors |
 
-#### Integration Test Coverage (177 tests)
+#### Integration Test Coverage (179 tests)
 
 Integration tests live in `tests/` and use synthetic CMAF fixtures — no external services or network required.
 
@@ -113,11 +123,11 @@ Integration tests live in `tests/` and use synthetic CMAF fixtures — no extern
 | `multi_key` | 12 | Per-track tenc (video/audio KIDs), multi-KID PSSH generation, single-key backward compat, codec string extraction, TrackKeyMapping serde roundtrip, create→strip roundtrip, TrackKeyMapping::from_tracks |
 | `jit_packaging` | 27 | JIT source config, on-demand setup, lock contention, backward compat (jit feature) |
 | `cdn_adapters` | 18+ | Backend type selection, config serde, create_backend factory, encryption token derivation (cloudflare feature) |
-| `wasm_binary_size` | 1 | Release WASM binary stays under 600 KB |
+| `wasm_binary_size` | 3 | Per-feature WASM binary size guards (base ≤600 KB, JIT ≤650 KB, full ≤650 KB) with function count reporting |
 
 All tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data programmatically — no external test media files needed. Multi-key tests use separate video/audio KIDs and keys to verify per-track tenc, multi-KID PSSH, and TrackKeyMapping behavior.
 
-> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare` to include all 825 tests. Without optional features: 768 tests.
+> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare` to include all 827 tests. Without optional features: 770 tests.
 
 ## Configuration
 

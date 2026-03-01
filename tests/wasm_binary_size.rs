@@ -1,22 +1,31 @@
-//! Binary size guard: ensures the release WASM artifact stays below 600 KB.
+//! Per-feature binary size guards for the release WASM artifact.
 //!
-//! This test shells out to `cargo build --release --target wasm32-wasip2`
-//! and then checks the size of the resulting `.wasm` file.  It prevents
-//! accidental dependency bloat from slipping in unnoticed.
+//! Each test builds with a specific feature combination, checks the resulting
+//! `.wasm` file stays below a size limit, and optionally reports the WASM
+//! function count (a cold-start proxy) via `wasm-tools` if installed.
 //!
-//! Current baseline: ~495 KB (after removing the `url` crate, applying
-//! opt-level="z", codegen-units=1, and panic="abort").
+//! Build variants and thresholds:
+//!   - Base (no features):           600,000 bytes (600 KB)
+//!   - JIT-only (`--features jit`):  650,000 bytes (650 KB)
+//!   - Full (`--features jit,cloudflare`): 650,000 bytes (650 KB)
+//!
+//! Current baselines (as of Phase 6 completion):
+//!   - Base:  ~580 KB,  ~1,792 functions
+//!   - JIT:   ~613 KB,  ~1,849 functions (+33 KB, +57 fns)
+//!   - Full:  ~618 KB,  ~1,860 functions (+38 KB, +68 fns)
 
-#[test]
-fn wasm_release_binary_is_under_600kb() {
-    const MAX_SIZE_BYTES: u64 = 600_000; // 600 KB
-
+/// Build the WASM binary with the given features, assert it's under `max_bytes`,
+/// and report size + function count.
+fn build_and_measure(features: &[&str], max_bytes: u64, label: &str) {
     // Build the release WASM binary.
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release", "--target", "wasm32-wasip2"])
-        .status()
-        .expect("failed to invoke cargo build");
-    assert!(status.success(), "cargo build --release failed");
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.args(["build", "--release", "--target", "wasm32-wasip2"]);
+    if !features.is_empty() {
+        cmd.arg("--features");
+        cmd.arg(features.join(","));
+    }
+    let status = cmd.status().expect("failed to invoke cargo build");
+    assert!(status.success(), "cargo build --release failed for {label}");
 
     // Locate the artifact.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -25,26 +34,92 @@ fn wasm_release_binary_is_under_600kb() {
 
     assert!(
         wasm_path.exists(),
-        "WASM binary not found at {}",
+        "[{label}] WASM binary not found at {}",
         wasm_path.display()
     );
 
-    let metadata = std::fs::metadata(&wasm_path)
-        .unwrap_or_else(|e| panic!("cannot stat {}: {e}", wasm_path.display()));
+    let size = std::fs::metadata(&wasm_path)
+        .unwrap_or_else(|e| panic!("[{label}] cannot stat {}: {e}", wasm_path.display()))
+        .len();
 
-    let size = metadata.len();
+    // Report size.
+    let features_str = if features.is_empty() {
+        "none".to_string()
+    } else {
+        features.join(",")
+    };
+    eprintln!(
+        "  [{label}] features: {features_str} | size: {size} bytes ({:.0} KB) | {:.1}% of {:.0} KB limit",
+        size as f64 / 1024.0,
+        (size as f64 / max_bytes as f64) * 100.0,
+        max_bytes as f64 / 1024.0,
+    );
 
+    // Report function count via wasm-tools (informational, not enforced).
+    report_function_count(&wasm_path, label);
+
+    // Assert size limit.
     assert!(
-        size <= MAX_SIZE_BYTES,
-        "WASM binary is {size} bytes ({:.0} KB) — exceeds {MAX_SIZE_BYTES} byte (600 KB) limit. \
+        size <= max_bytes,
+        "[{label}] WASM binary is {size} bytes ({:.0} KB) — exceeds {} byte ({:.0} KB) limit. \
          Check for unnecessary dependencies or feature flags.",
         size as f64 / 1024.0,
+        max_bytes,
+        max_bytes as f64 / 1024.0,
     );
+}
 
-    eprintln!(
-        "  WASM binary size: {} bytes ({:.0} KB) — {:.1}% of 600 KB limit",
-        size,
-        size as f64 / 1024.0,
-        (size as f64 / MAX_SIZE_BYTES as f64) * 100.0,
-    );
+/// Try to report the WASM function count using `wasm-tools`.
+/// Silently skips if wasm-tools is not installed.
+fn report_function_count(wasm_path: &std::path::Path, label: &str) {
+    let output = std::process::Command::new("wasm-tools")
+        .args(["objdump", wasm_path.to_str().unwrap()])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // wasm-tools objdump format for function sections:
+            //   "    functions                            |  ... | 1849 count"
+            // We look for lines starting with "functions" and extract the count.
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("functions") {
+                    // Extract the count from "... | NNNN count"
+                    if let Some(count_part) = trimmed.rsplit('|').next() {
+                        let count_str = count_part.trim().trim_end_matches(" count").trim();
+                        // Only report the first "functions" line (module 0 = main module)
+                        eprintln!("  [{label}] wasm functions: {count_str}");
+                        return;
+                    }
+                }
+            }
+            eprintln!("  [{label}] wasm-tools: function count not parsed from objdump output");
+        }
+        Ok(_) => {
+            eprintln!("  [{label}] wasm-tools objdump failed (non-zero exit)");
+        }
+        Err(_) => {
+            eprintln!("  [{label}] wasm-tools not installed — skipping function count");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-feature binary size tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wasm_base_binary_size() {
+    build_and_measure(&[], 600_000, "base");
+}
+
+#[test]
+fn wasm_jit_binary_size() {
+    build_and_measure(&["jit"], 650_000, "jit");
+}
+
+#[test]
+fn wasm_full_binary_size() {
+    build_and_measure(&["jit", "cloudflare"], 650_000, "full");
 }

@@ -242,7 +242,19 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **825 tests** total (with `--features jit,cloudflare`): 648 unit tests and 177 integration tests. Without optional features: **768 tests** (624 unit + 144 integration). All run on the native host target. The release WASM binary is ~495 KB (guarded by a binary size test with a 600 KB threshold).
+The project has **827 tests** total (with `--features jit,cloudflare`): 648 unit tests and 179 integration tests. Without optional features: **770 tests** (624 unit + 146 integration). All run on the native host target.
+
+#### WASM Binary Size Guards
+
+Per-feature binary size tests in `tests/wasm_binary_size.rs` prevent dependency bloat for each build variant:
+
+| Test | Features | Limit | Current Size | Functions |
+|------|----------|-------|-------------|-----------|
+| `wasm_base_binary_size` | none | 600 KB | ~580 KB | ~1,792 |
+| `wasm_jit_binary_size` | `jit` | 650 KB | ~613 KB | ~1,849 |
+| `wasm_full_binary_size` | `jit,cloudflare` | 650 KB | ~618 KB | ~1,860 |
+
+JIT adds ~33 KB (57 functions) over base. Cloudflare adds only ~4.5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
 
 ### Unit Tests (648 with all features)
 
@@ -284,7 +296,7 @@ tests/
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
 ├── handler_integration.rs    32 tests: HTTP routing (all 7 CMAF/ISOBMFF segment extensions), webhook validation, response helpers
 ├── multi_key.rs              12 tests: per-track tenc, multi-KID PSSH, single-key backward compat, codec extraction, TrackKeyMapping serde, create→strip roundtrip
-└── wasm_binary_size.rs        1 test: release WASM binary stays under 600 KB size limit
+└── wasm_binary_size.rs        3 tests: per-feature WASM binary size guards (base, jit, full)
 ```
 
 **Key fixtures in `tests/common/mod.rs`:**
