@@ -447,13 +447,21 @@ Phases 1–4 are complete. The following phases are planned next.
 - [x] Backward-compatible single `target_scheme` field and plain format paths
 - [x] 22 integration tests for dual-scheme routing, cache keys, webhooks, and validation
 
-### Phase 5: Full Remux (Sample-Level mdat Access)
+### Phase 5: Multi-Key PSSH (Layered & Per-Track Keys)
+
+- [ ] Support multiple content key IDs per request for per-track (audio/video) or per-scheme keying
+- [ ] Multi-key PSSH box generation — embed CBCS and CENC key IDs in a single init segment for layered encryption
+- [ ] Multi-key SPEKE requests — fetch keys for multiple KIDs in a single CPIX exchange
+- [ ] Per-track sinf/tenc — assign different keys to different sample entries (e.g., audio key ≠ video key)
+- [ ] Manifest signaling for multi-key content (multiple `#EXT-X-KEY` / `<ContentProtection>` per representation)
+
+### Phase 6: Full Remux (Sample-Level mdat Access)
 
 - [ ] Sample-level parsing and rebuilding from mdat + trun + senc
 - [ ] Segment boundary restructuring at sync points
 - [ ] Timescale parsing from mdhd/mvhd boxes
 
-### Phase 6: Compatibility Validation & Hardening
+### Phase 7: Compatibility Validation & Hardening
 
 - [ ] Compatibility checker (e.g. Chromium 53: CENC-only, H.264+AAC, fMP4)
 - [ ] Codec detection from stsd sample entries

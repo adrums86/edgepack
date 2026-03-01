@@ -410,19 +410,24 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Sandbox UI supports "Both (Dual-Scheme)" option, writes output per scheme
 - Webhook response includes `manifest_urls: HashMap<String, String>` mapping scheme names to URLs
 
-### Phase 5: Full Remux (Sample-Level mdat Access)
+### Phase 5: Multi-Key PSSH (Layered & Per-Track Keys)
+- Support multiple content key IDs per request for per-track (audio/video) or per-scheme keying
+- Multi-key PSSH box generation — embed CBCS and CENC key IDs in a single init segment for layered encryption
+- Multi-key SPEKE requests — fetch keys for multiple KIDs in a single CPIX exchange
+- Per-track sinf/tenc — assign different keys to different sample entries (e.g., audio key ≠ video key)
+- Manifest signaling for multi-key content (multiple `#EXT-X-KEY` / `<ContentProtection>` per representation)
+
+### Phase 6: Full Remux (Sample-Level mdat Access)
 - Create `src/media/samples.rs` for sample-level parsing/rebuilding
 - Segment boundary restructuring at sync points
 - Timescale parsing from mdhd/mvhd boxes
 - Variable segment count support in progressive output
-- Estimated: ~610 new LOC, ~80 modified LOC, ~40 new tests
 
-### Phase 6: Compatibility Validation & Hardening
+### Phase 7: Compatibility Validation & Hardening
 - Create `src/media/compat.rs` for target compatibility checking (e.g. Chromium 53+)
 - Codec detection from stsd sample entries
 - Pipeline validation hooks for early rejection of incompatible configs
 - New error variants: `Compatibility`, `UnsupportedCodec`
-- Estimated: ~260 new LOC, ~45 modified LOC, ~30 new tests
 
 Phase 4 plan details: `.claude/plans/crystalline-singing-bee.md`
 Full roadmap plan: `.claude/plans/radiant-plotting-badger.md`
