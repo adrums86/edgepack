@@ -546,6 +546,12 @@ async fn main() {
             "/api/output/{content_id}/{format}/{file}",
             get(handle_output),
         )
+        // Mirror the production /repackage/ paths so manifest-embedded URLs
+        // (e.g. /repackage/{id}/hls_cenc/init.mp4) resolve in the sandbox.
+        .route(
+            "/repackage/{content_id}/{format}/{file}",
+            get(handle_output),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3333")
@@ -944,7 +950,7 @@ async function startRepackage() {
 
     if (pollTimer) clearInterval(pollTimer);
     const storedContainerFormat = data.container_format || 'cmaf';
-    pollTimer = setInterval(() => pollStatus(data.content_id, data.format, storedContainerFormat), 1000);
+    pollTimer = setInterval(() => pollStatus(data.content_id, data.format, storedContainerFormat, targetSchemes), 1000);
   } catch (e) {
     alert('Request failed: ' + e.message);
     btn.disabled = false;
@@ -952,7 +958,7 @@ async function startRepackage() {
   }
 }
 
-async function pollStatus(contentId, format, containerFormat) {
+async function pollStatus(contentId, format, containerFormat, targetSchemes) {
   try {
     const resp = await fetch(`/api/status/${contentId}/${format}`);
     if (!resp.ok) return;
@@ -990,13 +996,17 @@ async function pollStatus(contentId, format, containerFormat) {
         const linksEl = document.getElementById('output-links');
         linksEl.innerHTML = '';
 
-        const base = `/api/output/${contentId}/${format}`;
         const ext = format === 'hls' ? 'm3u8' : 'mpd';
         const segExt = containerFormat === 'fmp4' ? '.m4s' : containerFormat === 'iso' ? '.mp4' : '.cmfv';
-        linksEl.innerHTML += `<a href="${base}/manifest.${ext}" target="_blank">manifest.${ext}</a>`;
-        linksEl.innerHTML += `<a href="${base}/init.mp4" target="_blank">init.mp4</a>`;
-        for (let i = 0; i < data.segments_completed; i++) {
-          linksEl.innerHTML += `<a href="${base}/segment_${i}${segExt}" target="_blank">segment_${i}${segExt}</a>`;
+        // Generate links per target scheme (e.g. hls_cenc, hls_cbcs)
+        for (const scheme of targetSchemes) {
+          const fmtScheme = `${format}_${scheme}`;
+          const base = `/api/output/${contentId}/${fmtScheme}`;
+          linksEl.innerHTML += `<a href="${base}/manifest.${ext}" target="_blank">${fmtScheme}/manifest.${ext}</a>`;
+          linksEl.innerHTML += `<a href="${base}/init.mp4" target="_blank">${fmtScheme}/init.mp4</a>`;
+          for (let i = 0; i < data.segments_completed; i++) {
+            linksEl.innerHTML += `<a href="${base}/segment_${i}${segExt}" target="_blank">${fmtScheme}/segment_${i}${segExt}</a>`;
+          }
         }
 
         document.getElementById('output-section').classList.remove('hidden');
