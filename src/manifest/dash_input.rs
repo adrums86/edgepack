@@ -6,7 +6,7 @@
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
-use crate::manifest::types::SourceManifest;
+use crate::manifest::types::{AdBreakInfo, SourceManifest};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use crate::url::Url;
@@ -36,10 +36,18 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     let mut uniform_duration: Option<u64> = None; // for SegmentTemplate@duration
     let mut base_url_override: Option<String> = None;
     let mut total_duration_secs: Option<f64> = None;
+    let mut ad_breaks: Vec<AdBreakInfo> = Vec::new();
+    let mut in_scte35_event_stream = false;
+    let mut event_stream_timescale: u64 = 90000;
+    // Pending Event attributes (collected on Start, resolved on End/text)
+    let mut pending_event: Option<PendingDashEvent> = None;
 
     let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        let is_empty = matches!(&event, Ok(Event::Empty(_)));
+
+        match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name = e.local_name();
                 match name.as_ref() {
@@ -148,19 +156,121 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                             }
                         }
                     }
+                    b"EventStream" => {
+                        // Check if this is a SCTE-35 event stream
+                        let mut scheme_uri = String::new();
+                        let mut ts: u64 = 90000;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"schemeIdUri" => {
+                                    scheme_uri = String::from_utf8_lossy(&attr.value).to_string();
+                                }
+                                b"timescale" => {
+                                    ts = String::from_utf8_lossy(&attr.value)
+                                        .parse()
+                                        .unwrap_or(90000);
+                                }
+                                _ => {}
+                            }
+                        }
+                        if scheme_uri.starts_with("urn:scte:scte35:") {
+                            in_scte35_event_stream = true;
+                            event_stream_timescale = ts;
+                        }
+                    }
+                    b"Event" if in_scte35_event_stream => {
+                        let mut evt_id: u32 = 0;
+                        let mut pt: u64 = 0;
+                        let mut dur: Option<u64> = None;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"id" => {
+                                    evt_id = String::from_utf8_lossy(&attr.value)
+                                        .parse()
+                                        .unwrap_or(0);
+                                }
+                                b"presentationTime" => {
+                                    pt = String::from_utf8_lossy(&attr.value)
+                                        .parse()
+                                        .unwrap_or(0);
+                                }
+                                b"duration" => {
+                                    dur = String::from_utf8_lossy(&attr.value).parse().ok();
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if is_empty {
+                            // Self-closing <Event .../> — finalize immediately
+                            let presentation_time_secs = pt as f64 / event_stream_timescale as f64;
+                            let duration_secs = dur.map(|d| d as f64 / event_stream_timescale as f64);
+                            ad_breaks.push(AdBreakInfo {
+                                id: evt_id,
+                                presentation_time: presentation_time_secs,
+                                duration: duration_secs,
+                                scte35_cmd: None,
+                                segment_number: 0,
+                            });
+                        } else {
+                            // Start tag — collect text content until End
+                            pending_event = Some(PendingDashEvent {
+                                id: evt_id,
+                                presentation_time: pt,
+                                duration: dur,
+                                text_content: String::new(),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
             Ok(Event::Text(ref e)) => {
+                let text = e.unescape().unwrap_or_default().to_string();
+                let text_trimmed = text.trim();
+
+                // Collect text into pending Event element
+                if let Some(ref mut pe) = pending_event {
+                    if !text_trimmed.is_empty() {
+                        pe.text_content.push_str(text_trimmed);
+                    }
+                }
+
                 // Check if we're inside a <BaseURL> element
                 // quick-xml delivers text after Start("BaseURL")
-                let text = e.unescape().unwrap_or_default().to_string();
-                let text = text.trim();
-                if !text.is_empty() && base_url_override.is_none() {
+                if !text_trimmed.is_empty() && base_url_override.is_none() {
                     // Only capture first BaseURL
-                    if text.starts_with("http://") || text.starts_with("https://") {
-                        base_url_override = Some(text.to_string());
+                    if text_trimmed.starts_with("http://") || text_trimmed.starts_with("https://") {
+                        base_url_override = Some(text_trimmed.to_string());
                     }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                match e.local_name().as_ref() {
+                    b"EventStream" => {
+                        in_scte35_event_stream = false;
+                    }
+                    b"Event" if in_scte35_event_stream => {
+                        if let Some(pe) = pending_event.take() {
+                            let presentation_time_secs =
+                                pe.presentation_time as f64 / event_stream_timescale as f64;
+                            let duration_secs = pe.duration
+                                .map(|d| d as f64 / event_stream_timescale as f64);
+                            let scte35_cmd = if pe.text_content.is_empty() {
+                                None
+                            } else {
+                                Some(pe.text_content)
+                            };
+                            ad_breaks.push(AdBreakInfo {
+                                id: pe.id,
+                                presentation_time: presentation_time_secs,
+                                duration: duration_secs,
+                                scte35_cmd,
+                                segment_number: 0,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok(Event::Eof) => break,
@@ -234,7 +344,16 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
         segment_durations,
         is_live,
         source_scheme,
+        ad_breaks,
     })
+}
+
+/// Temporary state for collecting a DASH `<Event>` element's attributes and text content.
+struct PendingDashEvent {
+    id: u32,
+    presentation_time: u64,
+    duration: Option<u64>,
+    text_content: String,
 }
 
 /// Resolve a possibly-relative URI against a base URL.
@@ -538,6 +657,93 @@ mod tests {
 </MPD>"#;
         let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
         assert_eq!(result.source_scheme, None);
+    }
+
+    #[test]
+    fn parse_event_stream_with_scte35() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT18S">
+  <Period>
+    <EventStream schemeIdUri="urn:scte:scte35:2013:bin" timescale="90000">
+      <Event presentationTime="540540" duration="2700000" id="42">AQIDBA==</Event>
+    </EventStream>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000" startNumber="0">
+          <SegmentTimeline>
+            <S d="6000" r="2"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        assert_eq!(result.ad_breaks.len(), 1);
+        let ab = &result.ad_breaks[0];
+        assert_eq!(ab.id, 42);
+        // 540540 / 90000 = 6.006
+        assert!((ab.presentation_time - 6.006).abs() < 0.001);
+        // 2700000 / 90000 = 30.0
+        assert!((ab.duration.unwrap() - 30.0).abs() < 0.001);
+        assert_eq!(ab.scte35_cmd.as_deref(), Some("AQIDBA=="));
+    }
+
+    #[test]
+    fn parse_event_stream_empty_event() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <EventStream schemeIdUri="urn:scte:scte35:2013:bin" timescale="90000">
+      <Event presentationTime="0" duration="900000" id="1"/>
+    </EventStream>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000" startNumber="0">
+          <SegmentTimeline>
+            <S d="6000" r="1"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        assert_eq!(result.ad_breaks.len(), 1);
+        let ab = &result.ad_breaks[0];
+        assert_eq!(ab.id, 1);
+        assert!((ab.presentation_time - 0.0).abs() < 0.001);
+        assert!((ab.duration.unwrap() - 10.0).abs() < 0.001);
+        assert!(ab.scte35_cmd.is_none());
+    }
+
+    #[test]
+    fn parse_no_event_stream_empty_ad_breaks() {
+        let result = parse_dash_manifest(&minimal_static_mpd(), BASE_URL).unwrap();
+        assert!(result.ad_breaks.is_empty());
+    }
+
+    #[test]
+    fn parse_non_scte35_event_stream_ignored() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <EventStream schemeIdUri="urn:mpeg:dash:event:2012" timescale="1000">
+      <Event presentationTime="0" duration="1000" id="1">some data</Event>
+    </EventStream>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000" startNumber="0">
+          <SegmentTimeline>
+            <S d="6000" r="1"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        assert!(result.ad_breaks.is_empty());
     }
 
     #[test]

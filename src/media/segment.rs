@@ -4,7 +4,8 @@ use crate::drm::ContentKey;
 use crate::error::{EdgepackError, Result};
 use crate::media::box_type;
 use crate::media::cmaf::{
-    self, iterate_boxes, parse_senc, parse_trun, BoxHeader, SencEntry, TrackRunBox,
+    self, iterate_boxes, parse_emsg, parse_senc, parse_trun, BoxHeader, EmsgBox, SencEntry,
+    TrackRunBox,
 };
 
 /// Parameters for repackaging a media segment between encryption schemes.
@@ -48,6 +49,31 @@ pub fn rewrite_segment(segment_data: &[u8], params: &SegmentRewriteParams) -> Re
         (true, false) => rewrite_encrypted_to_clear(segment_data, params),
         (false, false) => Ok(segment_data.to_vec()), // pass-through
     }
+}
+
+/// Extract all emsg boxes from a media segment.
+///
+/// Iterates top-level boxes in the segment and parses any `emsg` boxes found.
+/// Malformed emsg boxes are silently skipped.
+pub fn extract_emsg_boxes(segment_data: &[u8]) -> Vec<EmsgBox> {
+    let mut result = Vec::new();
+    for header_result in iterate_boxes(segment_data) {
+        let header = match header_result {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        if header.box_type == box_type::EMSG {
+            let payload_start = header.offset as usize + header.header_size as usize;
+            let box_end = header.offset as usize + header.size as usize;
+            if payload_start < box_end && box_end <= segment_data.len() {
+                match parse_emsg(&segment_data[payload_start..box_end]) {
+                    Ok(emsg) => result.push(emsg),
+                    Err(_) => {} // skip malformed emsg
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Rewrite an encrypted segment to a different encryption scheme.
@@ -941,5 +967,89 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("target_key"));
+    }
+
+    // --- extract_emsg_boxes tests ---
+
+    fn build_simple_box(box_type: &crate::media::FourCC, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        cmaf::write_box_header(&mut buf, 8 + payload.len() as u32, box_type);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    fn build_emsg_for_segment(scheme: &str, id: u32) -> Vec<u8> {
+        let emsg = EmsgBox {
+            version: 1,
+            scheme_id_uri: scheme.to_string(),
+            value: String::new(),
+            timescale: 90000,
+            presentation_time: 900000,
+            event_duration: 0,
+            id,
+            message_data: vec![0xFC, 0x30, 0x00],
+        };
+        cmaf::build_emsg_box(&emsg)
+    }
+
+    #[test]
+    fn extract_emsg_from_segment_with_emsg() {
+        let emsg_box = build_emsg_for_segment("urn:scte:scte35:2013:bin", 1);
+        let moof = build_simple_box(&box_type::MOOF, &[0u8; 8]);
+        let mdat = build_simple_box(&box_type::MDAT, &[0u8; 8]);
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&emsg_box);
+        segment.extend_from_slice(&moof);
+        segment.extend_from_slice(&mdat);
+
+        let boxes = extract_emsg_boxes(&segment);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].id, 1);
+        assert_eq!(boxes[0].scheme_id_uri, "urn:scte:scte35:2013:bin");
+    }
+
+    #[test]
+    fn extract_emsg_no_emsg_present() {
+        let moof = build_simple_box(&box_type::MOOF, &[0u8; 8]);
+        let mdat = build_simple_box(&box_type::MDAT, &[0u8; 8]);
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&moof);
+        segment.extend_from_slice(&mdat);
+
+        let boxes = extract_emsg_boxes(&segment);
+        assert!(boxes.is_empty());
+    }
+
+    #[test]
+    fn extract_emsg_multiple_emsg_boxes() {
+        let emsg1 = build_emsg_for_segment("urn:scte:scte35:2013:bin", 1);
+        let emsg2 = build_emsg_for_segment("urn:scte:scte35:2013:bin", 2);
+        let moof = build_simple_box(&box_type::MOOF, &[0u8; 8]);
+        let mdat = build_simple_box(&box_type::MDAT, &[0u8; 8]);
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&emsg1);
+        segment.extend_from_slice(&emsg2);
+        segment.extend_from_slice(&moof);
+        segment.extend_from_slice(&mdat);
+
+        let boxes = extract_emsg_boxes(&segment);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].id, 1);
+        assert_eq!(boxes[1].id, 2);
+    }
+
+    #[test]
+    fn extract_emsg_malformed_emsg_skipped() {
+        // Build a box with emsg type but invalid payload
+        let bad_emsg = build_simple_box(&box_type::EMSG, &[0xFF; 4]);
+        let moof = build_simple_box(&box_type::MOOF, &[0u8; 8]);
+        let mdat = build_simple_box(&box_type::MDAT, &[0u8; 8]);
+        let mut segment = Vec::new();
+        segment.extend_from_slice(&bad_emsg);
+        segment.extend_from_slice(&moof);
+        segment.extend_from_slice(&mdat);
+
+        let boxes = extract_emsg_boxes(&segment);
+        assert!(boxes.is_empty());
     }
 }

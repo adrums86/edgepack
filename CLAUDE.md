@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **codec string extraction** (RFC 6381 codec strings for manifest signaling), and **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~607 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted).
 
 ## Build Commands
 
@@ -61,12 +61,14 @@ src/
 │   ├── mod.rs          FourCC type, box_type constants, TrackType enum
 │   ├── cmaf.rs         Zero-copy MP4 box parser, builders, iterators
 │   ├── codec.rs        Codec string extraction, track metadata parsing, TrackKeyMapping
+│   ├── compat.rs       Codec/scheme compatibility validation, HDR detection, init/segment structure checks
 │   ├── container.rs    ContainerFormat enum (Cmaf/Fmp4) — brands, extensions, profiles
 │   ├── init.rs         Init segment rewriting (sinf/schm/tenc/pssh + ftyp brand rewriting, per-track keying)
+│   ├── scte35.rs       SCTE-35 splice_info_section parser (splice_insert, time_signal)
 │   └── segment.rs      Media segment rewriting (senc/mdat decrypt+re-encrypt)
 ├── manifest/           Manifest parsing (input) and rendering (output)
 │   ├── mod.rs          render_manifest() dispatcher
-│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, DrmInfo, CeaCaptionInfo, SourceManifest
+│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, DrmInfo, CeaCaptionInfo, AdBreakInfo, SourceManifest
 │   ├── hls.rs          HLS M3U8 renderer (media + master playlists)
 │   ├── dash.rs         DASH MPD renderer (SegmentTemplate + SegmentTimeline)
 │   ├── hls_input.rs    HLS M3U8 input parser (source manifest extraction)
@@ -242,7 +244,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **827 tests** total (with `--features jit,cloudflare`): 648 unit tests and 179 integration tests. Without optional features: **770 tests** (624 unit + 146 integration). All run on the native host target.
+The project has **948 tests** total (with `--features jit,cloudflare`): 733 unit tests and 215 integration tests. Without optional features: **891 tests** (709 unit + 182 integration). All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -250,13 +252,13 @@ Per-feature binary size tests in `tests/wasm_binary_size.rs` prevent dependency 
 
 | Test | Features | Limit | Current Size | Functions |
 |------|----------|-------|-------------|-----------|
-| `wasm_base_binary_size` | none | 600 KB | ~580 KB | ~1,792 |
-| `wasm_jit_binary_size` | `jit` | 650 KB | ~613 KB | ~1,849 |
-| `wasm_full_binary_size` | `jit,cloudflare` | 650 KB | ~618 KB | ~1,860 |
+| `wasm_base_binary_size` | none | 650 KB | ~607 KB | ~1,900 |
+| `wasm_jit_binary_size` | `jit` | 700 KB | ~640 KB | ~1,960 |
+| `wasm_full_binary_size` | `jit,cloudflare` | 700 KB | ~645 KB | ~1,970 |
 
-JIT adds ~33 KB (57 functions) over base. Cloudflare adds only ~4.5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
+JIT adds ~33 KB (60 functions) over base. Cloudflare adds only ~4.5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
 
-### Unit Tests (648 with all features)
+### Unit Tests (733 with all features)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -269,7 +271,9 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Codec string extraction**: RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C, wvtt, stpp), track metadata parsing (hdlr handler type, mdhd timescale + language, tkhd track_id, sinf/tenc default_kid), TrackKeyMapping construction and serde roundtrips
 - **Segment rewriting**: Four-way dispatch (encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear pass-through), scheme-aware decrypt/re-encrypt with optional source/target keys
 - **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering, subtitle rendition groups (HLS `TYPE=SUBTITLES`, DASH text AdaptationSet), CEA-608/708 closed caption signaling (HLS `TYPE=CLOSED-CAPTIONS` with `INSTREAM-ID`, DASH `Accessibility` descriptors)
-- **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements
+- **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements, `#EXT-X-DATERANGE` SCTE-35 ad break extraction, DASH `<EventStream>` SCTE-35 event parsing
+- **SCTE-35 parsing**: `emsg` box parsing (v0/v1), SCTE-35 splice_info_section binary parsing (splice_insert, time_signal), scheme URI detection, emsg builder roundtrips
+- **Compatibility validation**: Codec/scheme compatibility checks (VP9+CBCS error, HEVC+CENC warning, etc.), HDR format detection (HDR10, Dolby Vision, HLG), init/media segment structure validation, repackage request pre-flight validation
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through ContinuationParams, TrackKeyMapping construction and serialization, variant building from track metadata
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
@@ -279,7 +283,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (177 with all features)
+### Integration Tests (215 with all features)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -296,6 +300,8 @@ tests/
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
 ├── handler_integration.rs    32 tests: HTTP routing (all 7 CMAF/ISOBMFF segment extensions), webhook validation, response helpers
 ├── multi_key.rs              12 tests: per-track tenc, multi-KID PSSH, single-key backward compat, codec extraction, TrackKeyMapping serde, create→strip roundtrip
+├── conformance.rs            23 tests: init/media segment structure validation, roundtrip conformance, manifest conformance
+├── scte35_integration.rs     13 tests: emsg extraction, SCTE-35 parsing, HLS/DASH ad rendering, source manifest roundtrip, serde
 └── wasm_binary_size.rs        3 tests: per-feature WASM binary size guards (base, jit, full)
 ```
 
@@ -452,6 +458,7 @@ The parser handles these box types (defined in `media::box_type`):
 - **Encryption**: `schm`, `tenc`, `pssh`, `senc`, `saiz`, `saio`, `frma`
 - **Fragment**: `trun`, `mdat`
 - **Grouping**: `sbgp`, `sgpd`
+- **Event**: `emsg`
 - **Top-level**: `ftyp`
 
 ## DRM System IDs
@@ -466,7 +473,7 @@ FairPlay is recognised in both input and output. For CENC target output, FairPla
 
 ## Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–6, 8, and 17 are complete. All P0 items are done. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–8, 16, and 17 are complete. All P0 items are done. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -521,11 +528,15 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - DASH CEA `<Accessibility schemeIdUri="urn:scte:dash:cc:cea-608:2015">` descriptors inside video AdaptationSet
 - Result: 825 tests total with `--features jit,cloudflare` (18 new subtitle/caption tests)
 
-### Phase 7: SCTE-35 Ad Markers & Multi-Period DASH — P1
-- Parse `emsg` boxes for SCTE-35 splice info
-- HLS ad markers (`#EXT-X-DATERANGE` or `#EXT-X-CUE-OUT/IN`)
-- Multi-period DASH at SCTE-35 boundaries
-- New: `src/media/scte35.rs`
+### ~~Phase 7: SCTE-35 Ad Markers & Multi-Period DASH~~ ✅ Complete
+- `emsg` box parsing (v0/v1) with SCTE-35 splice_info_section binary parser (`src/media/scte35.rs`)
+- `EmsgBox` type with builder/parser in `cmaf.rs`, `extract_emsg_boxes()` in `segment.rs`
+- `AdBreakInfo` type in `manifest/types.rs`, threaded through pipeline → ProgressiveOutput → ManifestState
+- HLS ad markers via `#EXT-X-DATERANGE` with `SCTE35-CMD` hex encoding
+- DASH `<EventStream>` with SCTE-35 scheme URI and `<Event>` elements
+- Source manifest parsing: `#EXT-X-DATERANGE` in HLS input, `<EventStream>` in DASH input
+- New: `src/media/scte35.rs`, `tests/scte35_integration.rs` (13 integration tests)
+- Result: 948 tests total with `--features jit,cloudflare`
 
 ### ~~Phase 8: JIT Packaging (On-Demand GET)~~ ✅ Complete
 - Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging on cache miss)
@@ -564,10 +575,14 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - CMAF-to-TS muxer, HLS-TS manifests, AES-128 segment encryption
 - New: `src/media/ts_mux.rs`
 
-### Phase 16: Compatibility Validation & Hardening — P1 (parallel)
-- Codec compatibility matrix, pipeline validation hooks
-- HDR metadata preservation validation
-- New: `src/media/compat.rs`, conformance test suite
+### ~~Phase 16: Compatibility Validation & Hardening~~ ✅ Complete
+- Codec/scheme compatibility validation (`src/media/compat.rs`): VP9+CBCS error, HEVC+CENC subsample warning, AV1+CBCS warning, DV RPU warning, text track encryption error
+- HDR format detection (HDR10, HDR10+, Dolby Vision, HLG) from codec strings
+- Init segment structure validation (ftyp ordering, sinf/schm/tenc presence, PSSH well-formedness)
+- Media segment structure validation (moof/mdat presence, senc sample count, IV size)
+- `validate_repackage_request()` pre-flight check in pipeline entry (errors → reject, warnings → log)
+- Post-rewrite debug validation (init + segment structure checks)
+- New: `src/media/compat.rs` (28 unit tests), `tests/conformance.rs` (23 integration tests)
 
 ### ~~Phase 17: CDN Provider Adapters & Binary Optimization~~ ✅ Complete
 - Generalized config: `RedisConfig` → `StoreConfig`, `RedisBackendType` → `CacheBackendType`

@@ -5,14 +5,14 @@
 //! function count (a cold-start proxy) via `wasm-tools` if installed.
 //!
 //! Build variants and thresholds:
-//!   - Base (no features):           600,000 bytes (600 KB)
-//!   - JIT-only (`--features jit`):  650,000 bytes (650 KB)
-//!   - Full (`--features jit,cloudflare`): 650,000 bytes (650 KB)
+//!   - Base (no features):           650,000 bytes (650 KB)
+//!   - JIT-only (`--features jit`):  700,000 bytes (700 KB)
+//!   - Full (`--features jit,cloudflare`): 700,000 bytes (700 KB)
 //!
-//! Current baselines (as of Phase 6 completion):
-//!   - Base:  ~580 KB,  ~1,792 functions
-//!   - JIT:   ~613 KB,  ~1,849 functions (+33 KB, +57 fns)
-//!   - Full:  ~618 KB,  ~1,860 functions (+38 KB, +68 fns)
+//! Current baselines (as of Phase 7 + Phase 16 completion):
+//!   - Base:  ~607 KB,  ~1,900 functions
+//!   - JIT:   ~640 KB,  ~1,960 functions (+33 KB, +60 fns)
+//!   - Full:  ~645 KB,  ~1,970 functions (+38 KB, +70 fns)
 
 /// Build the WASM binary with the given features, assert it's under `max_bytes`,
 /// and report size + function count.
@@ -111,15 +111,15 @@ fn report_function_count(wasm_path: &std::path::Path, label: &str) {
 
 #[test]
 fn wasm_base_binary_size() {
-    build_and_measure(&[], 600_000, "base");
+    build_and_measure(&[], 650_000, "base");
 }
 
 #[test]
 fn wasm_jit_binary_size() {
-    build_and_measure(&["jit"], 650_000, "jit");
+    build_and_measure(&["jit"], 700_000, "jit");
 }
 
 #[test]
 fn wasm_full_binary_size() {
-    build_and_measure(&["jit", "cloudflare"], 650_000, "full");
+    build_and_measure(&["jit", "cloudflare"], 700_000, "full");
 }

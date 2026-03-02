@@ -1,6 +1,15 @@
 use crate::error::Result;
 use crate::manifest::types::{ManifestPhase, ManifestState};
 
+/// Decode base64 SCTE-35 command and return hex-encoded string.
+fn hex_encode_base64(b64: &str) -> String {
+    use base64::Engine;
+    match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => b64.to_string(), // fallback: pass through as-is
+    }
+}
+
 /// Render an HLS M3U8 manifest from the current state.
 ///
 /// - During `Live` phase: produces a live playlist (no `#EXT-X-ENDLIST`)
@@ -87,6 +96,33 @@ pub fn render(state: &ManifestState) -> Result<String> {
 
     // Segments
     for segment in &state.segments {
+        // SCTE-35 ad break markers for this segment
+        for ab in &state.ad_breaks {
+            if ab.segment_number == segment.number {
+                let mut daterange = format!(
+                    "#EXT-X-DATERANGE:ID=\"splice-{}\"",
+                    ab.id
+                );
+                // ISO 8601 date from presentation time (epoch-relative)
+                let secs = ab.presentation_time as u64;
+                let frac = ab.presentation_time - secs as f64;
+                daterange.push_str(&format!(
+                    ",START-DATE=\"1970-01-01T{:02}:{:02}:{:02}.{:03}Z\"",
+                    (secs / 3600) % 24,
+                    (secs / 60) % 60,
+                    secs % 60,
+                    (frac * 1000.0) as u32
+                ));
+                if let Some(dur) = ab.duration {
+                    daterange.push_str(&format!(",PLANNED-DURATION={dur:.3}"));
+                }
+                if let Some(ref cmd) = ab.scte35_cmd {
+                    daterange.push_str(&format!(",SCTE35-CMD=0x{}", hex_encode_base64(cmd)));
+                }
+                m3u8.push_str(&daterange);
+                m3u8.push('\n');
+            }
+        }
         m3u8.push_str(&format!("#EXTINF:{:.6},\n", segment.duration));
         m3u8.push_str(&format!("{}\n", segment.uri));
     }
@@ -256,6 +292,83 @@ mod tests {
         assert!(m3u8.contains("METHOD=SAMPLE-AES"));
         assert!(m3u8.contains("KEYFORMAT=\"com.apple.streamingkeydelivery\""));
         assert!(m3u8.contains("skd://key-server/key-id"));
+    }
+
+    #[test]
+    fn render_with_ad_break() {
+        let mut state = make_live_state_with_segments(3);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 42,
+            presentation_time: 12.0,
+            duration: Some(30.0),
+            scte35_cmd: None,
+            segment_number: 2,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("#EXT-X-DATERANGE:ID=\"splice-42\""));
+        assert!(m3u8.contains("PLANNED-DURATION=30.000"));
+        // Should appear before segment 2's EXTINF
+        let daterange_pos = m3u8.find("splice-42").unwrap();
+        let seg2_pos = m3u8.find("/base/segment_2.cmfv").unwrap();
+        assert!(daterange_pos < seg2_pos);
+    }
+
+    #[test]
+    fn render_with_ad_break_no_duration() {
+        let mut state = make_live_state_with_segments(2);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 6.0,
+            duration: None,
+            scte35_cmd: None,
+            segment_number: 1,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("#EXT-X-DATERANGE:ID=\"splice-1\""));
+        assert!(!m3u8.contains("PLANNED-DURATION"));
+    }
+
+    #[test]
+    fn render_with_ad_break_scte35_cmd() {
+        let mut state = make_live_state_with_segments(1);
+        // Base64 of [0xFC, 0x30] → "/DA="
+        state.ad_breaks.push(AdBreakInfo {
+            id: 5,
+            presentation_time: 0.0,
+            duration: None,
+            scte35_cmd: Some("/DA=".to_string()),
+            segment_number: 0,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("SCTE35-CMD=0x"));
+    }
+
+    #[test]
+    fn render_no_ad_breaks_unchanged() {
+        let state = make_live_state_with_segments(2);
+        let m3u8 = render(&state).unwrap();
+        assert!(!m3u8.contains("EXT-X-DATERANGE"));
+    }
+
+    #[test]
+    fn render_multiple_ad_breaks() {
+        let mut state = make_live_state_with_segments(3);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 6.0,
+            duration: Some(15.0),
+            scte35_cmd: None,
+            segment_number: 1,
+        });
+        state.ad_breaks.push(AdBreakInfo {
+            id: 2,
+            presentation_time: 12.0,
+            duration: Some(30.0),
+            scte35_cmd: None,
+            segment_number: 2,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert_eq!(m3u8.matches("EXT-X-DATERANGE").count(), 2);
     }
 
     #[test]

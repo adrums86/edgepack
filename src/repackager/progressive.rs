@@ -1,7 +1,7 @@
 use crate::manifest;
 use crate::manifest::types::{
-    InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo,
-    VariantInfo,
+    AdBreakInfo, InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat,
+    SegmentInfo, VariantInfo,
 };
 use crate::media::container::ContainerFormat;
 
@@ -100,6 +100,11 @@ impl ProgressiveOutput {
 
         // Render current manifest
         manifest::render_manifest(&self.state).ok()
+    }
+
+    /// Add an ad break marker to the manifest state.
+    pub fn add_ad_break(&mut self, info: AdBreakInfo) {
+        self.state.ad_breaks.push(info);
     }
 
     /// Mark the manifest as complete (VOD).

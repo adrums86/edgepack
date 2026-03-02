@@ -9,8 +9,10 @@ use crate::manifest::types::{
     TrackMediaType, VariantInfo,
 };
 use crate::media::codec::{extract_tracks, TrackInfo, TrackKeyMapping};
+use crate::media::compat;
 use crate::media::container::ContainerFormat;
 use crate::media::init;
+use crate::media::scte35;
 use crate::media::segment::{self, SegmentRewriteParams};
 use crate::repackager::progressive::ProgressiveOutput;
 use crate::repackager::{JobState, JobStatus, RepackageRequest};
@@ -82,6 +84,24 @@ impl RepackagePipeline {
 
         // Step 3: Extract track info for codec strings and per-track KIDs
         let tracks = extract_tracks(&init_data).unwrap_or_default();
+
+        // Step 3a: Validate codec/scheme compatibility (pre-flight check)
+        let validation = compat::validate_repackage_request(
+            source_scheme,
+            target_schemes,
+            container_format,
+            &tracks,
+        );
+        if !validation.errors.is_empty() {
+            return Err(EdgepackError::InvalidInput(format!(
+                "validation failed: {}",
+                validation.errors.join("; ")
+            )));
+        }
+        for warning in &validation.warnings {
+            log::warn!("validation warning: {warning}");
+        }
+
         let key_mapping = build_track_key_mapping(&tracks, &protection_info, content_id);
         let primary_kid = key_mapping.all_kids().into_iter().next()
             .unwrap_or_else(|| derive_kid_from_content_id(content_id));
@@ -154,10 +174,15 @@ impl RepackagePipeline {
             Some(source.segment_urls.len() as u32),
         )?;
 
+        let mut elapsed_time = 0.0f64;
         for (i, segment_url) in source.segment_urls.iter().enumerate() {
             let seg_data = self.fetch_segment(segment_url)?;
             let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
             let is_last = i == source.segment_urls.len() - 1 && !source.is_live;
+
+            // Extract SCTE-35 ad breaks from emsg boxes (once per source segment)
+            let ad_breaks = extract_ad_breaks_from_segment(&seg_data, i as u32, elapsed_time);
+            elapsed_time += duration;
 
             // Re-encrypt for each target scheme
             for (target_scheme, progressive) in outputs.iter_mut() {
@@ -180,6 +205,11 @@ impl RepackagePipeline {
 
                 let new_segment = segment::rewrite_segment(&seg_data, &params)?;
                 progressive.add_segment(i as u32, new_segment, duration);
+
+                // Add ad breaks to this scheme's progressive output
+                for ab in &ad_breaks {
+                    progressive.add_ad_break(ab.clone());
+                }
 
                 if is_last {
                     progressive.finalize();
@@ -262,6 +292,24 @@ impl RepackagePipeline {
 
         // Step 3: Extract track info and build key mapping
         let tracks = extract_tracks(&init_data).unwrap_or_default();
+
+        // Step 3a: Validate codec/scheme compatibility (pre-flight check)
+        let validation = compat::validate_repackage_request(
+            source_scheme,
+            target_schemes,
+            container_format,
+            &tracks,
+        );
+        if !validation.errors.is_empty() {
+            return Err(EdgepackError::InvalidInput(format!(
+                "validation failed: {}",
+                validation.errors.join("; ")
+            )));
+        }
+        for warning in &validation.warnings {
+            log::warn!("validation warning: {warning}");
+        }
+
         let key_mapping = build_track_key_mapping(&tracks, &protection_info, content_id);
         let primary_kid = key_mapping.all_kids().into_iter().next()
             .unwrap_or_else(|| derive_kid_from_content_id(content_id));
@@ -291,6 +339,9 @@ impl RepackagePipeline {
         let seg_data = self.fetch_segment(&source.segment_urls[0])?;
         let first_duration = source.segment_durations.first().copied().unwrap_or(6.0);
         let is_last = source.segment_urls.len() == 1 && !source.is_live;
+
+        // Extract SCTE-35 ad breaks from first segment's emsg boxes
+        let ad_breaks = extract_ad_breaks_from_segment(&seg_data, 0, 0.0);
 
         // Step 6: Per-scheme — continuation params, init rewrite, first segment, manifest state
         for &target_scheme in target_schemes {
@@ -399,6 +450,9 @@ impl RepackagePipeline {
             )?;
 
             progressive.add_segment(0, new_segment, first_duration);
+            for ab in &ad_breaks {
+                progressive.add_ad_break(ab.clone());
+            }
             if is_last {
                 progressive.finalize();
             }
@@ -498,6 +552,12 @@ impl RepackagePipeline {
         let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
         let is_last = i == total - 1 && !source.is_live;
 
+        // Calculate elapsed time from prior segment durations
+        let elapsed_time: f64 = source.segment_durations[..i].iter().sum();
+
+        // Extract SCTE-35 ad breaks from emsg boxes
+        let ad_breaks = extract_ad_breaks_from_segment(&seg_data, i as u32, elapsed_time);
+
         // Process for each target scheme
         let mut needs_keys = false;
         for target_scheme in &target_schemes {
@@ -568,6 +628,12 @@ impl RepackagePipeline {
             if duration > manifest_state.target_duration {
                 manifest_state.target_duration = duration;
             }
+
+            // Add ad breaks from this segment
+            for ab in &ad_breaks {
+                manifest_state.ad_breaks.push(ab.clone());
+            }
+
             if is_last {
                 manifest_state.phase = ManifestPhase::Complete;
             }
@@ -759,6 +825,24 @@ impl RepackagePipeline {
 
         // Step 3: Extract tracks and build key mapping
         let tracks = extract_tracks(&init_data).unwrap_or_default();
+
+        // Step 3a: Validate codec/scheme compatibility (pre-flight check)
+        let validation = compat::validate_repackage_request(
+            source_scheme,
+            &[target_scheme],
+            source_config.container_format,
+            &tracks,
+        );
+        if !validation.errors.is_empty() {
+            return Err(EdgepackError::InvalidInput(format!(
+                "validation failed: {}",
+                validation.errors.join("; ")
+            )));
+        }
+        for warning in &validation.warnings {
+            log::warn!("validation warning: {warning}");
+        }
+
         let key_mapping = build_track_key_mapping(&tracks, &protection_info, content_id);
         let primary_kid = key_mapping.all_kids().into_iter().next()
             .unwrap_or_else(|| derive_kid_from_content_id(content_id));
@@ -886,6 +970,7 @@ impl RepackagePipeline {
             base_url: base_url.to_string(),
             container_format,
             cea_captions: Vec::new(),
+            ad_breaks: Vec::new(),
         };
 
         let state_json = serde_json::to_vec(&manifest_state)
@@ -1189,6 +1274,41 @@ fn restore_content_key(cached: &CachedKey) -> ContentKey {
         key: cached.key.clone(),
         iv: cached.iv.clone(),
     }
+}
+
+/// Extract SCTE-35 ad breaks from emsg boxes in a source segment.
+fn extract_ad_breaks_from_segment(
+    segment_data: &[u8],
+    segment_number: u32,
+    elapsed_time: f64,
+) -> Vec<crate::manifest::types::AdBreakInfo> {
+    use base64::Engine;
+    let emsg_boxes = segment::extract_emsg_boxes(segment_data);
+    let mut ad_breaks = Vec::new();
+
+    for emsg in &emsg_boxes {
+        if !scte35::is_scte35_emsg(emsg) {
+            continue;
+        }
+        if let Ok(splice) = scte35::parse_splice_info(&emsg.message_data) {
+            let presentation_time = if let Some(pts) = splice.pts_time {
+                pts as f64 / 90000.0
+            } else {
+                elapsed_time
+            };
+            let scte35_cmd =
+                Some(base64::engine::general_purpose::STANDARD.encode(&emsg.message_data));
+            ad_breaks.push(crate::manifest::types::AdBreakInfo {
+                id: splice.splice_event_id,
+                presentation_time,
+                duration: splice.break_duration,
+                scte35_cmd,
+                segment_number,
+            });
+        }
+    }
+
+    ad_breaks
 }
 
 // ---------------------------------------------------------------------------

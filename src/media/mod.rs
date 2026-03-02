@@ -1,7 +1,9 @@
 pub mod cmaf;
 pub mod codec;
+pub mod compat;
 pub mod container;
 pub mod init;
+pub mod scte35;
 pub mod segment;
 
 /// Four-character code (FourCC) used to identify MP4 box types.
@@ -43,6 +45,7 @@ pub mod box_type {
     pub const MVEX: FourCC = *b"mvex";
     pub const TREX: FourCC = *b"trex";
     pub const EDTS: FourCC = *b"edts";
+    pub const EMSG: FourCC = *b"emsg";
 }
 
 /// Track types as identified by the handler type in hdlr box.

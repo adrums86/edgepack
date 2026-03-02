@@ -91,6 +91,21 @@ pub struct ManifestDrmInfo {
     pub default_kid: String,
 }
 
+/// SCTE-35 ad break information extracted from emsg boxes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdBreakInfo {
+    /// Splice event ID (from splice_insert).
+    pub id: u32,
+    /// Presentation time in seconds from stream start.
+    pub presentation_time: f64,
+    /// Break duration in seconds (None = unknown/unbounded).
+    pub duration: Option<f64>,
+    /// Base64-encoded splice_info_section (for HLS SCTE35-CMD).
+    pub scte35_cmd: Option<String>,
+    /// Segment number containing this splice point.
+    pub segment_number: u32,
+}
+
 /// CEA-608/708 closed caption channel info for manifest signaling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CeaCaptionInfo {
@@ -131,6 +146,9 @@ pub struct ManifestState {
     /// CEA-608/708 closed caption channels (embedded in video, signaled in manifest).
     #[serde(default)]
     pub cea_captions: Vec<CeaCaptionInfo>,
+    /// SCTE-35 ad break markers extracted from emsg boxes.
+    #[serde(default)]
+    pub ad_breaks: Vec<AdBreakInfo>,
 }
 
 /// Lifecycle phase of the manifest.
@@ -164,6 +182,7 @@ impl ManifestState {
             base_url,
             container_format,
             cea_captions: Vec::new(),
+            ad_breaks: Vec::new(),
         }
     }
 
@@ -189,6 +208,9 @@ pub struct SourceManifest {
     /// Encryption scheme detected from manifest DRM signaling.
     /// `None` if not signaled in the manifest (will be detected from init segment instead).
     pub source_scheme: Option<EncryptionScheme>,
+    /// Ad break markers parsed from source manifest (HLS EXT-X-DATERANGE, DASH EventStream).
+    #[serde(default)]
+    pub ad_breaks: Vec<AdBreakInfo>,
 }
 
 #[cfg(test)]
@@ -395,6 +417,66 @@ mod tests {
 
         state.phase = ManifestPhase::Complete;
         assert!(state.is_complete());
+    }
+
+    #[test]
+    fn ad_break_info_construction() {
+        let ab = AdBreakInfo {
+            id: 42,
+            presentation_time: 30.0,
+            duration: Some(15.0),
+            scte35_cmd: Some("base64data".to_string()),
+            segment_number: 5,
+        };
+        assert_eq!(ab.id, 42);
+        assert!((ab.presentation_time - 30.0).abs() < f64::EPSILON);
+        assert_eq!(ab.duration, Some(15.0));
+        assert_eq!(ab.segment_number, 5);
+    }
+
+    #[test]
+    fn ad_break_info_serde_roundtrip() {
+        let ab = AdBreakInfo {
+            id: 1,
+            presentation_time: 60.0,
+            duration: None,
+            scte35_cmd: None,
+            segment_number: 10,
+        };
+        let json = serde_json::to_string(&ab).unwrap();
+        let parsed: AdBreakInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, 1);
+        assert!((parsed.presentation_time - 60.0).abs() < f64::EPSILON);
+        assert!(parsed.duration.is_none());
+        assert!(parsed.scte35_cmd.is_none());
+    }
+
+    #[test]
+    fn manifest_state_with_ad_breaks() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        assert!(state.ad_breaks.is_empty());
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 30.0,
+            duration: Some(15.0),
+            scte35_cmd: None,
+            segment_number: 5,
+        });
+        assert_eq!(state.ad_breaks.len(), 1);
+
+        // Verify serde roundtrip with ad_breaks
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: ManifestState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.ad_breaks.len(), 1);
+        assert_eq!(parsed.ad_breaks[0].id, 1);
+    }
+
+    #[test]
+    fn manifest_state_serde_backward_compat_no_ad_breaks() {
+        // Verify ManifestState from JSON without ad_breaks field deserializes correctly
+        let json = r#"{"content_id":"c","format":"Hls","phase":"Live","init_segment":null,"segments":[],"target_duration":6.0,"variants":[],"drm_info":null,"media_sequence":0,"base_url":"/"}"#;
+        let parsed: ManifestState = serde_json::from_str(json).unwrap();
+        assert!(parsed.ad_breaks.is_empty());
     }
 
     #[test]
