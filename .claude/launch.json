@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sandbox",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "--bin", "sandbox", "--features", "sandbox", "--target", "aarch64-apple-darwin"],
+      "port": 3333
+    }
+  ]
+}
