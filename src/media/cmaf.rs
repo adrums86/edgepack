@@ -1,5 +1,6 @@
 use crate::error::{EdgepackError, Result};
 use crate::media::FourCC;
+use serde::{Deserialize, Serialize};
 
 /// An ISOBMFF box header.
 #[derive(Debug, Clone)]
@@ -572,6 +573,212 @@ pub fn build_senc_box(entries: &[SencEntry], use_subsamples: bool) -> Vec<u8> {
     output
 }
 
+/// Parsed emsg (event message) box.
+///
+/// Carries in-band event messages in media segments. Used for SCTE-35 ad markers,
+/// ID3 metadata, and other timed events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmsgBox {
+    /// Box version (0 or 1).
+    pub version: u8,
+    /// Scheme ID URI identifying the event type.
+    pub scheme_id_uri: String,
+    /// Value string (scheme-specific).
+    pub value: String,
+    /// Timescale for presentation_time and event_duration.
+    pub timescale: u32,
+    /// Presentation time (v0: delta from segment decode time; v1: absolute).
+    pub presentation_time: u64,
+    /// Event duration in timescale units (0xFFFFFFFF = unknown).
+    pub event_duration: u32,
+    /// Event identifier.
+    pub id: u32,
+    /// Event-specific data (e.g., SCTE-35 splice_info_section binary).
+    pub message_data: Vec<u8>,
+}
+
+/// Read a NUL-terminated string from data starting at offset.
+/// Returns (string, bytes_consumed_including_NUL).
+fn read_nul_string(data: &[u8], offset: usize) -> Result<(String, usize)> {
+    let start = offset;
+    let mut end = offset;
+    while end < data.len() && data[end] != 0 {
+        end += 1;
+    }
+    if end >= data.len() {
+        return Err(EdgepackError::MediaParse(
+            "emsg: NUL-terminated string extends beyond data".into(),
+        ));
+    }
+    let s = String::from_utf8_lossy(&data[start..end]).into_owned();
+    Ok((s, end - start + 1)) // +1 for the NUL byte
+}
+
+/// Parse an emsg box from its full box payload (including version/flags).
+///
+/// Version 0 layout: version(1) + flags(3) + scheme_id_uri(NUL) + value(NUL) +
+///   timescale(4) + presentation_time_delta(4) + event_duration(4) + id(4) + message_data
+///
+/// Version 1 layout: version(1) + flags(3) + timescale(4) + presentation_time(8) +
+///   event_duration(4) + id(4) + scheme_id_uri(NUL) + value(NUL) + message_data
+pub fn parse_emsg(data: &[u8]) -> Result<EmsgBox> {
+    if data.len() < 4 {
+        return Err(EdgepackError::MediaParse("emsg box too small".into()));
+    }
+
+    let version = data[0];
+    // flags at data[1..4] — ignored
+
+    match version {
+        0 => {
+            let mut offset = 4;
+            let (scheme_id_uri, consumed) = read_nul_string(data, offset)?;
+            offset += consumed;
+            let (value, consumed) = read_nul_string(data, offset)?;
+            offset += consumed;
+
+            if offset + 16 > data.len() {
+                return Err(EdgepackError::MediaParse(
+                    "emsg v0: not enough data for fixed fields".into(),
+                ));
+            }
+
+            let timescale = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+            let presentation_time_delta = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+            let event_duration = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+            let id = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+
+            let message_data = data[offset..].to_vec();
+
+            Ok(EmsgBox {
+                version: 0,
+                scheme_id_uri,
+                value,
+                timescale,
+                presentation_time: presentation_time_delta as u64,
+                event_duration,
+                id,
+                message_data,
+            })
+        }
+        1 => {
+            if data.len() < 24 {
+                return Err(EdgepackError::MediaParse(
+                    "emsg v1: not enough data for fixed fields".into(),
+                ));
+            }
+
+            let mut offset = 4;
+            let timescale = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+            let presentation_time = u64::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+            ]);
+            offset += 8;
+            let event_duration = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+            let id = u32::from_be_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+
+            let (scheme_id_uri, consumed) = read_nul_string(data, offset)?;
+            offset += consumed;
+            let (value, consumed) = read_nul_string(data, offset)?;
+            offset += consumed;
+
+            let message_data = data[offset..].to_vec();
+
+            Ok(EmsgBox {
+                version: 1,
+                scheme_id_uri,
+                value,
+                timescale,
+                presentation_time,
+                event_duration,
+                id,
+                message_data,
+            })
+        }
+        _ => Err(EdgepackError::MediaParse(format!(
+            "emsg: unsupported version {version}"
+        ))),
+    }
+}
+
+/// Build an emsg box from its components.
+pub fn build_emsg_box(emsg: &EmsgBox) -> Vec<u8> {
+    let mut inner = Vec::new();
+
+    match emsg.version {
+        0 => {
+            // version + flags
+            inner.push(0);
+            inner.extend_from_slice(&[0u8; 3]);
+            // scheme_id_uri + NUL
+            inner.extend_from_slice(emsg.scheme_id_uri.as_bytes());
+            inner.push(0);
+            // value + NUL
+            inner.extend_from_slice(emsg.value.as_bytes());
+            inner.push(0);
+            // timescale
+            inner.extend_from_slice(&emsg.timescale.to_be_bytes());
+            // presentation_time_delta (v0 is 32-bit)
+            inner.extend_from_slice(&(emsg.presentation_time as u32).to_be_bytes());
+            // event_duration
+            inner.extend_from_slice(&emsg.event_duration.to_be_bytes());
+            // id
+            inner.extend_from_slice(&emsg.id.to_be_bytes());
+            // message_data
+            inner.extend_from_slice(&emsg.message_data);
+        }
+        _ => {
+            // version 1 (or treat any non-0 as v1)
+            inner.push(1);
+            inner.extend_from_slice(&[0u8; 3]);
+            // timescale
+            inner.extend_from_slice(&emsg.timescale.to_be_bytes());
+            // presentation_time (64-bit)
+            inner.extend_from_slice(&emsg.presentation_time.to_be_bytes());
+            // event_duration
+            inner.extend_from_slice(&emsg.event_duration.to_be_bytes());
+            // id
+            inner.extend_from_slice(&emsg.id.to_be_bytes());
+            // scheme_id_uri + NUL
+            inner.extend_from_slice(emsg.scheme_id_uri.as_bytes());
+            inner.push(0);
+            // value + NUL
+            inner.extend_from_slice(emsg.value.as_bytes());
+            inner.push(0);
+            // message_data
+            inner.extend_from_slice(&emsg.message_data);
+        }
+    }
+
+    let total_size = 8 + inner.len() as u32;
+    let mut output = Vec::with_capacity(total_size as usize);
+    write_box_header(&mut output, total_size, &crate::media::box_type::EMSG);
+    output.extend_from_slice(&inner);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,5 +1175,158 @@ mod tests {
         let header = read_box_header(&data, 0).unwrap();
         let payload = box_payload(&data, &header);
         assert_eq!(payload, &[0xAA, 0xBB, 0xCC]);
+    }
+
+    // --- parse_emsg ---
+
+    #[test]
+    fn parse_emsg_v0() {
+        let mut payload = Vec::new();
+        payload.push(0); // version
+        payload.extend_from_slice(&[0u8; 3]); // flags
+        payload.extend_from_slice(b"urn:test:scheme\0"); // scheme_id_uri + NUL
+        payload.extend_from_slice(b"value1\0"); // value + NUL
+        payload.extend_from_slice(&90000u32.to_be_bytes()); // timescale
+        payload.extend_from_slice(&1000u32.to_be_bytes()); // presentation_time_delta
+        payload.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // event_duration
+        payload.extend_from_slice(&42u32.to_be_bytes()); // id
+        payload.extend_from_slice(&[0xDE, 0xAD]); // message_data
+
+        let emsg = parse_emsg(&payload).unwrap();
+        assert_eq!(emsg.version, 0);
+        assert_eq!(emsg.scheme_id_uri, "urn:test:scheme");
+        assert_eq!(emsg.value, "value1");
+        assert_eq!(emsg.timescale, 90000);
+        assert_eq!(emsg.presentation_time, 1000);
+        assert_eq!(emsg.event_duration, 0xFFFFFFFF);
+        assert_eq!(emsg.id, 42);
+        assert_eq!(emsg.message_data, vec![0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn parse_emsg_v1() {
+        let mut payload = Vec::new();
+        payload.push(1); // version
+        payload.extend_from_slice(&[0u8; 3]); // flags
+        payload.extend_from_slice(&90000u32.to_be_bytes()); // timescale
+        payload.extend_from_slice(&8100000u64.to_be_bytes()); // presentation_time (90s)
+        payload.extend_from_slice(&2700000u32.to_be_bytes()); // event_duration (30s)
+        payload.extend_from_slice(&99u32.to_be_bytes()); // id
+        payload.extend_from_slice(b"urn:scte:scte35:2013:bin\0"); // scheme_id_uri + NUL
+        payload.extend_from_slice(b"\0"); // value (empty + NUL)
+        payload.extend_from_slice(&[0xFC, 0x30]); // message_data
+
+        let emsg = parse_emsg(&payload).unwrap();
+        assert_eq!(emsg.version, 1);
+        assert_eq!(emsg.scheme_id_uri, "urn:scte:scte35:2013:bin");
+        assert_eq!(emsg.value, "");
+        assert_eq!(emsg.timescale, 90000);
+        assert_eq!(emsg.presentation_time, 8100000);
+        assert_eq!(emsg.event_duration, 2700000);
+        assert_eq!(emsg.id, 99);
+        assert_eq!(emsg.message_data, vec![0xFC, 0x30]);
+    }
+
+    #[test]
+    fn parse_emsg_v0_empty_message() {
+        let mut payload = Vec::new();
+        payload.push(0);
+        payload.extend_from_slice(&[0u8; 3]);
+        payload.extend_from_slice(b"urn:test\0");
+        payload.extend_from_slice(b"\0"); // empty value
+        payload.extend_from_slice(&1000u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        // no message_data
+
+        let emsg = parse_emsg(&payload).unwrap();
+        assert!(emsg.message_data.is_empty());
+    }
+
+    #[test]
+    fn parse_emsg_too_small() {
+        assert!(parse_emsg(&[0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn parse_emsg_unsupported_version() {
+        let mut payload = vec![2u8]; // version 2
+        payload.extend_from_slice(&[0u8; 3]);
+        payload.extend_from_slice(&[0u8; 20]); // padding
+        assert!(parse_emsg(&payload).is_err());
+    }
+
+    // --- build_emsg_box ---
+
+    #[test]
+    fn build_emsg_box_v0_roundtrip() {
+        let emsg = EmsgBox {
+            version: 0,
+            scheme_id_uri: "urn:test:scheme".to_string(),
+            value: "val".to_string(),
+            timescale: 90000,
+            presentation_time: 500,
+            event_duration: 1000,
+            id: 7,
+            message_data: vec![0xAA, 0xBB, 0xCC],
+        };
+        let built = build_emsg_box(&emsg);
+        let header = read_box_header(&built, 0).unwrap();
+        assert_eq!(header.box_type, box_type::EMSG);
+        let payload = &built[header.header_size as usize..];
+        let parsed = parse_emsg(payload).unwrap();
+        assert_eq!(parsed.version, 0);
+        assert_eq!(parsed.scheme_id_uri, "urn:test:scheme");
+        assert_eq!(parsed.value, "val");
+        assert_eq!(parsed.timescale, 90000);
+        assert_eq!(parsed.presentation_time, 500);
+        assert_eq!(parsed.event_duration, 1000);
+        assert_eq!(parsed.id, 7);
+        assert_eq!(parsed.message_data, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn build_emsg_box_v1_roundtrip() {
+        let emsg = EmsgBox {
+            version: 1,
+            scheme_id_uri: "urn:scte:scte35:2013:bin".to_string(),
+            value: String::new(),
+            timescale: 90000,
+            presentation_time: 8100000,
+            event_duration: 2700000,
+            id: 42,
+            message_data: vec![0xFC, 0x30, 0x00],
+        };
+        let built = build_emsg_box(&emsg);
+        let header = read_box_header(&built, 0).unwrap();
+        let payload = &built[header.header_size as usize..];
+        let parsed = parse_emsg(payload).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.scheme_id_uri, "urn:scte:scte35:2013:bin");
+        assert_eq!(parsed.timescale, 90000);
+        assert_eq!(parsed.presentation_time, 8100000);
+        assert_eq!(parsed.event_duration, 2700000);
+        assert_eq!(parsed.id, 42);
+        assert_eq!(parsed.message_data, vec![0xFC, 0x30, 0x00]);
+    }
+
+    #[test]
+    fn build_emsg_box_empty_message() {
+        let emsg = EmsgBox {
+            version: 0,
+            scheme_id_uri: "urn:x".to_string(),
+            value: String::new(),
+            timescale: 1,
+            presentation_time: 0,
+            event_duration: 0,
+            id: 0,
+            message_data: Vec::new(),
+        };
+        let built = build_emsg_box(&emsg);
+        let header = read_box_header(&built, 0).unwrap();
+        let payload = &built[header.header_size as usize..];
+        let parsed = parse_emsg(payload).unwrap();
+        assert!(parsed.message_data.is_empty());
     }
 }

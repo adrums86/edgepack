@@ -50,6 +50,30 @@ pub fn render(state: &ManifestState) -> Result<String> {
     // Period
     mpd.push_str("  <Period id=\"0\">\n");
 
+    // SCTE-35 EventStream (ad break signaling)
+    if !state.ad_breaks.is_empty() {
+        mpd.push_str(
+            "    <EventStream schemeIdUri=\"urn:scte:scte35:2013:bin\" timescale=\"90000\">\n",
+        );
+        for ab in &state.ad_breaks {
+            let pts = (ab.presentation_time * 90000.0) as u64;
+            let dur = ab
+                .duration
+                .map(|d| (d * 90000.0) as u64)
+                .unwrap_or(0);
+            mpd.push_str(&format!(
+                "      <Event presentationTime=\"{pts}\" duration=\"{dur}\" id=\"{}\"",
+                ab.id
+            ));
+            if let Some(ref cmd) = ab.scte35_cmd {
+                mpd.push_str(&format!(">{cmd}</Event>\n"));
+            } else {
+                mpd.push_str("/>\n");
+            }
+        }
+        mpd.push_str("    </EventStream>\n");
+    }
+
     // Content Protection at AdaptationSet level
     let cp_xml = build_content_protection_xml(state);
 
@@ -700,5 +724,103 @@ mod tests {
         assert!(mpd.contains("urn:scte:dash:cc:cea-608:2015"));
         // Count AdaptationSet elements
         assert_eq!(mpd.matches("<AdaptationSet").count(), 3);
+    }
+
+    // --- SCTE-35 EventStream tests ---
+
+    #[test]
+    fn render_with_ad_break_event_stream() {
+        let mut state = make_live_state_with_segments(3);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 42,
+            presentation_time: 12.0,
+            duration: Some(30.0),
+            scte35_cmd: None,
+            segment_number: 2,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("<EventStream schemeIdUri=\"urn:scte:scte35:2013:bin\" timescale=\"90000\">"));
+        assert!(mpd.contains("id=\"42\""));
+        // 12s * 90000 = 1080000
+        assert!(mpd.contains("presentationTime=\"1080000\""));
+        // 30s * 90000 = 2700000
+        assert!(mpd.contains("duration=\"2700000\""));
+    }
+
+    #[test]
+    fn render_with_ad_break_scte35_cmd() {
+        let mut state = make_live_state_with_segments(1);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 0.0,
+            duration: None,
+            scte35_cmd: Some("AABBCC".to_string()),
+            segment_number: 0,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains(">AABBCC</Event>"));
+    }
+
+    #[test]
+    fn render_no_ad_breaks_no_event_stream() {
+        let state = make_live_state_with_segments(2);
+        let mpd = render(&state).unwrap();
+        assert!(!mpd.contains("EventStream"));
+    }
+
+    #[test]
+    fn render_multiple_ad_breaks_single_event_stream() {
+        let mut state = make_live_state_with_segments(3);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 6.0,
+            duration: Some(15.0),
+            scte35_cmd: None,
+            segment_number: 1,
+        });
+        state.ad_breaks.push(AdBreakInfo {
+            id: 2,
+            presentation_time: 12.0,
+            duration: Some(30.0),
+            scte35_cmd: None,
+            segment_number: 2,
+        });
+        let mpd = render(&state).unwrap();
+        // One EventStream with two Events
+        assert_eq!(mpd.matches("<EventStream").count(), 1);
+        assert_eq!(mpd.matches("<Event ").count(), 2);
+    }
+
+    #[test]
+    fn render_ad_break_no_duration() {
+        let mut state = make_live_state_with_segments(1);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 0.0,
+            duration: None,
+            scte35_cmd: None,
+            segment_number: 0,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("duration=\"0\""));
+    }
+
+    #[test]
+    fn render_ad_break_event_stream_in_period() {
+        let mut state = make_live_state_with_segments(1);
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 0.0,
+            duration: Some(15.0),
+            scte35_cmd: None,
+            segment_number: 0,
+        });
+        let mpd = render(&state).unwrap();
+        // EventStream should be inside Period, before AdaptationSet
+        let event_stream_pos = mpd.find("<EventStream").unwrap();
+        let adaptation_set_pos = mpd.find("<AdaptationSet").unwrap();
+        let period_pos = mpd.find("<Period").unwrap();
+        assert!(event_stream_pos > period_pos);
+        assert!(event_stream_pos < adaptation_set_pos);
     }
 }

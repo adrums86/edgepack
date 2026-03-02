@@ -6,7 +6,7 @@
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
-use crate::manifest::types::SourceManifest;
+use crate::manifest::types::{AdBreakInfo, SourceManifest};
 use crate::url::Url;
 
 /// Parse an HLS M3U8 media playlist into a `SourceManifest`.
@@ -39,6 +39,9 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
     let mut is_live = true; // live unless #EXT-X-ENDLIST is found
     let mut pending_duration: Option<f64> = None;
     let mut source_scheme: Option<EncryptionScheme> = None;
+    let mut ad_breaks = Vec::new();
+    let mut segment_number: u32 = 0;
+    let mut elapsed_time: f64 = 0.0;
 
     for line in manifest_text.lines() {
         let line = line.trim();
@@ -56,6 +59,11 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
                     _ => {} // AES-128, NONE, etc. — not CENC/CBCS
                 }
             }
+        } else if line.starts_with("#EXT-X-DATERANGE:") {
+            // Parse SCTE-35 ad marker signaling
+            if let Some(ab) = parse_daterange_ad_break(line, segment_number, elapsed_time) {
+                ad_breaks.push(ab);
+            }
         } else if line.starts_with("#EXTINF:") {
             let duration_str = line.strip_prefix("#EXTINF:").unwrap_or("");
             let duration_str = duration_str.split(',').next().unwrap_or("0");
@@ -65,8 +73,11 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         } else if !line.starts_with('#') && !line.is_empty() {
             // URI line — associate with the pending EXTINF duration
             if pending_duration.is_some() {
+                let duration = pending_duration.take().unwrap_or(6.0);
                 segment_urls.push(resolve_url(&base_url, line)?);
-                segment_durations.push(pending_duration.take().unwrap_or(6.0));
+                segment_durations.push(duration);
+                elapsed_time += duration;
+                segment_number += 1;
             }
         }
     }
@@ -83,6 +94,7 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         segment_durations,
         is_live,
         source_scheme,
+        ad_breaks,
     })
 }
 
@@ -104,6 +116,65 @@ fn extract_attribute(line: &str, attr: &str) -> Option<String> {
     let rest = &line[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+/// Parse an `#EXT-X-DATERANGE` tag into an `AdBreakInfo` if it contains SCTE-35 signaling.
+///
+/// Looks for `SCTE35-CMD` (hex-encoded) or `SCTE35-OUT=YES` attributes.
+/// Uses the `ID` attribute (expected format `splice-{id}`) to extract the splice event ID.
+fn parse_daterange_ad_break(
+    line: &str,
+    segment_number: u32,
+    elapsed_time: f64,
+) -> Option<AdBreakInfo> {
+    // Require SCTE35-CMD or SCTE35-OUT to identify this as an ad break
+    let scte35_cmd = extract_attribute_unquoted(line, "SCTE35-CMD");
+    let scte35_out = extract_attribute_unquoted(line, "SCTE35-OUT");
+
+    if scte35_cmd.is_none() && scte35_out.is_none() {
+        return None;
+    }
+
+    // Extract ID — expected format "splice-{id}" or any string
+    let id = extract_attribute(line, "ID").unwrap_or_default();
+    let splice_id: u32 = id
+        .strip_prefix("splice-")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Extract duration from PLANNED-DURATION
+    let duration = extract_attribute_unquoted(line, "PLANNED-DURATION")
+        .and_then(|s| s.parse::<f64>().ok());
+
+    // Convert SCTE35-CMD from hex (0x...) to base64
+    let scte35_base64 = scte35_cmd.and_then(|hex| {
+        let hex = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X")).unwrap_or(&hex);
+        hex_decode(hex).map(|bytes| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        })
+    });
+
+    Some(AdBreakInfo {
+        id: splice_id,
+        presentation_time: elapsed_time,
+        duration,
+        scte35_cmd: scte35_base64,
+        segment_number,
+    })
+}
+
+/// Decode a hex string into bytes. Returns None if the string has odd length or invalid chars.
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
 }
 
 /// Extract an unquoted attribute value from an HLS tag line.
@@ -321,6 +392,65 @@ mod tests {
              #EXT-X-ENDLIST\n";
         let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
         assert_eq!(result.source_scheme, None);
+    }
+
+    #[test]
+    fn parse_daterange_with_scte35_cmd() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-TARGETDURATION:7\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6.006,\n\
+             segment_0.cmfv\n\
+             #EXT-X-DATERANGE:ID=\"splice-42\",START-DATE=\"2024-01-01T00:00:06.006Z\",PLANNED-DURATION=30.0,SCTE35-CMD=0xFC301100000000000000FF\n\
+             #EXTINF:6.006,\n\
+             segment_1.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.ad_breaks.len(), 1);
+        let ab = &result.ad_breaks[0];
+        assert_eq!(ab.id, 42);
+        assert!((ab.duration.unwrap() - 30.0).abs() < 0.001);
+        assert!(ab.scte35_cmd.is_some());
+        // Segment number should be 1 (DATERANGE appears after segment_0's URI)
+        assert_eq!(ab.segment_number, 1);
+    }
+
+    #[test]
+    fn parse_daterange_scte35_out() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6.0,\n\
+             segment_0.cmfv\n\
+             #EXT-X-DATERANGE:ID=\"splice-100\",START-DATE=\"2024-01-01T00:00:00Z\",SCTE35-OUT=YES,PLANNED-DURATION=15.5\n\
+             #EXTINF:6.0,\n\
+             segment_1.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.ad_breaks.len(), 1);
+        let ab = &result.ad_breaks[0];
+        assert_eq!(ab.id, 100);
+        assert!((ab.duration.unwrap() - 15.5).abs() < 0.001);
+        assert!(ab.scte35_cmd.is_none()); // SCTE35-OUT, not SCTE35-CMD
+    }
+
+    #[test]
+    fn parse_daterange_no_scte35_ignored() {
+        // A DATERANGE without SCTE35-CMD or SCTE35-OUT should be ignored
+        let manifest = "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXT-X-DATERANGE:ID=\"program-1\",START-DATE=\"2024-01-01T00:00:00Z\",PLANNED-DURATION=60.0\n\
+             #EXTINF:6.0,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert!(result.ad_breaks.is_empty());
+    }
+
+    #[test]
+    fn parse_no_daterange_empty_ad_breaks() {
+        let result = parse_hls_manifest(minimal_vod_manifest(), BASE_URL).unwrap();
+        assert!(result.ad_breaks.is_empty());
     }
 
     #[test]

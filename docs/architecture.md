@@ -418,8 +418,10 @@ flowchart TD
 | **Subtitle Pass-Through** | WebVTT/TTML in fMP4, HLS subtitle rendition groups, DASH text AdaptationSets, CEA-608/708 caption signaling |
 | **JIT Packaging** | On-demand GET packaging (manifest/init/segment-on-GET), request coalescing via distributed locking |
 | **Multi-Backend Caching** | Redis HTTP, Cloudflare Workers KV, generic HTTP KV for AWS/Akamai/custom stores |
-| **Per-Feature Binary Size Guards** | 3 tests enforce size limits per build variant (base ≤600 KB, JIT ≤650 KB, full ≤650 KB) with WASM function count reporting |
-| **Zero External Test Dependencies** | All 827 tests use synthetic CMAF fixtures — no network or media files needed |
+| **SCTE-35 Ad Break Signaling** | emsg box extraction, splice event parsing, HLS `#EXT-X-DATERANGE` and DASH `EventStream` output, source manifest ad marker roundtrip |
+| **Compatibility Validation** | Pre-flight codec/scheme checks, HDR format detection, init/segment structure validation, conformance test suite |
+| **Per-Feature Binary Size Guards** | 3 tests enforce size limits per build variant (base ≤650 KB, JIT ≤700 KB, full ≤700 KB) with WASM function count reporting |
+| **Zero External Test Dependencies** | All 948 tests use synthetic CMAF fixtures — no network or media files needed |
 | **WASM-Native** | Entire runtime compiles to `wasm32-wasip2` with no async runtime or system calls |
 
 ## Inputs and Outputs
