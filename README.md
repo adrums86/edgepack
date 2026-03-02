@@ -609,6 +609,15 @@ Phases 1–8, 16, and 17 are complete. All P0 items are done. The roadmap target
 - [ ] CMAF-to-TS muxer (PES packets, PAT/PMT, 188-byte TS)
 - [ ] HLS-TS manifests (no `#EXT-X-MAP`, `.ts` extensions, `AES-128` encryption)
 
+### Phase 18: Binary Size Monitoring & Selective Feature Gating — P2
+
+The current binary (~607 KB base, ~645 KB full) is well within cold start budgets (<1 ms). Feature-gating existing Rust application logic yields only ~20–30 KB — not worth the `#[cfg]` maintenance burden. Real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
+
+- [ ] Monitor binary size as new features land — per-feature size tests in CI enforce limits per build variant
+- [ ] Feature-gate only when a phase introduces a heavy new dependency or parser (50+ KB), as already planned for the `ts` feature (Phase 10: MPEG-TS demuxer)
+- [ ] If the binary exceeds ~800 KB with all features, audit and selectively gate the heaviest new module
+- [ ] Prefer lightweight built-in implementations over crate dependencies when the crate adds disproportionate WASM size
+
 ### Phase 16: Compatibility Validation & Hardening ✅
 
 - [x] Codec/scheme compatibility matrix — VP9+CBCS rejected, HEVC+CENC warned (subsample required), AV1+CBCS warned (limited support), Dolby Vision RPU preservation warned, text track encryption rejected

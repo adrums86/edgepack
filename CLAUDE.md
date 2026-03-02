@@ -575,6 +575,19 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - CMAF-to-TS muxer, HLS-TS manifests, AES-128 segment encryption
 - New: `src/media/ts_mux.rs`
 
+### Phase 18: Binary Size Monitoring & Selective Feature Gating — P2
+The current binary (~607 KB base, ~645 KB full) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
+
+**Policy:** Monitor binary size as new features land. Feature-gate only when a phase introduces a **heavy new dependency or parser** that meaningfully increases the binary (50+ KB). Existing examples of this approach:
+- `ts` feature (Phase 10): MPEG-TS demuxer + transmuxer adds a substantial new parser — feature-gated to keep it out of builds that don't need TS input
+- `cloudflare` feature (Phase 17): Cloudflare KV backend — only needed on Cloudflare Workers deployments
+
+**Action items (reactive, not pre-emptive):**
+- If the binary exceeds **800 KB** with all features enabled, audit the largest new modules and consider feature-gating the heaviest one
+- If a new crate dependency adds **50+ KB** to the WASM binary, it must be feature-gated
+- Per-feature binary size tests in `tests/wasm_binary_size.rs` enforce limits per build variant — a failing test triggers the conversation about what to gate
+- Prefer lightweight built-in implementations over crate dependencies (as with `url.rs`) when the crate adds disproportionate WASM size
+
 ### ~~Phase 16: Compatibility Validation & Hardening~~ ✅ Complete
 - Codec/scheme compatibility validation (`src/media/compat.rs`): VP9+CBCS error, HEVC+CENC subsample warning, AV1+CBCS warning, DV RPU warning, text track encryption error
 - HDR format detection (HDR10, HDR10+, Dolby Vision, HLG) from codec strings
