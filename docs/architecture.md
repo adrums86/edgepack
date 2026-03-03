@@ -1,6 +1,6 @@
 # edgepack Architecture
 
-All diagrams use [Mermaid](https://mermaid.js.org/) syntax. They render natively in Confluence (Mermaid macro), Jira (Mermaid code blocks), GitHub, and can be imported into Lucidchart via **File → Import → Mermaid**.
+All diagrams use [Mermaid](https://mermaid.js.org/) syntax (11 diagrams total). They render natively in Confluence (Mermaid macro), Jira (Mermaid code blocks), GitHub, and can be imported into Lucidchart via **File → Import → Mermaid**.
 
 ---
 
@@ -399,6 +399,54 @@ flowchart TD
 
 ---
 
+## 11. I-Frame Detection & Trick Play Flow
+
+Shows how I-frame byte ranges are detected from rewritten segments and rendered as trick play manifests.
+
+```mermaid
+flowchart TD
+    subgraph Pipeline["Pipeline (per segment)"]
+        Rewrite["Rewrite Segment<br/>(decrypt → re-encrypt)"]
+        ChunkDetect["detect_chunk_boundaries()<br/>(media/chunk.rs)"]
+        FindIDR["Find first independent chunk<br/>(is_independent_chunk)"]
+        Record["Record IFrameSegmentInfo<br/>byte_offset, byte_length,<br/>duration, segment_uri"]
+    end
+
+    subgraph ManifestState["ManifestState"]
+        IFrameSegs["iframe_segments:<br/>Vec&lt;IFrameSegmentInfo&gt;"]
+        Enable["enable_iframe_playlist: true"]
+    end
+
+    subgraph HLS["HLS Output"]
+        IFramePlaylist["I-Frame Playlist<br/>#EXT-X-I-FRAMES-ONLY<br/>#EXT-X-VERSION:4<br/>#EXT-X-BYTERANGE:len@off<br/>per segment"]
+        MasterPlaylist["Master Playlist<br/>#EXT-X-I-FRAME-STREAM-INF<br/>BANDWIDTH, CODECS,<br/>RESOLUTION, URI=iframes"]
+    end
+
+    subgraph DASH["DASH Output"]
+        TrickAS["Trick Play AdaptationSet<br/>EssentialProperty<br/>schemeIdUri=trickmode<br/>value=1 (main video id)"]
+        MainAS["Main Video AdaptationSet<br/>id=1"]
+    end
+
+    subgraph Route["HTTP Route"]
+        IFrameRoute["GET /repackage/{id}/{fmt}/iframes<br/>→ render_iframe_manifest()"]
+    end
+
+    Rewrite --> ChunkDetect
+    ChunkDetect --> FindIDR
+    FindIDR --> Record
+    Record --> IFrameSegs
+    Enable --> IFrameSegs
+
+    IFrameSegs --> IFramePlaylist
+    IFrameSegs --> MasterPlaylist
+    IFrameSegs --> TrickAS
+    IFrameSegs --> MainAS
+
+    IFrameRoute --> IFramePlaylist
+```
+
+---
+
 ## Key Features Summary
 
 | Feature | Description |
@@ -425,6 +473,7 @@ flowchart TD
 | **LL-HLS** | Low-Latency HLS with partial segments (`#EXT-X-PART`), server control (`#EXT-X-SERVER-CONTROL`), CMAF chunk boundary detection, HLS version 9 |
 | **LL-DASH** | Low-Latency DASH with `availabilityTimeOffset` and `availabilityTimeComplete` on `<SegmentTemplate>` |
 | **MPEG-TS Input** | TS demuxer (PAT/PMT/PES, H.264/AAC), TS-to-CMAF transmuxer (Annex B→AVCC, init synthesis), AES-128 segment decryption. Feature-gated (`ts` feature) |
+| **Trick Play** | HLS `#EXT-X-I-FRAMES-ONLY` playlists with `#EXT-X-BYTERANGE` into existing segments, `#EXT-X-I-FRAME-STREAM-INF` in master. DASH trick play `<AdaptationSet>` with `<EssentialProperty>` trickmode. I-frame detection from CMAF chunk boundaries — no duplicate storage |
 | **Per-Feature Binary Size Guards** | 5 tests enforce size limits per build variant (base ≤700 KB, JIT ≤750 KB, full ≤750 KB, ts ≤800 KB, full+ts ≤850 KB). Binary size is the primary cold start proxy — every KB matters for JIT latency |
 | **Zero External Test Dependencies** | All 1,151 tests (1,072 without `ts` feature) use synthetic CMAF fixtures — no network or media files needed |
 | **CDN-Portable WASM** | Entire runtime compiles to `wasm32-wasip2` — runs on any CDN with WASI P2 support (Cloudflare Workers, Fastly Compute, wasmtime on Lambda, Akamai EdgeCompute). No CDN-specific APIs, no vendor lock-in |
@@ -529,6 +578,17 @@ flowchart TD
 - Key rotation: per-period key rotation at configurable segment boundaries, new DRM signaling per period
 - Clear lead: first N segments unencrypted, manifest transition at boundary
 - DRM systems override: explicit selection of widevine/playready/fairplay/clearkey per request
+
+### ~~Phase 12: Trick Play & I-Frame Playlists~~ ✅ Complete
+- `IFrameSegmentInfo` type in `manifest/types.rs` — byte offset, length, duration, segment URI per I-frame
+- `enable_iframe_playlist` opt-in field on `ManifestState` and `RepackageRequest` (default false, `#[serde(default)]` for backward compat)
+- I-frame detection reuses `chunk.rs` — `detect_chunk_boundaries()` → find first independent (IDR) chunk → record byte range
+- Consolidated chunk detection in pipeline — runs once when either LL-HLS parts or I-frame playlists need it
+- HLS I-frame playlist: `#EXT-X-I-FRAMES-ONLY`, `#EXT-X-VERSION:4`, `#EXT-X-BYTERANGE:length@offset`, DRM KEY tags, init MAP
+- HLS master playlist: `#EXT-X-I-FRAME-STREAM-INF` per video variant (bandwidth/10, codecs, resolution)
+- DASH trick play: separate `<AdaptationSet>` with `<EssentialProperty schemeIdUri="http://dashif.org/guidelines/trickmode" value="1"/>` referencing main video by `id="1"`
+- Dedicated route: `GET /repackage/{id}/{fmt}/iframes` (HLS only, DASH returns 404)
+- Sandbox writes `iframes.m3u8` alongside regular HLS output
 
 ## Planned Architecture Extensions
 

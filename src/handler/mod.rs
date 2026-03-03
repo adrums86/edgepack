@@ -120,6 +120,13 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
             request::handle_init_segment_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
+        // On-demand: GET /repackage/{content_id}/{format}/iframes
+        // Serves the I-frame-only playlist (HLS) or 404 (DASH — trick play is in regular MPD)
+        (HttpMethod::Get, ["repackage", content_id, format, "iframes"]) => {
+            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            request::handle_iframe_manifest_request(content_id, output_format, scheme.as_deref(), ctx)
+        }
+
         // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.{ext}
         // Accepts all CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions:
         // .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a

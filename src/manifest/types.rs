@@ -112,6 +112,26 @@ pub struct AdBreakInfo {
     pub segment_number: u32,
 }
 
+/// I-frame byte range within a regular media segment.
+///
+/// For each rewritten video segment, records the byte offset and size
+/// of the first independent (IDR) moof+mdat chunk. Used to build
+/// HLS `#EXT-X-I-FRAMES-ONLY` playlists with `#EXT-X-BYTERANGE`
+/// and DASH trick play `<AdaptationSet>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IFrameSegmentInfo {
+    /// Segment number (matches SegmentInfo.number).
+    pub segment_number: u32,
+    /// Byte offset of the IDR chunk within the segment.
+    pub byte_offset: u64,
+    /// Byte length of the IDR chunk.
+    pub byte_length: u64,
+    /// Duration of the parent segment in seconds.
+    pub duration: f64,
+    /// URI of the parent segment (same file, byte-ranged).
+    pub segment_uri: String,
+}
+
 /// CEA-608/708 closed caption channel info for manifest signaling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CeaCaptionInfo {
@@ -231,6 +251,12 @@ pub struct ManifestState {
     /// LL-DASH low-latency parameters.
     #[serde(default)]
     pub ll_dash_info: Option<LowLatencyDashInfo>,
+    /// I-frame byte ranges for each video segment (for HLS I-Frame playlists, DASH trick play).
+    #[serde(default)]
+    pub iframe_segments: Vec<IFrameSegmentInfo>,
+    /// Whether trick play / I-frame playlist generation is enabled for this content.
+    #[serde(default)]
+    pub enable_iframe_playlist: bool,
 }
 
 /// Lifecycle phase of the manifest.
@@ -271,6 +297,8 @@ impl ManifestState {
             part_target_duration: None,
             server_control: None,
             ll_dash_info: None,
+            iframe_segments: Vec::new(),
+            enable_iframe_playlist: false,
         }
     }
 
@@ -817,5 +845,78 @@ mod tests {
         assert!(parsed.is_ts_source);
         assert_eq!(parsed.aes128_key_url.as_deref(), Some("https://keys.example.com/key"));
         assert_eq!(parsed.aes128_iv.unwrap()[15], 0x01);
+    }
+
+    // --- I-Frame / Trick Play type tests ---
+
+    #[test]
+    fn iframe_segment_info_construction() {
+        let info = IFrameSegmentInfo {
+            segment_number: 3,
+            byte_offset: 0,
+            byte_length: 32456,
+            duration: 6.006,
+            segment_uri: "segment_3.cmfv".to_string(),
+        };
+        assert_eq!(info.segment_number, 3);
+        assert_eq!(info.byte_offset, 0);
+        assert_eq!(info.byte_length, 32456);
+        assert!((info.duration - 6.006).abs() < f64::EPSILON);
+        assert_eq!(info.segment_uri, "segment_3.cmfv");
+    }
+
+    #[test]
+    fn iframe_segment_info_serde_roundtrip() {
+        let info = IFrameSegmentInfo {
+            segment_number: 5,
+            byte_offset: 128,
+            byte_length: 8192,
+            duration: 4.0,
+            segment_uri: "segment_5.m4s".to_string(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: IFrameSegmentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.segment_number, 5);
+        assert_eq!(parsed.byte_offset, 128);
+        assert_eq!(parsed.byte_length, 8192);
+        assert!((parsed.duration - 4.0).abs() < f64::EPSILON);
+        assert_eq!(parsed.segment_uri, "segment_5.m4s");
+    }
+
+    #[test]
+    fn manifest_state_new_iframe_defaults() {
+        let state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        assert!(state.iframe_segments.is_empty());
+        assert!(!state.enable_iframe_playlist);
+    }
+
+    #[test]
+    fn manifest_state_with_iframe_segments() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.enable_iframe_playlist = true;
+        state.iframe_segments.push(IFrameSegmentInfo {
+            segment_number: 0,
+            byte_offset: 0,
+            byte_length: 5000,
+            duration: 6.0,
+            segment_uri: "segment_0.cmfv".to_string(),
+        });
+        assert_eq!(state.iframe_segments.len(), 1);
+        assert!(state.enable_iframe_playlist);
+
+        // Verify serde roundtrip with iframe fields
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: ManifestState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.iframe_segments.len(), 1);
+        assert_eq!(parsed.iframe_segments[0].byte_length, 5000);
+        assert!(parsed.enable_iframe_playlist);
+    }
+
+    #[test]
+    fn manifest_state_serde_backward_compat_no_iframe_fields() {
+        let json = r#"{"content_id":"c","format":"Hls","phase":"Live","init_segment":null,"segments":[],"target_duration":6.0,"variants":[],"drm_info":null,"media_sequence":0,"base_url":"/"}"#;
+        let parsed: ManifestState = serde_json::from_str(json).unwrap();
+        assert!(parsed.iframe_segments.is_empty());
+        assert!(!parsed.enable_iframe_playlist);
     }
 }

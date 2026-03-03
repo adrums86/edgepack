@@ -6,7 +6,8 @@
 
 use edgepack::drm::{system_ids, ContentKey, DrmKeySet, DrmSystemData};
 use edgepack::manifest::types::{
-    InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo,
+    IFrameSegmentInfo, InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState,
+    OutputFormat, SegmentInfo,
 };
 use edgepack::media::cmaf;
 use edgepack::media::container::ContainerFormat;
@@ -543,5 +544,37 @@ pub fn make_dash_manifest_state(segment_count: u32, phase: ManifestPhase) -> Man
         state.target_duration = 6.0;
     }
 
+    state
+}
+
+/// Build an HLS ManifestState with I-frame segment data for trick play testing.
+pub fn make_hls_iframe_manifest_state(segment_count: u32, phase: ManifestPhase) -> ManifestState {
+    let mut state = make_hls_manifest_state(segment_count, phase);
+    state.enable_iframe_playlist = true;
+    for i in 0..segment_count {
+        state.iframe_segments.push(IFrameSegmentInfo {
+            segment_number: i,
+            byte_offset: 0,
+            byte_length: 8192 + (i as u64 * 100),
+            duration: 6.006,
+            segment_uri: format!("/repackage/integration-test/hls/segment_{i}.cmfv"),
+        });
+    }
+    state
+}
+
+/// Build a DASH ManifestState with I-frame / trick play data.
+pub fn make_dash_iframe_manifest_state(segment_count: u32, phase: ManifestPhase) -> ManifestState {
+    let mut state = make_dash_manifest_state(segment_count, phase);
+    state.enable_iframe_playlist = true;
+    for i in 0..segment_count {
+        state.iframe_segments.push(IFrameSegmentInfo {
+            segment_number: i,
+            byte_offset: 0,
+            byte_length: 8192 + (i as u64 * 100),
+            duration: 6.0,
+            segment_uri: format!("/repackage/integration-test/dash/segment_{i}.cmfv"),
+        });
+    }
     state
 }

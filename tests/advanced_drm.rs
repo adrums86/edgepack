@@ -84,6 +84,7 @@ fn repackage_request_with_all_advanced_drm_fields() {
         key_rotation: Some(KeyRotationConfig { period_segments: 10 }),
         clear_lead_segments: Some(3),
         drm_systems: vec!["widevine".into(), "clearkey".into()],
+        enable_iframe_playlist: false,
     };
     let json = serde_json::to_string(&req).unwrap();
     let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -283,6 +284,7 @@ fn clearkey_combined_with_widevine() {
         key_rotation: None,
         clear_lead_segments: None,
         drm_systems: vec!["widevine".into(), "clearkey".into()],
+        enable_iframe_playlist: false,
     };
     assert_eq!(req.drm_systems.len(), 2);
 }

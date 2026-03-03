@@ -272,6 +272,7 @@ async fn handle_repackage(
         key_rotation: None,
         clear_lead_segments: None,
         drm_systems: vec![],
+        enable_iframe_playlist: false,
     };
 
     // Track the job
@@ -649,6 +650,14 @@ fn write_output_to_disk(
     }
     if seg_num > 0 {
         eprintln!("  Wrote {seg_num} media segments to {}", out_dir.display());
+    }
+
+    // Write I-frame playlist (HLS only)
+    if let Ok(Some(iframe_playlist)) = manifest::render_iframe_manifest(state) {
+        let iframe_path = out_dir.join("iframes.m3u8");
+        std::fs::write(&iframe_path, iframe_playlist)
+            .map_err(|e| format!("write I-frame playlist: {e}"))?;
+        eprintln!("  Wrote {}", iframe_path.display());
     }
 
     Ok(())
