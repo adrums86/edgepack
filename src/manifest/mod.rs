@@ -33,6 +33,7 @@ mod tests {
             duration: 6.0,
             uri: "/segment_0.cmfv".into(),
             byte_size: 1024,
+            key_period: None,
         });
         s
     }

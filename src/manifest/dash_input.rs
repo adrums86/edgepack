@@ -6,7 +6,7 @@
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
-use crate::manifest::types::{AdBreakInfo, SourceManifest};
+use crate::manifest::types::{AdBreakInfo, LowLatencyDashInfo, SourceManifest};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use crate::url::Url;
@@ -35,6 +35,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     let mut timeline_entries: Vec<(u64, u32)> = Vec::new(); // (duration_ticks, repeat_count)
     let mut uniform_duration: Option<u64> = None; // for SegmentTemplate@duration
     let mut base_url_override: Option<String> = None;
+    let mut ll_dash_info: Option<LowLatencyDashInfo> = None;
     let mut total_duration_secs: Option<f64> = None;
     let mut ad_breaks: Vec<AdBreakInfo> = Vec::new();
     let mut in_scte35_event_stream = false;
@@ -71,6 +72,8 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                         // BaseURL content comes in a Text event; we'll read it next
                     }
                     b"SegmentTemplate" => {
+                        let mut ato: Option<f64> = None;
+                        let mut atc: Option<bool> = None;
                         for attr in e.attributes().flatten() {
                             match attr.key.as_ref() {
                                 b"initialization" => {
@@ -98,8 +101,24 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                                         .parse()
                                         .ok();
                                 }
+                                b"availabilityTimeOffset" => {
+                                    ato = String::from_utf8_lossy(&attr.value)
+                                        .parse::<f64>()
+                                        .ok();
+                                }
+                                b"availabilityTimeComplete" => {
+                                    let val = String::from_utf8_lossy(&attr.value);
+                                    atc = Some(val == "true");
+                                }
                                 _ => {}
                             }
+                        }
+                        // Detect LL-DASH parameters
+                        if let Some(offset) = ato {
+                            ll_dash_info = Some(LowLatencyDashInfo {
+                                availability_time_offset: offset,
+                                availability_time_complete: atc.unwrap_or(true),
+                            });
                         }
                     }
                     b"S" => {
@@ -345,6 +364,13 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
         is_live,
         source_scheme,
         ad_breaks,
+        parts: Vec::new(),
+        part_target_duration: None,
+        server_control: None,
+        ll_dash_info,
+        is_ts_source: false,
+        aes128_key_url: None,
+        aes128_iv: None,
     })
 }
 
@@ -765,5 +791,57 @@ mod tests {
     fn parse_iso8601_duration_invalid() {
         assert!(parse_iso8601_duration("invalid").is_none());
         assert!(parse_iso8601_duration("P1D").is_none()); // days not supported
+    }
+
+    // --- LL-DASH parsing tests ---
+
+    #[test]
+    fn parse_availability_time_offset() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="dynamic">
+  <Period>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000" availabilityTimeOffset="5.0" availabilityTimeComplete="false">
+          <SegmentTimeline>
+            <S d="6000"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        let ll = result.ll_dash_info.unwrap();
+        assert!((ll.availability_time_offset - 5.0).abs() < 0.001);
+        assert!(!ll.availability_time_complete);
+    }
+
+    #[test]
+    fn parse_availability_time_complete_true() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="dynamic">
+  <Period>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000" availabilityTimeOffset="2.5" availabilityTimeComplete="true">
+          <SegmentTimeline>
+            <S d="6000"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        let ll = result.ll_dash_info.unwrap();
+        assert!((ll.availability_time_offset - 2.5).abs() < 0.001);
+        assert!(ll.availability_time_complete);
+    }
+
+    #[test]
+    fn parse_no_ll_dash_attributes_backward_compat() {
+        let result = parse_dash_manifest(&minimal_static_mpd(), BASE_URL).unwrap();
+        assert!(result.ll_dash_info.is_none());
     }
 }

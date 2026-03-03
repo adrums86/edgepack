@@ -6,7 +6,7 @@
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
-use crate::manifest::types::{AdBreakInfo, SourceManifest};
+use crate::manifest::types::{AdBreakInfo, ServerControl, SourceManifest, SourcePartInfo};
 use crate::url::Url;
 
 /// Parse an HLS M3U8 media playlist into a `SourceManifest`.
@@ -42,6 +42,15 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
     let mut ad_breaks = Vec::new();
     let mut segment_number: u32 = 0;
     let mut elapsed_time: f64 = 0.0;
+    let mut is_ts_source = false;
+    let mut aes128_key_url: Option<String> = None;
+    let mut aes128_iv: Option<[u8; 16]> = None;
+
+    // LL-HLS state
+    let mut parts: Vec<SourcePartInfo> = Vec::new();
+    let mut part_target_duration: Option<f64> = None;
+    let mut server_control: Option<ServerControl> = None;
+    let mut part_index_in_segment: u32 = 0;
 
     for line in manifest_text.lines() {
         let line = line.trim();
@@ -56,7 +65,25 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
                 match method.as_str() {
                     "SAMPLE-AES-CTR" => source_scheme = Some(EncryptionScheme::Cenc),
                     "SAMPLE-AES" => source_scheme = Some(EncryptionScheme::Cbcs),
-                    _ => {} // AES-128, NONE, etc. — not CENC/CBCS
+                    "AES-128" => {
+                        // AES-128 segment-level encryption (used with TS segments)
+                        if let Some(uri) = extract_attribute(line, "URI") {
+                            aes128_key_url = Some(resolve_url(&base_url, &uri)?);
+                        }
+                        if let Some(iv_hex) = extract_attribute_unquoted(line, "IV") {
+                            let iv_hex = iv_hex.strip_prefix("0x")
+                                .or_else(|| iv_hex.strip_prefix("0X"))
+                                .unwrap_or(&iv_hex);
+                            if let Some(bytes) = hex_decode(iv_hex) {
+                                if bytes.len() == 16 {
+                                    let mut iv = [0u8; 16];
+                                    iv.copy_from_slice(&bytes);
+                                    aes128_iv = Some(iv);
+                                }
+                            }
+                        }
+                    }
+                    _ => {} // NONE, etc.
                 }
             }
         } else if line.starts_with("#EXT-X-DATERANGE:") {
@@ -64,6 +91,22 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
             if let Some(ab) = parse_daterange_ad_break(line, segment_number, elapsed_time) {
                 ad_breaks.push(ab);
             }
+        } else if line.starts_with("#EXT-X-PART-INF:") {
+            // LL-HLS: parse part target duration
+            if let Some(val) = extract_attribute_unquoted(line, "PART-TARGET") {
+                part_target_duration = val.parse::<f64>().ok();
+            }
+        } else if line.starts_with("#EXT-X-PART:") {
+            // LL-HLS: parse partial segment
+            if let Some(part) = parse_ext_x_part(line, &base_url, segment_number, part_index_in_segment) {
+                parts.push(part);
+                part_index_in_segment += 1;
+            }
+        } else if line.starts_with("#EXT-X-SERVER-CONTROL:") {
+            // LL-HLS: parse server control parameters
+            server_control = Some(parse_server_control(line));
+        } else if line.starts_with("#EXT-X-PRELOAD-HINT:") {
+            // LL-HLS: acknowledged but not stored (informational only)
         } else if line.starts_with("#EXTINF:") {
             let duration_str = line.strip_prefix("#EXTINF:").unwrap_or("");
             let duration_str = duration_str.split(',').next().unwrap_or("0");
@@ -74,19 +117,31 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
             // URI line — associate with the pending EXTINF duration
             if pending_duration.is_some() {
                 let duration = pending_duration.take().unwrap_or(6.0);
-                segment_urls.push(resolve_url(&base_url, line)?);
+                let resolved = resolve_url(&base_url, line)?;
+                // Detect TS segment extension
+                if !is_ts_source && (line.ends_with(".ts") || line.contains(".ts?")) {
+                    is_ts_source = true;
+                }
+                segment_urls.push(resolved);
                 segment_durations.push(duration);
                 elapsed_time += duration;
                 segment_number += 1;
+                // Reset part index for next segment
+                part_index_in_segment = 0;
             }
         }
     }
 
-    let init_url = init_segment_url.ok_or_else(|| {
-        EdgepackError::Manifest(
-            "HLS manifest missing #EXT-X-MAP (init segment)".into(),
-        )
-    })?;
+    // For TS sources, init segment is not required (synthesized from first segment)
+    let init_url = if is_ts_source {
+        init_segment_url.unwrap_or_default()
+    } else {
+        init_segment_url.ok_or_else(|| {
+            EdgepackError::Manifest(
+                "HLS manifest missing #EXT-X-MAP (init segment)".into(),
+            )
+        })?
+    };
 
     Ok(SourceManifest {
         init_segment_url: init_url,
@@ -95,6 +150,13 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         is_live,
         source_scheme,
         ad_breaks,
+        parts,
+        part_target_duration,
+        server_control,
+        ll_dash_info: None,
+        is_ts_source,
+        aes128_key_url,
+        aes128_iv,
     })
 }
 
@@ -175,6 +237,77 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
         bytes.push(byte);
     }
     Some(bytes)
+}
+
+/// Parse an `#EXT-X-PART` tag into a `SourcePartInfo`.
+fn parse_ext_x_part(
+    line: &str,
+    base_url: &Url,
+    segment_number: u32,
+    part_index: u32,
+) -> Option<SourcePartInfo> {
+    let duration = extract_attribute_unquoted(line, "DURATION")?
+        .parse::<f64>()
+        .ok()?;
+    let uri_raw = extract_attribute(line, "URI")?;
+    let uri = resolve_url(base_url, &uri_raw).ok()?;
+    let independent = extract_attribute_unquoted(line, "INDEPENDENT")
+        .map(|v| v == "YES")
+        .unwrap_or(false);
+
+    Some(SourcePartInfo {
+        segment_number,
+        part_index,
+        duration,
+        independent,
+        uri,
+    })
+}
+
+/// Parse an `#EXT-X-SERVER-CONTROL` tag into a `ServerControl`.
+fn parse_server_control(line: &str) -> ServerControl {
+    let can_skip_until = extract_attribute_unquoted(line, "CAN-SKIP-UNTIL")
+        .and_then(|v| v.parse::<f64>().ok());
+    // HOLD-BACK must not match PART-HOLD-BACK.
+    // Use extract_exact_attribute which checks for a proper boundary.
+    let hold_back = extract_exact_attribute(line, "HOLD-BACK")
+        .and_then(|v| v.parse::<f64>().ok());
+    let part_hold_back = extract_attribute_unquoted(line, "PART-HOLD-BACK")
+        .and_then(|v| v.parse::<f64>().ok());
+    let can_block_reload = extract_attribute_unquoted(line, "CAN-BLOCK-RELOAD")
+        .map(|v| v == "YES")
+        .unwrap_or(false);
+
+    ServerControl {
+        can_skip_until,
+        hold_back,
+        part_hold_back,
+        can_block_reload,
+    }
+}
+
+/// Extract an attribute value ensuring the match is at a proper boundary
+/// (preceded by comma, colon, or start of string, not by another letter/hyphen).
+/// This avoids "HOLD-BACK" matching inside "PART-HOLD-BACK".
+fn extract_exact_attribute(line: &str, attr: &str) -> Option<String> {
+    let search = format!("{attr}=");
+    let mut search_start = 0;
+    while let Some(pos) = line[search_start..].find(&search) {
+        let abs_pos = search_start + pos;
+        // Check that the character before is a valid boundary (comma, colon, or start)
+        if abs_pos == 0 || matches!(line.as_bytes()[abs_pos - 1], b',' | b':' | b' ') {
+            let value_start = abs_pos + search.len();
+            let rest = &line[value_start..];
+            if rest.starts_with('"') {
+                let end = rest[1..].find('"')?;
+                return Some(rest[1..1 + end].to_string());
+            }
+            let end = rest.find(',').unwrap_or(rest.len());
+            return Some(rest[..end].to_string());
+        }
+        search_start = abs_pos + 1;
+    }
+    None
 }
 
 /// Extract an unquoted attribute value from an HLS tag line.
@@ -497,5 +630,168 @@ mod tests {
             extract_attribute(line, "BYTERANGE"),
             Some("500@0".to_string())
         );
+    }
+
+    // --- LL-HLS parsing tests ---
+
+    #[test]
+    fn parse_part_inf() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:9\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PART-INF:PART-TARGET=0.33334\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:4.0,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.part_target_duration, Some(0.33334));
+    }
+
+    #[test]
+    fn parse_ext_x_parts() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:9\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PART-INF:PART-TARGET=0.33334\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXT-X-PART:DURATION=0.33334,URI=\"part0.0.cmfv\",INDEPENDENT=YES\n\
+             #EXT-X-PART:DURATION=0.33334,URI=\"part0.1.cmfv\"\n\
+             #EXT-X-PART:DURATION=0.33334,URI=\"part0.2.cmfv\"\n\
+             #EXTINF:1.0,\n\
+             segment_0.cmfv\n\
+             #EXT-X-PART:DURATION=0.33334,URI=\"part1.0.cmfv\",INDEPENDENT=YES\n\
+             #EXTINF:0.33334,\n\
+             segment_1.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.parts.len(), 4);
+        // First 3 parts belong to segment 0
+        assert_eq!(result.parts[0].segment_number, 0);
+        assert_eq!(result.parts[0].part_index, 0);
+        assert!(result.parts[0].independent);
+        assert_eq!(result.parts[1].segment_number, 0);
+        assert_eq!(result.parts[1].part_index, 1);
+        assert!(!result.parts[1].independent);
+        assert_eq!(result.parts[2].segment_number, 0);
+        assert_eq!(result.parts[2].part_index, 2);
+        // Fourth part belongs to segment 1 (part index resets)
+        assert_eq!(result.parts[3].segment_number, 1);
+        assert_eq!(result.parts[3].part_index, 0);
+        assert!(result.parts[3].independent);
+    }
+
+    #[test]
+    fn parse_server_control_tag() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:9\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=1.0,CAN-SKIP-UNTIL=12.0\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:4.0,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        let sc = result.server_control.unwrap();
+        assert!(sc.can_block_reload);
+        assert_eq!(sc.part_hold_back, Some(1.0));
+        assert_eq!(sc.can_skip_until, Some(12.0));
+        assert!(sc.hold_back.is_none());
+    }
+
+    #[test]
+    fn parse_preload_hint_skipped() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:9\n\
+             #EXT-X-TARGETDURATION:4\n\
+             #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"next.cmfv\"\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:4.0,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        // Preload hint is acknowledged but not stored
+        assert_eq!(result.segment_urls.len(), 1);
+    }
+
+    #[test]
+    fn parse_backward_compat_no_ll_tags() {
+        let result = parse_hls_manifest(minimal_vod_manifest(), BASE_URL).unwrap();
+        assert!(result.parts.is_empty());
+        assert!(result.part_target_duration.is_none());
+        assert!(result.server_control.is_none());
+    }
+
+    #[test]
+    fn parse_part_independent_flag() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXT-X-PART:DURATION=0.5,URI=\"p.cmfv\",INDEPENDENT=YES\n\
+             #EXTINF:0.5,\n\
+             segment_0.cmfv\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert_eq!(result.parts.len(), 1);
+        assert!(result.parts[0].independent);
+    }
+
+    // --- TS source detection tests ---
+
+    #[test]
+    fn parse_ts_source_detected_from_extension() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-TARGETDURATION:10\n\
+             #EXTINF:10.0,\n\
+             segment_0.ts\n\
+             #EXTINF:10.0,\n\
+             segment_1.ts\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert!(result.is_ts_source);
+        assert_eq!(result.segment_urls.len(), 2);
+        // init_segment_url should be empty for TS (no #EXT-X-MAP)
+        assert_eq!(result.init_segment_url, "");
+    }
+
+    #[test]
+    fn parse_ts_source_with_aes128_key() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-TARGETDURATION:10\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.example.com/key.bin\",IV=0x00000000000000000000000000000001\n\
+             #EXTINF:10.0,\n\
+             segment_0.ts\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert!(result.is_ts_source);
+        assert_eq!(
+            result.aes128_key_url.as_deref(),
+            Some("https://keys.example.com/key.bin")
+        );
+        assert!(result.aes128_iv.is_some());
+        let iv = result.aes128_iv.unwrap();
+        assert_eq!(iv[15], 0x01);
+        assert_eq!(iv[0], 0x00);
+    }
+
+    #[test]
+    fn parse_cmaf_source_not_ts() {
+        let result = parse_hls_manifest(minimal_vod_manifest(), BASE_URL).unwrap();
+        assert!(!result.is_ts_source);
+        assert!(result.aes128_key_url.is_none());
+        assert!(result.aes128_iv.is_none());
+    }
+
+    #[test]
+    fn parse_ts_source_with_query_string() {
+        let manifest = "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-TARGETDURATION:10\n\
+             #EXTINF:10.0,\n\
+             segment_0.ts?token=abc\n\
+             #EXT-X-ENDLIST\n";
+        let result = parse_hls_manifest(manifest, BASE_URL).unwrap();
+        assert!(result.is_ts_source);
     }
 }

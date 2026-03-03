@@ -105,7 +105,7 @@ mod tests {
         DrmConfig {
             speke_url: Url::parse("https://drm.example.com/speke").unwrap(),
             speke_auth: auth,
-            system_ids: DrmSystemIds { widevine, playready },
+            system_ids: DrmSystemIds { widevine, playready, clearkey: false },
         }
     }
 

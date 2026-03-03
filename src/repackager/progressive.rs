@@ -1,7 +1,7 @@
 use crate::manifest;
 use crate::manifest::types::{
-    AdBreakInfo, InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat,
-    SegmentInfo, VariantInfo,
+    AdBreakInfo, InitSegmentInfo, LowLatencyDashInfo, ManifestDrmInfo, ManifestPhase,
+    ManifestState, OutputFormat, PartInfo, SegmentInfo, ServerControl, VariantInfo,
 };
 use crate::media::container::ContainerFormat;
 
@@ -23,6 +23,8 @@ pub struct ProgressiveOutput {
     init_segment_data: Option<Vec<u8>>,
     /// Rewritten media segment data, indexed by segment number.
     segment_data: Vec<(u32, Vec<u8>)>,
+    /// LL-HLS part data, keyed by (segment_number, part_index).
+    part_data: Vec<((u32, u32), Vec<u8>)>,
 }
 
 impl ProgressiveOutput {
@@ -40,6 +42,7 @@ impl ProgressiveOutput {
             state,
             init_segment_data: None,
             segment_data: Vec::new(),
+            part_data: Vec::new(),
         }
     }
 
@@ -76,6 +79,7 @@ impl ProgressiveOutput {
             duration,
             uri,
             byte_size,
+            key_period: None,
         });
 
         // Update target duration if this segment is longer
@@ -105,6 +109,57 @@ impl ProgressiveOutput {
     /// Add an ad break marker to the manifest state.
     pub fn add_ad_break(&mut self, info: AdBreakInfo) {
         self.state.ad_breaks.push(info);
+    }
+
+    /// Add a part (LL-HLS partial segment) to the progressive output.
+    pub fn add_part(
+        &mut self,
+        segment_number: u32,
+        part_index: u32,
+        data: Vec<u8>,
+        duration: f64,
+        independent: bool,
+    ) {
+        let ext = self.state.container_format.video_segment_extension();
+        let uri = format!(
+            "{}part_{segment_number}.{part_index}{ext}",
+            self.state.base_url
+        );
+        let byte_size = data.len() as u64;
+
+        self.state.parts.push(PartInfo {
+            segment_number,
+            part_index,
+            duration,
+            independent,
+            uri,
+            byte_size,
+        });
+
+        self.part_data.push(((segment_number, part_index), data));
+    }
+
+    /// Set the LL-HLS server control parameters.
+    pub fn set_server_control(&mut self, sc: ServerControl) {
+        self.state.server_control = Some(sc);
+    }
+
+    /// Set the LL-HLS part target duration.
+    pub fn set_part_target_duration(&mut self, duration: f64) {
+        self.state.part_target_duration = Some(duration);
+    }
+
+    /// Set the LL-DASH low-latency parameters.
+    pub fn set_ll_dash_info(&mut self, info: LowLatencyDashInfo) {
+        self.state.ll_dash_info = Some(info);
+    }
+
+    /// Get part data by segment number and part index.
+    pub fn part_data(&self, segment_number: u32, part_index: u32) -> Option<&[u8]> {
+        self.part_data
+            .iter()
+            .find(|((sn, pi), _)| *sn == segment_number && *pi == part_index)
+            .map(|(_, data)| data.as_slice())
     }
 
     /// Mark the manifest as complete (VOD).
@@ -175,6 +230,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "00112233445566778899aabbccddeeff".into(),
+            clearkey_pssh: None,
         }
     }
 
@@ -456,5 +512,98 @@ mod tests {
             ProgressiveOutput::segment_cache_control(86400),
             "public, max-age=86400, immutable"
         );
+    }
+
+    // --- LL-HLS part tests ---
+
+    #[test]
+    fn add_part_stores_data() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            Some(make_drm_info()),
+            ContainerFormat::default(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 100], 6.0);
+        po.add_part(0, 0, vec![0xBB; 30], 0.33, true);
+        po.add_part(0, 1, vec![0xCC; 25], 0.33, false);
+
+        assert!(po.part_data(0, 0).is_some());
+        assert_eq!(po.part_data(0, 0).unwrap().len(), 30);
+        assert!(po.part_data(0, 1).is_some());
+        assert_eq!(po.part_data(0, 1).unwrap().len(), 25);
+        assert!(po.part_data(0, 2).is_none());
+        assert!(po.part_data(1, 0).is_none());
+    }
+
+    #[test]
+    fn add_part_updates_manifest_state() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            Some(make_drm_info()),
+            ContainerFormat::default(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 100], 6.0);
+        po.add_part(0, 0, vec![0xBB; 30], 0.33, true);
+
+        assert_eq!(po.manifest_state().parts.len(), 1);
+        assert_eq!(po.manifest_state().parts[0].segment_number, 0);
+        assert_eq!(po.manifest_state().parts[0].part_index, 0);
+        assert!(po.manifest_state().parts[0].independent);
+    }
+
+    #[test]
+    fn set_server_control_updates_state() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            None,
+            ContainerFormat::default(),
+        );
+        assert!(po.manifest_state().server_control.is_none());
+        po.set_server_control(crate::manifest::types::ServerControl {
+            can_skip_until: Some(12.0),
+            hold_back: None,
+            part_hold_back: Some(1.0),
+            can_block_reload: true,
+        });
+        assert!(po.manifest_state().server_control.is_some());
+    }
+
+    #[test]
+    fn set_part_target_duration_updates_state() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            None,
+            ContainerFormat::default(),
+        );
+        assert!(po.manifest_state().part_target_duration.is_none());
+        po.set_part_target_duration(0.33334);
+        assert_eq!(po.manifest_state().part_target_duration, Some(0.33334));
+    }
+
+    #[test]
+    fn set_ll_dash_info_updates_state() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Dash,
+            "/base/".into(),
+            None,
+            ContainerFormat::default(),
+        );
+        assert!(po.manifest_state().ll_dash_info.is_none());
+        po.set_ll_dash_info(crate::manifest::types::LowLatencyDashInfo {
+            availability_time_offset: 5.0,
+            availability_time_complete: false,
+        });
+        assert!(po.manifest_state().ll_dash_info.is_some());
     }
 }

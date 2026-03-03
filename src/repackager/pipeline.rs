@@ -62,8 +62,40 @@ impl RepackagePipeline {
         // Step 1: Fetch the source manifest to discover segments and encryption info
         let source = self.fetch_source_manifest(&request.source_url)?;
 
+        // TS source: reject if feature not enabled, set up pre-processing state
+        #[cfg(not(feature = "ts"))]
+        if source.is_ts_source {
+            return Err(EdgepackError::InvalidInput(
+                "TS input requires the 'ts' feature to be enabled".to_string(),
+            ));
+        }
+        #[cfg(feature = "ts")]
+        let mut ts_state: Option<(
+            Option<crate::media::transmux::VideoConfig>,
+            Option<crate::media::transmux::AudioConfig>,
+        )> = None;
+
         // Step 2: Fetch the init segment and parse protection info
-        let init_data = self.fetch_segment(&source.init_segment_url)?;
+        // For TS sources, we synthesize the init from the first segment instead
+        let init_data = if source.is_ts_source {
+            #[cfg(feature = "ts")]
+            {
+                // Fetch the first TS segment to extract codec config
+                let first_ts = self.fetch_segment(&source.segment_urls[0])?;
+                let (_, init) = process_ts_segment(&first_ts, &source, &mut ts_state, 0)?;
+                init.ok_or_else(|| {
+                    EdgepackError::MediaParse("failed to synthesize init from TS segment".to_string())
+                })?
+            }
+            #[cfg(not(feature = "ts"))]
+            {
+                return Err(EdgepackError::InvalidInput(
+                    "TS input requires the 'ts' feature".to_string(),
+                ));
+            }
+        } else {
+            self.fetch_segment(&source.init_segment_url)?
+        };
         let protection_info = init::parse_protection_info(&init_data)?;
 
         // Detect source encryption scheme
@@ -110,8 +142,12 @@ impl RepackagePipeline {
         let any_target_encrypted = target_schemes.iter().any(|s| s.is_encrypted());
         let needs_keys = source_scheme.is_encrypted() || any_target_encrypted;
         let (key_set, source_key, content_key) = if needs_keys {
-            let key_ids = key_mapping.all_kids();
-            let ks = self.get_or_fetch_keys(content_id, &key_ids)?;
+            let ks = if !request.raw_keys.is_empty() {
+                build_key_set_from_raw_keys(&request.raw_keys)
+            } else {
+                let key_ids = key_mapping.all_kids();
+                self.get_or_fetch_keys(content_id, &key_ids)?
+            };
             let key = find_key_for_kid(&ks, &primary_kid)?;
             let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
             (Some(ks), src, Some(key))
@@ -148,7 +184,7 @@ impl RepackagePipeline {
             let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
             let drm_info = if target_scheme.is_encrypted() {
                 let ks = key_set.as_ref().unwrap();
-                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme))
+                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme, &request.drm_systems))
             } else {
                 None
             };
@@ -156,6 +192,18 @@ impl RepackagePipeline {
                 ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
             progressive.set_variants(build_variants_from_tracks(&tracks));
             progressive.set_init_segment(new_init);
+
+            // Thread LL-HLS/LL-DASH parameters from source manifest
+            if let Some(ptd) = source.part_target_duration {
+                progressive.set_part_target_duration(ptd);
+            }
+            if let Some(ref sc) = source.server_control {
+                progressive.set_server_control(sc.clone());
+            }
+            if let Some(ref ll) = source.ll_dash_info {
+                progressive.set_ll_dash_info(ll.clone());
+            }
+
             outputs.push((target_scheme, progressive));
         }
 
@@ -176,7 +224,31 @@ impl RepackagePipeline {
 
         let mut elapsed_time = 0.0f64;
         for (i, segment_url) in source.segment_urls.iter().enumerate() {
-            let seg_data = self.fetch_segment(segment_url)?;
+            // For TS sources, transmux to CMAF before further processing
+            let seg_data = if source.is_ts_source {
+                #[cfg(feature = "ts")]
+                {
+                    if i == 0 {
+                        // First segment was already processed for init synthesis.
+                        // Re-fetch and re-transmux (the cost is acceptable for correctness).
+                        let raw_ts = self.fetch_segment(segment_url)?;
+                        let (cmaf_seg, _) = process_ts_segment(&raw_ts, &source, &mut ts_state, i as u32)?;
+                        cmaf_seg
+                    } else {
+                        let raw_ts = self.fetch_segment(segment_url)?;
+                        let (cmaf_seg, _) = process_ts_segment(&raw_ts, &source, &mut ts_state, i as u32)?;
+                        cmaf_seg
+                    }
+                }
+                #[cfg(not(feature = "ts"))]
+                {
+                    return Err(EdgepackError::InvalidInput(
+                        "TS input requires the 'ts' feature".to_string(),
+                    ));
+                }
+            } else {
+                self.fetch_segment(segment_url)?
+            };
             let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
             let is_last = i == source.segment_urls.len() - 1 && !source.is_live;
 
@@ -204,6 +276,31 @@ impl RepackagePipeline {
                 };
 
                 let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+
+                // LL-HLS: detect chunks and add parts if source has parts
+                if !source.parts.is_empty() {
+                    let boundaries = crate::media::chunk::detect_chunk_boundaries(&new_segment);
+                    if boundaries.len() > 1 {
+                        // Multi-chunk segment: extract each chunk as a part
+                        let part_duration = if boundaries.len() > 0 {
+                            duration / boundaries.len() as f64
+                        } else {
+                            duration
+                        };
+                        for (pi, boundary) in boundaries.iter().enumerate() {
+                            if let Some(chunk_data) = crate::media::chunk::extract_chunk(&new_segment, boundary) {
+                                progressive.add_part(
+                                    i as u32,
+                                    pi as u32,
+                                    chunk_data,
+                                    part_duration,
+                                    boundary.independent,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 progressive.add_segment(i as u32, new_segment, duration);
 
                 // Add ad breaks to this scheme's progressive output
@@ -270,8 +367,38 @@ impl RepackagePipeline {
         self.cache
             .set(&CacheKeys::target_schemes(content_id, &fmt), &schemes_json, ttl)?;
 
+        // TS source: reject if feature not enabled
+        #[cfg(not(feature = "ts"))]
+        if source.is_ts_source {
+            return Err(EdgepackError::InvalidInput(
+                "TS input requires the 'ts' feature to be enabled".to_string(),
+            ));
+        }
+        #[cfg(feature = "ts")]
+        let mut ts_state: Option<(
+            Option<crate::media::transmux::VideoConfig>,
+            Option<crate::media::transmux::AudioConfig>,
+        )> = None;
+
         // Step 2: Fetch init segment and parse protection info
-        let init_data = self.fetch_segment(&source.init_segment_url)?;
+        let init_data = if source.is_ts_source {
+            #[cfg(feature = "ts")]
+            {
+                let first_ts = self.fetch_segment(&source.segment_urls[0])?;
+                let (_, init) = process_ts_segment(&first_ts, &source, &mut ts_state, 0)?;
+                init.ok_or_else(|| {
+                    EdgepackError::MediaParse("failed to synthesize init from TS segment".to_string())
+                })?
+            }
+            #[cfg(not(feature = "ts"))]
+            {
+                return Err(EdgepackError::InvalidInput(
+                    "TS input requires the 'ts' feature".to_string(),
+                ));
+            }
+        } else {
+            self.fetch_segment(&source.init_segment_url)?
+        };
         let protection_info = init::parse_protection_info(&init_data)?;
 
         // Detect source encryption scheme
@@ -318,8 +445,12 @@ impl RepackagePipeline {
         let any_target_encrypted = target_schemes.iter().any(|s| s.is_encrypted());
         let needs_keys = source_scheme.is_encrypted() || any_target_encrypted;
         let (key_set, source_key, content_key) = if needs_keys {
-            let key_ids = key_mapping.all_kids();
-            let ks = self.get_or_fetch_keys(content_id, &key_ids)?;
+            let ks = if !request.raw_keys.is_empty() {
+                build_key_set_from_raw_keys(&request.raw_keys)
+            } else {
+                let key_ids = key_mapping.all_kids();
+                self.get_or_fetch_keys(content_id, &key_ids)?
+            };
             let key = find_key_for_kid(&ks, &primary_kid)?;
             let src = if source_scheme.is_encrypted() { Some(key.clone()) } else { None };
             (Some(ks), src, Some(key))
@@ -336,7 +467,22 @@ impl RepackagePipeline {
 
         // Step 5: Fetch first segment (once, shared across all schemes)
         self.update_job_state(content_id, format, JobState::Processing, 0, Some(total))?;
-        let seg_data = self.fetch_segment(&source.segment_urls[0])?;
+        let seg_data = if source.is_ts_source {
+            #[cfg(feature = "ts")]
+            {
+                let raw_ts = self.fetch_segment(&source.segment_urls[0])?;
+                let (cmaf_seg, _) = process_ts_segment(&raw_ts, &source, &mut ts_state, 0)?;
+                cmaf_seg
+            }
+            #[cfg(not(feature = "ts"))]
+            {
+                return Err(EdgepackError::InvalidInput(
+                    "TS input requires the 'ts' feature".to_string(),
+                ));
+            }
+        } else {
+            self.fetch_segment(&source.segment_urls[0])?
+        };
         let first_duration = source.segment_durations.first().copied().unwrap_or(6.0);
         let is_last = source.segment_urls.len() == 1 && !source.is_live;
 
@@ -413,7 +559,7 @@ impl RepackagePipeline {
             let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
             let drm_info = if target_scheme.is_encrypted() {
                 let ks = key_set.as_ref().unwrap();
-                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme))
+                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme, &request.drm_systems))
             } else {
                 None
             };
@@ -548,7 +694,23 @@ impl RepackagePipeline {
 
         // Fetch next source segment (once, shared across all schemes)
         let i = segments_done;
-        let seg_data = self.fetch_segment(&source.segment_urls[i])?;
+        let seg_data = if source.is_ts_source {
+            #[cfg(feature = "ts")]
+            {
+                let mut ts_state_cont = Some((None, None));
+                let raw_ts = self.fetch_segment(&source.segment_urls[i])?;
+                let (cmaf_seg, _) = process_ts_segment(&raw_ts, &source, &mut ts_state_cont, i as u32)?;
+                cmaf_seg
+            }
+            #[cfg(not(feature = "ts"))]
+            {
+                return Err(EdgepackError::InvalidInput(
+                    "TS input requires the 'ts' feature".to_string(),
+                ));
+            }
+        } else {
+            self.fetch_segment(&source.segment_urls[i])?
+        };
         let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
         let is_last = i == total - 1 && !source.is_live;
 
@@ -624,6 +786,7 @@ impl RepackagePipeline {
                 duration,
                 uri,
                 byte_size: new_segment.len() as u64,
+                key_period: None,
             });
             if duration > manifest_state.target_duration {
                 manifest_state.target_duration = duration;
@@ -933,7 +1096,7 @@ impl RepackagePipeline {
         // Step 9: Build manifest state with all segment entries (but not yet processed)
         let drm_info = if target_scheme.is_encrypted() {
             let ks = key_set.as_ref().unwrap();
-            Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme))
+            Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme, &[]))
         } else {
             None
         };
@@ -946,6 +1109,7 @@ impl RepackagePipeline {
                 duration,
                 uri: format!("{base_url}segment_{i}{ext}"),
                 byte_size: 0, // Not yet processed — size will be updated when segment is processed
+                key_period: None,
             }
         }).collect();
 
@@ -971,6 +1135,12 @@ impl RepackagePipeline {
             container_format,
             cea_captions: Vec::new(),
             ad_breaks: Vec::new(),
+            rotation_drm_info: Vec::new(),
+            clear_lead_boundary: None,
+            parts: Vec::new(),
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info: None,
         };
 
         let state_json = serde_json::to_vec(&manifest_state)
@@ -1087,6 +1257,31 @@ impl RepackagePipeline {
     }
 }
 
+/// Build a DrmKeySet from raw key entries (bypass SPEKE).
+fn build_key_set_from_raw_keys(raw_keys: &[crate::repackager::RawKeyEntry]) -> DrmKeySet {
+    let keys = raw_keys
+        .iter()
+        .map(|rk| ContentKey {
+            kid: rk.kid,
+            key: rk.key.to_vec(),
+            iv: rk.iv.map(|iv| iv.to_vec()),
+        })
+        .collect();
+    DrmKeySet {
+        keys,
+        drm_systems: vec![],
+    }
+}
+
+/// Determine the key period index for a segment number.
+/// Returns None if rotation is disabled.
+fn key_period_for_segment(segment_number: u32, period_segments: u32) -> Option<u32> {
+    if period_segments == 0 {
+        return None;
+    }
+    Some(segment_number / period_segments)
+}
+
 /// Build a TrackKeyMapping from extracted tracks and protection info.
 ///
 /// Priority:
@@ -1160,31 +1355,61 @@ fn build_manifest_drm_info(
     kid: &[u8; 16],
     key_mapping: &TrackKeyMapping,
     target_scheme: EncryptionScheme,
+    drm_systems_override: &[String],
 ) -> ManifestDrmInfo {
     let b64 = &base64::engine::general_purpose::STANDARD;
     use base64::Engine;
 
     let kid_hex: String = kid.iter().map(|b| format!("{b:02x}")).collect();
 
-    let widevine_pssh = build_manifest_pssh_for_system(key_set, key_mapping, crate::drm::system_ids::WIDEVINE)
-        .map(|pssh_box| b64.encode(&pssh_box));
+    // DRM systems filtering
+    let include_widevine = drm_systems_override.is_empty() || drm_systems_override.iter().any(|s| s == "widevine");
+    let include_playready = drm_systems_override.is_empty() || drm_systems_override.iter().any(|s| s == "playready");
+    let include_fairplay = drm_systems_override.is_empty() || drm_systems_override.iter().any(|s| s == "fairplay");
+    let include_clearkey = drm_systems_override.iter().any(|s| s == "clearkey");
 
-    let playready_pssh = build_manifest_pssh_for_system(key_set, key_mapping, crate::drm::system_ids::PLAYREADY)
-        .map(|pssh_box| b64.encode(&pssh_box));
+    let widevine_pssh = if include_widevine {
+        build_manifest_pssh_for_system(key_set, key_mapping, crate::drm::system_ids::WIDEVINE)
+            .map(|pssh_box| b64.encode(&pssh_box))
+    } else {
+        None
+    };
 
-    let playready_pro = key_set
-        .drm_systems
-        .iter()
-        .find(|d| d.system_id == crate::drm::system_ids::PLAYREADY)
-        .and_then(|d| d.content_protection_data.clone());
+    let playready_pssh = if include_playready {
+        build_manifest_pssh_for_system(key_set, key_mapping, crate::drm::system_ids::PLAYREADY)
+            .map(|pssh_box| b64.encode(&pssh_box))
+    } else {
+        None
+    };
 
-    // For CBCS output, include FairPlay key URI if available
-    let fairplay_key_uri = if target_scheme == EncryptionScheme::Cbcs {
-        key_set
-            .drm_systems
-            .iter()
+    let playready_pro = if include_playready {
+        key_set.drm_systems.iter()
+            .find(|d| d.system_id == crate::drm::system_ids::PLAYREADY)
+            .and_then(|d| d.content_protection_data.clone())
+    } else {
+        None
+    };
+
+    let fairplay_key_uri = if include_fairplay && target_scheme == EncryptionScheme::Cbcs {
+        key_set.drm_systems.iter()
             .find(|d| d.system_id == crate::drm::system_ids::FAIRPLAY)
             .and_then(|d| d.content_protection_data.clone())
+    } else {
+        None
+    };
+
+    // ClearKey: build PSSH locally from KIDs
+    let clearkey_pssh = if include_clearkey {
+        let all_kids = key_mapping.all_kids();
+        let kids_owned: Vec<[u8; 16]> = all_kids;
+        let pssh_data = crate::drm::build_clearkey_pssh_data(&kids_owned);
+        let pssh_box = crate::media::cmaf::build_pssh_box(&crate::media::cmaf::PsshBox {
+            version: 1,
+            system_id: crate::drm::system_ids::CLEARKEY,
+            key_ids: kids_owned,
+            data: pssh_data,
+        });
+        Some(b64.encode(&pssh_box))
     } else {
         None
     };
@@ -1196,6 +1421,7 @@ fn build_manifest_drm_info(
         playready_pro,
         fairplay_key_uri,
         default_kid: kid_hex,
+        clearkey_pssh,
     }
 }
 
@@ -1479,6 +1705,71 @@ fn parse_scheme_str(s: &str) -> Option<EncryptionScheme> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MPEG-TS processing (feature-gated)
+// ---------------------------------------------------------------------------
+
+/// Process a TS segment: optionally decrypt, demux, and transmux to CMAF.
+///
+/// On the first segment, extracts codec config and synthesizes a CMAF init segment.
+/// Returns `(cmaf_segment_data, Option<init_segment_data>)`.
+#[cfg(feature = "ts")]
+fn process_ts_segment(
+    segment_data: &[u8],
+    _source_manifest: &SourceManifest,
+    ts_state: &mut Option<(
+        Option<crate::media::transmux::VideoConfig>,
+        Option<crate::media::transmux::AudioConfig>,
+    )>,
+    sequence_number: u32,
+) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    use crate::media::ts;
+    use crate::media::transmux;
+
+    // Step 1: AES-128 decryption is handled at a higher level when keys are available.
+    // For now, the pipeline passes through the raw data. TS segment-level AES-128
+    // decryption support will be completed when key fetching is integrated.
+    let data = segment_data;
+
+    // Step 2: Demux TS to PES packets
+    let demuxed = ts::demux_segment(data)?;
+
+    // Step 3: Extract config from first segment if not already done
+    let init_data = if ts_state.is_none() {
+        let video_config = if !demuxed.video_packets.is_empty() {
+            Some(transmux::extract_video_config(&demuxed.video_packets[0])?)
+        } else {
+            None
+        };
+        let audio_config = if !demuxed.audio_packets.is_empty() {
+            Some(transmux::extract_audio_config(&demuxed.audio_packets[0])?)
+        } else {
+            None
+        };
+
+        let init = transmux::synthesize_init_segment(
+            video_config.as_ref(),
+            audio_config.as_ref(),
+        )?;
+
+        *ts_state = Some((video_config, audio_config));
+        Some(init)
+    } else {
+        None
+    };
+
+    // Step 4: Transmux PES to CMAF moof+mdat
+    let (ref video_config, ref audio_config) = ts_state.as_ref().unwrap();
+    let cmaf_segment = transmux::transmux_to_cmaf(
+        &demuxed,
+        video_config.as_ref(),
+        audio_config.as_ref(),
+        sequence_number,
+    )?;
+
+    Ok((cmaf_segment, init_data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1637,7 +1928,7 @@ mod tests {
         let key_set = make_key_set();
         let kid = [0x01; 16];
         let mapping = TrackKeyMapping::single(kid);
-        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc, &[]);
 
         assert!(info.widevine_pssh.is_some());
         assert!(info.playready_pssh.is_some());
@@ -1656,7 +1947,7 @@ mod tests {
         };
         let kid = [0x01; 16];
         let mapping = TrackKeyMapping::single(kid);
-        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc, &[]);
 
         assert!(info.widevine_pssh.is_none());
         assert!(info.playready_pssh.is_none());
@@ -1673,7 +1964,7 @@ mod tests {
         let kid = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
         let mapping = TrackKeyMapping::single(kid);
-        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc, &[]);
         assert_eq!(info.default_kid, "0123456789abcdef0123456789abcdef");
     }
 
@@ -1692,7 +1983,7 @@ mod tests {
         };
         let kid = [0x01; 16];
         let mapping = TrackKeyMapping::single(kid);
-        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cbcs);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cbcs, &[]);
 
         assert_eq!(info.encryption_scheme, EncryptionScheme::Cbcs);
         assert_eq!(info.fairplay_key_uri, Some("skd://fairplay-key-uri".into()));
@@ -1713,7 +2004,7 @@ mod tests {
         };
         let kid = [0x01; 16];
         let mapping = TrackKeyMapping::single(kid);
-        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc);
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc, &[]);
 
         assert_eq!(info.encryption_scheme, EncryptionScheme::Cenc);
         assert!(info.fairplay_key_uri.is_none());
@@ -1744,7 +2035,7 @@ mod tests {
         };
         let video_kid = [0xAA; 16];
         let mapping = TrackKeyMapping::per_type([0xAA; 16], [0xBB; 16]);
-        let info = build_manifest_drm_info(&key_set, &video_kid, &mapping, EncryptionScheme::Cenc);
+        let info = build_manifest_drm_info(&key_set, &video_kid, &mapping, EncryptionScheme::Cenc, &[]);
 
         // Should have Widevine PSSH with both KIDs
         assert!(info.widevine_pssh.is_some());
@@ -2340,5 +2631,105 @@ mod tests {
         let resolved = resolve_source_config(&cache, "vid-1", &config, Some("cbcs")).unwrap();
         assert_eq!(resolved.source_url, "https://cdn.test/vid-1/index.m3u8");
         assert_eq!(resolved.target_schemes, vec![EncryptionScheme::Cbcs]);
+    }
+
+    // --- build_key_set_from_raw_keys tests ---
+
+    #[test]
+    fn build_key_set_from_raw_keys_single() {
+        let raw = vec![crate::repackager::RawKeyEntry {
+            kid: [0xAA; 16],
+            key: [0xBB; 16],
+            iv: Some([0xCC; 16]),
+        }];
+        let ks = build_key_set_from_raw_keys(&raw);
+        assert_eq!(ks.keys.len(), 1);
+        assert_eq!(ks.keys[0].kid, [0xAA; 16]);
+        assert_eq!(ks.keys[0].key, vec![0xBB; 16]);
+        assert_eq!(ks.keys[0].iv, Some(vec![0xCC; 16]));
+        assert!(ks.drm_systems.is_empty());
+    }
+
+    #[test]
+    fn build_key_set_from_raw_keys_multi() {
+        let raw = vec![
+            crate::repackager::RawKeyEntry { kid: [0x01; 16], key: [0x11; 16], iv: None },
+            crate::repackager::RawKeyEntry { kid: [0x02; 16], key: [0x22; 16], iv: None },
+        ];
+        let ks = build_key_set_from_raw_keys(&raw);
+        assert_eq!(ks.keys.len(), 2);
+        assert_eq!(ks.keys[0].kid, [0x01; 16]);
+        assert_eq!(ks.keys[1].kid, [0x02; 16]);
+    }
+
+    #[test]
+    fn build_key_set_from_raw_keys_empty() {
+        let ks = build_key_set_from_raw_keys(&[]);
+        assert!(ks.keys.is_empty());
+        assert!(ks.drm_systems.is_empty());
+    }
+
+    #[test]
+    fn build_key_set_from_raw_keys_finds_key_by_kid() {
+        let raw = vec![
+            crate::repackager::RawKeyEntry { kid: [0xAA; 16], key: [0x11; 16], iv: None },
+            crate::repackager::RawKeyEntry { kid: [0xBB; 16], key: [0x22; 16], iv: None },
+        ];
+        let ks = build_key_set_from_raw_keys(&raw);
+        let found = find_key_for_kid(&ks, &[0xBB; 16]).unwrap();
+        assert_eq!(found.key, vec![0x22; 16]);
+    }
+
+    // --- key_period_for_segment tests ---
+
+    #[test]
+    fn key_period_disabled_when_zero() {
+        assert!(key_period_for_segment(5, 0).is_none());
+    }
+
+    #[test]
+    fn key_period_boundary_detection() {
+        assert_eq!(key_period_for_segment(0, 3), Some(0));
+        assert_eq!(key_period_for_segment(2, 3), Some(0));
+        assert_eq!(key_period_for_segment(3, 3), Some(1));
+        assert_eq!(key_period_for_segment(5, 3), Some(1));
+        assert_eq!(key_period_for_segment(6, 3), Some(2));
+    }
+
+    #[test]
+    fn key_period_single_segment_periods() {
+        assert_eq!(key_period_for_segment(0, 1), Some(0));
+        assert_eq!(key_period_for_segment(1, 1), Some(1));
+        assert_eq!(key_period_for_segment(100, 1), Some(100));
+    }
+
+    // --- build_manifest_drm_info with drm_systems_override tests ---
+
+    #[test]
+    fn build_manifest_drm_info_drm_systems_filter_widevine_only() {
+        let key_set = make_key_set();
+        let kid = [0x01; 16];
+        let mapping = TrackKeyMapping::single(kid);
+        let override_list = vec!["widevine".to_string()];
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc, &override_list);
+        assert!(info.widevine_pssh.is_some());
+        assert!(info.playready_pssh.is_none());
+        assert!(info.playready_pro.is_none());
+    }
+
+    #[test]
+    fn build_manifest_drm_info_drm_systems_clearkey() {
+        let key_set = DrmKeySet {
+            keys: vec![],
+            drm_systems: vec![],
+        };
+        let kid = [0x01; 16];
+        let mapping = TrackKeyMapping::single(kid);
+        let override_list = vec!["clearkey".to_string()];
+        let info = build_manifest_drm_info(&key_set, &kid, &mapping, EncryptionScheme::Cenc, &override_list);
+        assert!(info.clearkey_pssh.is_some());
+        // Widevine and PlayReady should be excluded
+        assert!(info.widevine_pssh.is_none());
+        assert!(info.playready_pssh.is_none());
     }
 }

@@ -126,9 +126,9 @@ graph TD
     end
 
     subgraph Core["Core Modules"]
-        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>codec + language extraction<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
-        DRMMod["drm/<br/>EncryptionScheme<br/>SampleDecryptor/Encryptor<br/>SPEKE client + CPIX XML<br/>CBCS decrypt+encrypt<br/>CENC encrypt+decrypt"]
-        Manifest["manifest/<br/>HLS renderer<br/>DASH renderer<br/>HLS input parser<br/>DASH input parser<br/>Subtitle/CEA signaling"]
+        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>codec + language extraction<br/>chunk boundary detection<br/>TS demux + transmux (ts feature)<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
+        DRMMod["drm/<br/>EncryptionScheme<br/>SampleDecryptor/Encryptor<br/>SPEKE client + CPIX XML<br/>CBCS decrypt+encrypt<br/>CENC encrypt+decrypt<br/>ClearKey PSSH builder"]
+        Manifest["manifest/<br/>HLS renderer (incl. LL-HLS)<br/>DASH renderer (incl. LL-DASH)<br/>HLS input parser<br/>DASH input parser<br/>Subtitle/CEA signaling"]
         CacheMod2["cache/<br/>CacheBackend trait<br/>EncryptedCacheBackend<br/>Redis HTTP / TCP<br/>Cloudflare KV / HTTP KV<br/>In-memory (sandbox)"]
     end
 
@@ -417,12 +417,16 @@ flowchart TD
 | **Codec Awareness** | RFC 6381 codec string extraction from init segments for manifest signaling |
 | **Subtitle Pass-Through** | WebVTT/TTML in fMP4, HLS subtitle rendition groups, DASH text AdaptationSets, CEA-608/708 caption signaling |
 | **JIT Packaging** | On-demand GET packaging (manifest/init/segment-on-GET) with <1 ms cold start — package content on first viewer request instead of pre-processing at origin. Request coalescing via distributed locking prevents duplicate work |
-| **Sub-Millisecond Cold Start** | ~607 KB WASM binary instantiates in <1 ms, 50–500x faster than Lambda/Cloud Functions. Enables JIT packaging without adding perceptible latency to viewer requests |
+| **Sub-Millisecond Cold Start** | ~648 KB WASM binary instantiates in <1 ms, 50–500x faster than Lambda/Cloud Functions. Enables JIT packaging without adding perceptible latency to viewer requests |
 | **Multi-Backend Caching** | Redis HTTP, Cloudflare Workers KV, generic HTTP KV for AWS/Akamai/custom stores |
 | **SCTE-35 Ad Break Signaling** | emsg box extraction, splice event parsing, HLS `#EXT-X-DATERANGE` and DASH `EventStream` output, source manifest ad marker roundtrip |
 | **Compatibility Validation** | Pre-flight codec/scheme checks, HDR format detection, init/segment structure validation, conformance test suite |
-| **Per-Feature Binary Size Guards** | 3 tests enforce size limits per build variant (base ≤650 KB, JIT ≤700 KB, full ≤700 KB). Binary size is the primary cold start proxy — every KB matters for JIT latency |
-| **Zero External Test Dependencies** | All 948 tests use synthetic CMAF fixtures — no network or media files needed |
+| **Advanced DRM** | ClearKey DRM system, raw key mode (bypass SPEKE), key rotation at segment boundaries, clear lead (unencrypted lead-in segments), explicit DRM system selection per request |
+| **LL-HLS** | Low-Latency HLS with partial segments (`#EXT-X-PART`), server control (`#EXT-X-SERVER-CONTROL`), CMAF chunk boundary detection, HLS version 9 |
+| **LL-DASH** | Low-Latency DASH with `availabilityTimeOffset` and `availabilityTimeComplete` on `<SegmentTemplate>` |
+| **MPEG-TS Input** | TS demuxer (PAT/PMT/PES, H.264/AAC), TS-to-CMAF transmuxer (Annex B→AVCC, init synthesis), AES-128 segment decryption. Feature-gated (`ts` feature) |
+| **Per-Feature Binary Size Guards** | 5 tests enforce size limits per build variant (base ≤700 KB, JIT ≤750 KB, full ≤750 KB, ts ≤800 KB, full+ts ≤850 KB). Binary size is the primary cold start proxy — every KB matters for JIT latency |
+| **Zero External Test Dependencies** | All 1,151 tests (1,072 without `ts` feature) use synthetic CMAF fixtures — no network or media files needed |
 | **CDN-Portable WASM** | Entire runtime compiles to `wasm32-wasip2` — runs on any CDN with WASI P2 support (Cloudflare Workers, Fastly Compute, wasmtime on Lambda, Akamai EdgeCompute). No CDN-specific APIs, no vendor lock-in |
 
 ## Inputs and Outputs
@@ -432,6 +436,8 @@ flowchart TD
 | **Input** | Source manifest | HLS `.m3u8` or DASH `.mpd` (source scheme auto-detected) | HTTP GET from origin |
 | **Input** | Source init segment | CMAF (CBCS or CENC sinf/schm/tenc/pssh) | HTTP GET from origin |
 | **Input** | Source media segments | CMAF (source-scheme encrypted mdat) | HTTP GET from origin |
+| **Input** | Source TS segments | MPEG-TS (H.264/AAC, optional AES-128 encryption) | HTTP GET from origin (`ts` feature) |
+| **Input** | AES-128 key | Raw key bytes for HLS-TS segment decryption | HTTP GET from key URL (`ts` feature) |
 | **Input** | DRM content keys | CPIX XML (SPEKE 2.0) | HTTP POST to license server |
 | **Output** | Repackaged manifest | HLS `.m3u8` or DASH `.mpd` (target-scheme DRM signaling, format-aware profiles) | HTTP GET via CDN |
 | **Output** | Repackaged init segment | CMAF or fMP4 (target-scheme schm/tenc/pssh, target-format ftyp brands, DRM systems per scheme) | HTTP GET via CDN |
@@ -500,9 +506,33 @@ flowchart TD
 - `CACHE_BACKEND` env var override, `CACHE_ENCRYPTION_TOKEN` for custom key derivation
 - `set_nx()` best-effort (GET then PUT) on non-Redis backends
 
+### ~~Phase 9: LL-HLS & LL-DASH~~ ✅ Complete
+- LL-HLS partial segments: `#EXT-X-PART`, `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PRELOAD-HINT`
+- LL-DASH: `availabilityTimeOffset` and `availabilityTimeComplete` on `<SegmentTemplate>`
+- CMAF chunk boundary detection (`src/media/chunk.rs`) — finds moof+mdat pairs, checks independence via trun flags
+- New types: `PartInfo`, `ServerControl`, `LowLatencyDashInfo`, `SourcePartInfo`
+- Progressive output part support (`add_part()`, `part_data()`, LL setter methods)
+- HLS version bump to 9 when LL-HLS parts present
+- Source LL info threaded through pipeline to output manifests
+
+### ~~Phase 10: MPEG-TS Input~~ ✅ Complete
+- Feature-gated: all TS code behind `#[cfg(feature = "ts")]`
+- TS demuxer (`src/media/ts.rs`): 188-byte packet parsing, PAT/PMT table parsing, PES reassembly, `TsDemuxer` stateful accumulator
+- TS-to-CMAF transmuxer (`src/media/transmux.rs`): H.264 NAL extraction (Annex B→AVCC), SPS parsing, AAC ADTS config, init segment synthesis (ftyp+moov), moof+mdat fragment generation
+- AES-128-CBC whole-segment decryption for HLS-TS (`decrypt_ts_segment()`)
+- HLS input TS detection: `.ts` extension, `#EXT-X-KEY:METHOD=AES-128` with URI/IV, optional `#EXT-X-MAP`
+- Pipeline integration: feature-gated `process_ts_segment()` — decrypt → demux → transmux → CMAF pipeline
+
+### ~~Phase 11: Advanced DRM~~ ✅ Complete
+- ClearKey DRM system ID (`e2719d58-a985-b3c9-781a-b030af78d30e`) with local PSSH builder (JSON `{"kids":["base64url"]}`)
+- Raw key mode: accept encryption keys directly via webhook, bypass SPEKE
+- Key rotation: per-period key rotation at configurable segment boundaries, new DRM signaling per period
+- Clear lead: first N segments unencrypted, manifest transition at boundary
+- DRM systems override: explicit selection of widevine/playready/fairplay/clearkey per request
+
 ## Planned Architecture Extensions
 
-All P0 items are complete. Remaining phases are P1 and P2.
+All P0 and P1 items are complete. Remaining phases are P2.
 
 ---
 

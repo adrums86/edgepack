@@ -25,6 +25,13 @@ pub mod system_ids {
         0x8c, 0xa2,
     ];
 
+    /// ClearKey: e2719d58-a985-b3c9-781a-b030af78d30e
+    /// W3C EME ClearKey system (keys delivered in-band via JSON).
+    pub const CLEARKEY: [u8; 16] = [
+        0xe2, 0x71, 0x9d, 0x58, 0xa9, 0x85, 0xb3, 0xc9, 0x78, 0x1a, 0xb0, 0x30, 0xaf, 0x78,
+        0xd3, 0x0e,
+    ];
+
     pub fn system_id_name(id: &[u8; 16]) -> &'static str {
         if id == &WIDEVINE {
             "Widevine"
@@ -32,6 +39,8 @@ pub mod system_ids {
             "PlayReady"
         } else if id == &FAIRPLAY {
             "FairPlay"
+        } else if id == &CLEARKEY {
+            "ClearKey"
         } else {
             "Unknown"
         }
@@ -69,6 +78,31 @@ pub struct DrmKeySet {
     pub keys: Vec<ContentKey>,
     /// DRM system-specific data for each system and key.
     pub drm_systems: Vec<DrmSystemData>,
+}
+
+/// Build the PSSH data payload for ClearKey DRM.
+///
+/// ClearKey PSSH contains a JSON object with base64url-encoded KIDs:
+/// `{"kids":["base64url-kid-1","base64url-kid-2"]}`
+///
+/// This is the inner PSSH data (not the full PSSH box).
+pub fn build_clearkey_pssh_data(kids: &[[u8; 16]]) -> Vec<u8> {
+    let encoded_kids: Vec<String> = kids.iter().map(|kid| base64url_encode(kid)).collect();
+    let json = format!(
+        r#"{{"kids":[{}]}}"#,
+        encoded_kids
+            .iter()
+            .map(|k| format!("\"{}\"", k))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    json.into_bytes()
+}
+
+/// Base64url encoding (no padding) per RFC 4648 §5.
+fn base64url_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
 
 #[cfg(test)]
@@ -117,10 +151,25 @@ mod tests {
     }
 
     #[test]
+    fn clearkey_system_id_correct() {
+        assert_eq!(CLEARKEY[0], 0xe2);
+        assert_eq!(CLEARKEY[15], 0x0e);
+        assert_eq!(CLEARKEY.len(), 16);
+    }
+
+    #[test]
+    fn system_id_name_clearkey() {
+        assert_eq!(system_id_name(&CLEARKEY), "ClearKey");
+    }
+
+    #[test]
     fn all_system_ids_are_distinct() {
         assert_ne!(WIDEVINE, PLAYREADY);
         assert_ne!(WIDEVINE, FAIRPLAY);
+        assert_ne!(WIDEVINE, CLEARKEY);
         assert_ne!(PLAYREADY, FAIRPLAY);
+        assert_ne!(PLAYREADY, CLEARKEY);
+        assert_ne!(FAIRPLAY, CLEARKEY);
     }
 
     #[test]
@@ -162,5 +211,56 @@ mod tests {
         };
         assert_eq!(ks.keys.len(), 1);
         assert_eq!(ks.drm_systems.len(), 1);
+    }
+
+    #[test]
+    fn clearkey_pssh_data_single_kid() {
+        use base64::Engine;
+        let kid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                   0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10];
+        let data = super::build_clearkey_pssh_data(&[kid]);
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let kids = json["kids"].as_array().unwrap();
+        assert_eq!(kids.len(), 1);
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(kids[0].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, kid);
+    }
+
+    #[test]
+    fn clearkey_pssh_data_multi_kid() {
+        use base64::Engine;
+        let kid1 = [0xAA; 16];
+        let kid2 = [0xBB; 16];
+        let data = super::build_clearkey_pssh_data(&[kid1, kid2]);
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let kids = json["kids"].as_array().unwrap();
+        assert_eq!(kids.len(), 2);
+        for (i, expected) in [kid1, kid2].iter().enumerate() {
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(kids[i].as_str().unwrap())
+                .unwrap();
+            assert_eq!(decoded.as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn clearkey_pssh_data_is_valid_json() {
+        let kid = [0x00; 16];
+        let data = super::build_clearkey_pssh_data(&[kid]);
+        let json_str = std::str::from_utf8(&data).unwrap();
+        assert!(json_str.starts_with('{'));
+        assert!(json_str.ends_with('}'));
+        assert!(json_str.contains("\"kids\""));
+        assert!(!json_str.contains('='));
+    }
+
+    #[test]
+    fn clearkey_pssh_data_empty_kids() {
+        let data = super::build_clearkey_pssh_data(&[]);
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        let kids = json["kids"].as_array().unwrap();
+        assert!(kids.is_empty());
     }
 }

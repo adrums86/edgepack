@@ -243,6 +243,16 @@ fn build_content_protection_xml(state: &ManifestState) -> String {
             }
             xml.push_str("      </ContentProtection>\n");
         }
+
+        // ClearKey
+        if let Some(ref pssh) = drm.clearkey_pssh {
+            xml.push_str(
+                "      <ContentProtection \
+                 schemeIdUri=\"urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e\">\n",
+            );
+            xml.push_str(&format!("        <cenc:pssh>{pssh}</cenc:pssh>\n"));
+            xml.push_str("      </ContentProtection>\n");
+        }
     }
 
     xml
@@ -263,9 +273,22 @@ fn build_segment_template(state: &ManifestState) -> String {
         "      <SegmentTemplate timescale=\"{timescale}\" \
          initialization=\"{init_uri}\" \
          media=\"{base}segment_$Number${seg_ext}\" \
-         startNumber=\"0\">\n",
+         startNumber=\"0\"",
         base = state.base_url
     );
+
+    // LL-DASH: add availabilityTimeOffset and availabilityTimeComplete
+    if let Some(ref ll) = state.ll_dash_info {
+        xml.push_str(&format!(
+            " availabilityTimeOffset=\"{:.3}\"",
+            ll.availability_time_offset
+        ));
+        if !ll.availability_time_complete {
+            xml.push_str(" availabilityTimeComplete=\"false\"");
+        }
+    }
+
+    xml.push_str(">\n");
 
     xml.push_str("        <SegmentTimeline>\n");
     for segment in &state.segments {
@@ -342,6 +365,7 @@ mod tests {
                 duration: 6.0,
                 uri: format!("/base/segment_{i}.cmfv"),
                 byte_size: 1024,
+                key_period: None,
             });
         }
         s
@@ -441,6 +465,7 @@ mod tests {
             playready_pro: Some("<pro>data</pro>".into()),
             fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("urn:mpeg:dash:mp4protection:2011"));
@@ -463,6 +488,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("value=\"cbcs\""));
@@ -590,6 +616,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: None,
         });
         state.variants.push(VariantInfo {
             id: "v1".into(),
@@ -822,5 +849,57 @@ mod tests {
         let period_pos = mpd.find("<Period").unwrap();
         assert!(event_stream_pos > period_pos);
         assert!(event_stream_pos < adaptation_set_pos);
+    }
+
+    // --- LL-DASH rendering tests ---
+
+    #[test]
+    fn render_ll_dash_availability_time_offset() {
+        let mut state = make_live_state_with_segments(2);
+        state.ll_dash_info = Some(crate::manifest::types::LowLatencyDashInfo {
+            availability_time_offset: 5.0,
+            availability_time_complete: false,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("availabilityTimeOffset=\"5.000\""));
+        assert!(mpd.contains("availabilityTimeComplete=\"false\""));
+    }
+
+    #[test]
+    fn render_ll_dash_atc_true_not_emitted() {
+        let mut state = make_live_state_with_segments(1);
+        state.ll_dash_info = Some(crate::manifest::types::LowLatencyDashInfo {
+            availability_time_offset: 3.5,
+            availability_time_complete: true,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("availabilityTimeOffset=\"3.500\""));
+        // When ATC is true (default), it should NOT be emitted
+        assert!(!mpd.contains("availabilityTimeComplete"));
+    }
+
+    #[test]
+    fn render_no_ll_dash_backward_compat() {
+        let state = make_live_state_with_segments(2);
+        let mpd = render(&state).unwrap();
+        assert!(!mpd.contains("availabilityTimeOffset"));
+        assert!(!mpd.contains("availabilityTimeComplete"));
+    }
+
+    #[test]
+    fn render_with_clearkey_content_protection() {
+        let mut state = make_live_state_with_segments(1);
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: None,
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: Some("CKDATA".into()),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e"));
+        assert!(mpd.contains("<cenc:pssh>CKDATA</cenc:pssh>"));
     }
 }

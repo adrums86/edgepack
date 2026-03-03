@@ -1,3 +1,4 @@
+pub mod chunk;
 pub mod cmaf;
 pub mod codec;
 pub mod compat;
@@ -5,6 +6,10 @@ pub mod container;
 pub mod init;
 pub mod scte35;
 pub mod segment;
+#[cfg(feature = "ts")]
+pub mod transmux;
+#[cfg(feature = "ts")]
+pub mod ts;
 
 /// Four-character code (FourCC) used to identify MP4 box types.
 pub type FourCC = [u8; 4];
