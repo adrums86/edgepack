@@ -36,6 +36,9 @@ pub struct SegmentInfo {
     pub uri: String,
     /// Byte size of the segment.
     pub byte_size: u64,
+    /// Key rotation period index for this segment. None = no rotation.
+    #[serde(default)]
+    pub key_period: Option<u32>,
 }
 
 /// Information about the init segment.
@@ -89,6 +92,9 @@ pub struct ManifestDrmInfo {
     pub fairplay_key_uri: Option<String>,
     /// Default Key ID (hex string, no hyphens).
     pub default_kid: String,
+    /// ClearKey PSSH (base64-encoded full PSSH box).
+    #[serde(default)]
+    pub clearkey_pssh: Option<String>,
 }
 
 /// SCTE-35 ad break information extracted from emsg boxes.
@@ -115,6 +121,64 @@ pub struct CeaCaptionInfo {
     pub language: String,
     /// Whether this is CEA-608 (true) or CEA-708 (false).
     pub is_608: bool,
+}
+
+/// Information about a CMAF part (LL-HLS partial segment).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartInfo {
+    /// Parent segment number.
+    pub segment_number: u32,
+    /// Part index within the segment (0-indexed).
+    pub part_index: u32,
+    /// Duration of this part in seconds.
+    pub duration: f64,
+    /// Whether this part starts with an independent frame (IDR/sync).
+    pub independent: bool,
+    /// URI path for this part.
+    pub uri: String,
+    /// Byte size of the part.
+    pub byte_size: u64,
+}
+
+/// LL-HLS server control parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerControl {
+    /// CAN-SKIP-UNTIL: duration in seconds of skippable content.
+    #[serde(default)]
+    pub can_skip_until: Option<f64>,
+    /// HOLD-BACK: server-recommended live edge distance in seconds.
+    #[serde(default)]
+    pub hold_back: Option<f64>,
+    /// PART-HOLD-BACK: live edge distance for parts in seconds.
+    #[serde(default)]
+    pub part_hold_back: Option<f64>,
+    /// CAN-BLOCK-RELOAD: server supports blocking playlist reload.
+    #[serde(default)]
+    pub can_block_reload: bool,
+}
+
+/// LL-DASH low-latency parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LowLatencyDashInfo {
+    /// availabilityTimeOffset on SegmentTemplate (seconds).
+    pub availability_time_offset: f64,
+    /// availabilityTimeComplete (false = chunks available before segment complete).
+    pub availability_time_complete: bool,
+}
+
+/// Part info from source manifest (input side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourcePartInfo {
+    /// Parent segment number (index into segment_urls).
+    pub segment_number: u32,
+    /// Part index within the segment.
+    pub part_index: u32,
+    /// Part duration in seconds.
+    pub duration: f64,
+    /// Whether this part is independent (starts with IDR frame).
+    pub independent: bool,
+    /// URL to fetch this part.
+    pub uri: String,
 }
 
 /// The persistent state of a manifest being progressively built.
@@ -149,6 +213,24 @@ pub struct ManifestState {
     /// SCTE-35 ad break markers extracted from emsg boxes.
     #[serde(default)]
     pub ad_breaks: Vec<AdBreakInfo>,
+    /// Key rotation: per-period DRM info (indexed by key_period % len).
+    #[serde(default)]
+    pub rotation_drm_info: Vec<ManifestDrmInfo>,
+    /// Clear lead: segment number boundary where encryption starts.
+    #[serde(default)]
+    pub clear_lead_boundary: Option<u32>,
+    /// LL-HLS parts (partial segments).
+    #[serde(default)]
+    pub parts: Vec<PartInfo>,
+    /// LL-HLS part target duration (EXT-X-PART-INF:PART-TARGET).
+    #[serde(default)]
+    pub part_target_duration: Option<f64>,
+    /// LL-HLS server control parameters.
+    #[serde(default)]
+    pub server_control: Option<ServerControl>,
+    /// LL-DASH low-latency parameters.
+    #[serde(default)]
+    pub ll_dash_info: Option<LowLatencyDashInfo>,
 }
 
 /// Lifecycle phase of the manifest.
@@ -183,6 +265,12 @@ impl ManifestState {
             container_format,
             cea_captions: Vec::new(),
             ad_breaks: Vec::new(),
+            rotation_drm_info: Vec::new(),
+            clear_lead_boundary: None,
+            parts: Vec::new(),
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info: None,
         }
     }
 
@@ -211,6 +299,27 @@ pub struct SourceManifest {
     /// Ad break markers parsed from source manifest (HLS EXT-X-DATERANGE, DASH EventStream).
     #[serde(default)]
     pub ad_breaks: Vec<AdBreakInfo>,
+    /// LL-HLS parts parsed from source manifest.
+    #[serde(default)]
+    pub parts: Vec<SourcePartInfo>,
+    /// LL-HLS part target duration.
+    #[serde(default)]
+    pub part_target_duration: Option<f64>,
+    /// LL-HLS server control parameters.
+    #[serde(default)]
+    pub server_control: Option<ServerControl>,
+    /// LL-DASH low-latency parameters.
+    #[serde(default)]
+    pub ll_dash_info: Option<LowLatencyDashInfo>,
+    /// Whether the source uses MPEG-TS segments (detected from .ts extension).
+    #[serde(default)]
+    pub is_ts_source: bool,
+    /// AES-128 key URL for TS segment decryption.
+    #[serde(default)]
+    pub aes128_key_url: Option<String>,
+    /// AES-128 IV for TS segment decryption (hex-decoded from manifest).
+    #[serde(default)]
+    pub aes128_iv: Option<[u8; 16]>,
 }
 
 #[cfg(test)]
@@ -265,6 +374,7 @@ mod tests {
             duration: 6.006,
             uri: "segment_5.cmfv".to_string(),
             byte_size: 1024,
+            key_period: None,
         };
         assert_eq!(seg.number, 5);
         assert!((seg.duration - 6.006).abs() < f64::EPSILON);
@@ -279,6 +389,7 @@ mod tests {
             duration: 4.004,
             uri: "segment_3.cmfv".to_string(),
             byte_size: 2048,
+            key_period: None,
         };
         let json = serde_json::to_string(&seg).unwrap();
         let parsed: SegmentInfo = serde_json::from_str(&json).unwrap();
@@ -374,6 +485,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".to_string(),
+            clearkey_pssh: None,
         };
         assert_eq!(drm.encryption_scheme, EncryptionScheme::Cenc);
         assert!(drm.widevine_pssh.is_some());
@@ -488,6 +600,7 @@ mod tests {
             duration: 6.0,
             uri: "segment_0.cmfv".to_string(),
             byte_size: 1024,
+            key_period: None,
         });
         state.init_segment = Some(InitSegmentInfo {
             uri: "init.mp4".into(),
@@ -501,5 +614,208 @@ mod tests {
         assert_eq!(parsed.phase, ManifestPhase::Live);
         assert_eq!(parsed.segments.len(), 1);
         assert!(parsed.init_segment.is_some());
+    }
+
+    #[test]
+    fn segment_info_key_period_serde() {
+        let seg = SegmentInfo {
+            number: 0,
+            duration: 6.0,
+            uri: "seg.cmfv".into(),
+            byte_size: 1024,
+            key_period: Some(2),
+        };
+        let json = serde_json::to_string(&seg).unwrap();
+        let parsed: SegmentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.key_period, Some(2));
+    }
+
+    #[test]
+    fn segment_info_key_period_backward_compat() {
+        let json = r#"{"number":0,"duration":6.0,"uri":"seg.cmfv","byte_size":1024}"#;
+        let parsed: SegmentInfo = serde_json::from_str(json).unwrap();
+        assert!(parsed.key_period.is_none());
+    }
+
+    #[test]
+    fn manifest_state_rotation_drm_info() {
+        let state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        assert!(state.rotation_drm_info.is_empty());
+        assert!(state.clear_lead_boundary.is_none());
+    }
+
+    #[test]
+    fn manifest_drm_info_clearkey_pssh() {
+        let drm = ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: None,
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: Some("CLEARKEY_DATA".into()),
+        };
+        assert!(drm.clearkey_pssh.is_some());
+    }
+
+    #[test]
+    fn manifest_state_serde_backward_compat_no_rotation() {
+        let json = r#"{"content_id":"c","format":"Hls","phase":"Live","init_segment":null,"segments":[],"target_duration":6.0,"variants":[],"drm_info":null,"media_sequence":0,"base_url":"/"}"#;
+        let parsed: ManifestState = serde_json::from_str(json).unwrap();
+        assert!(parsed.rotation_drm_info.is_empty());
+        assert!(parsed.clear_lead_boundary.is_none());
+    }
+
+    // --- LL-HLS / LL-DASH type tests ---
+
+    #[test]
+    fn part_info_construction() {
+        let part = PartInfo {
+            segment_number: 2,
+            part_index: 1,
+            duration: 0.33334,
+            independent: true,
+            uri: "/base/part_2.1.cmfv".to_string(),
+            byte_size: 5000,
+        };
+        assert_eq!(part.segment_number, 2);
+        assert_eq!(part.part_index, 1);
+        assert!((part.duration - 0.33334).abs() < f64::EPSILON);
+        assert!(part.independent);
+        assert_eq!(part.byte_size, 5000);
+    }
+
+    #[test]
+    fn part_info_serde_roundtrip() {
+        let part = PartInfo {
+            segment_number: 0,
+            part_index: 3,
+            duration: 0.5,
+            independent: false,
+            uri: "part_0.3.cmfv".to_string(),
+            byte_size: 1234,
+        };
+        let json = serde_json::to_string(&part).unwrap();
+        let parsed: PartInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.segment_number, 0);
+        assert_eq!(parsed.part_index, 3);
+        assert!(!parsed.independent);
+    }
+
+    #[test]
+    fn server_control_construction_and_serde() {
+        let sc = ServerControl {
+            can_skip_until: Some(12.0),
+            hold_back: Some(9.0),
+            part_hold_back: Some(1.0),
+            can_block_reload: true,
+        };
+        let json = serde_json::to_string(&sc).unwrap();
+        let parsed: ServerControl = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.can_skip_until, Some(12.0));
+        assert_eq!(parsed.hold_back, Some(9.0));
+        assert_eq!(parsed.part_hold_back, Some(1.0));
+        assert!(parsed.can_block_reload);
+    }
+
+    #[test]
+    fn server_control_defaults() {
+        let json = r#"{}"#;
+        let parsed: ServerControl = serde_json::from_str(json).unwrap();
+        assert!(parsed.can_skip_until.is_none());
+        assert!(parsed.hold_back.is_none());
+        assert!(parsed.part_hold_back.is_none());
+        assert!(!parsed.can_block_reload);
+    }
+
+    #[test]
+    fn low_latency_dash_info_serde_roundtrip() {
+        let info = LowLatencyDashInfo {
+            availability_time_offset: 5.0,
+            availability_time_complete: false,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: LowLatencyDashInfo = serde_json::from_str(&json).unwrap();
+        assert!((parsed.availability_time_offset - 5.0).abs() < f64::EPSILON);
+        assert!(!parsed.availability_time_complete);
+    }
+
+    #[test]
+    fn source_part_info_serde_roundtrip() {
+        let sp = SourcePartInfo {
+            segment_number: 1,
+            part_index: 0,
+            duration: 0.33334,
+            independent: true,
+            uri: "https://cdn.example.com/part1.0.cmfv".to_string(),
+        };
+        let json = serde_json::to_string(&sp).unwrap();
+        let parsed: SourcePartInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.segment_number, 1);
+        assert_eq!(parsed.part_index, 0);
+        assert!(parsed.independent);
+    }
+
+    #[test]
+    fn manifest_state_new_ll_defaults() {
+        let state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        assert!(state.parts.is_empty());
+        assert!(state.part_target_duration.is_none());
+        assert!(state.server_control.is_none());
+        assert!(state.ll_dash_info.is_none());
+    }
+
+    #[test]
+    fn manifest_state_serde_backward_compat_no_ll_fields() {
+        let json = r#"{"content_id":"c","format":"Hls","phase":"Live","init_segment":null,"segments":[],"target_duration":6.0,"variants":[],"drm_info":null,"media_sequence":0,"base_url":"/"}"#;
+        let parsed: ManifestState = serde_json::from_str(json).unwrap();
+        assert!(parsed.parts.is_empty());
+        assert!(parsed.part_target_duration.is_none());
+        assert!(parsed.server_control.is_none());
+        assert!(parsed.ll_dash_info.is_none());
+    }
+
+    #[test]
+    fn source_manifest_serde_backward_compat_no_ll_fields() {
+        let json = r#"{"init_segment_url":"https://cdn.example.com/init.mp4","segment_urls":[],"segment_durations":[],"is_live":false,"source_scheme":null,"ad_breaks":[]}"#;
+        let parsed: SourceManifest = serde_json::from_str(json).unwrap();
+        assert!(parsed.parts.is_empty());
+        assert!(parsed.part_target_duration.is_none());
+        assert!(parsed.server_control.is_none());
+        assert!(parsed.ll_dash_info.is_none());
+    }
+
+    #[test]
+    fn source_manifest_serde_backward_compat_no_ts_fields() {
+        let json = r#"{"init_segment_url":"https://cdn.example.com/init.mp4","segment_urls":[],"segment_durations":[],"is_live":false,"source_scheme":null,"ad_breaks":[]}"#;
+        let parsed: SourceManifest = serde_json::from_str(json).unwrap();
+        assert!(!parsed.is_ts_source);
+        assert!(parsed.aes128_key_url.is_none());
+        assert!(parsed.aes128_iv.is_none());
+    }
+
+    #[test]
+    fn source_manifest_ts_fields_serde_roundtrip() {
+        let manifest = SourceManifest {
+            init_segment_url: "".to_string(),
+            segment_urls: vec!["https://cdn.example.com/seg0.ts".to_string()],
+            segment_durations: vec![10.0],
+            is_live: false,
+            source_scheme: None,
+            ad_breaks: Vec::new(),
+            parts: Vec::new(),
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info: None,
+            is_ts_source: true,
+            aes128_key_url: Some("https://keys.example.com/key".to_string()),
+            aes128_iv: Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed: SourceManifest = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_ts_source);
+        assert_eq!(parsed.aes128_key_url.as_deref(), Some("https://keys.example.com/key"));
+        assert_eq!(parsed.aes128_iv.unwrap()[15], 0x01);
     }
 }

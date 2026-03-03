@@ -486,6 +486,7 @@ pub fn make_hls_manifest_state(segment_count: u32, phase: ManifestPhase) -> Mani
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
         fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
+        clearkey_pssh: None,
     });
 
     for i in 0..segment_count {
@@ -494,6 +495,7 @@ pub fn make_hls_manifest_state(segment_count: u32, phase: ManifestPhase) -> Mani
             duration: 6.006,
             uri: format!("/repackage/integration-test/hls/segment_{i}.cmfv"),
             byte_size: 50_000 + (i as u64 * 1000),
+            key_period: None,
         });
     }
 
@@ -524,6 +526,7 @@ pub fn make_dash_manifest_state(segment_count: u32, phase: ManifestPhase) -> Man
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
         fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
+        clearkey_pssh: None,
     });
 
     for i in 0..segment_count {
@@ -532,6 +535,7 @@ pub fn make_dash_manifest_state(segment_count: u32, phase: ManifestPhase) -> Man
             duration: 6.0,
             uri: format!("/repackage/integration-test/dash/segment_{i}.cmfv"),
             byte_size: 50_000 + (i as u64 * 1000),
+            key_period: None,
         });
     }
 

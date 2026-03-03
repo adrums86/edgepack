@@ -117,6 +117,9 @@ pub struct DrmSystemIds {
     pub widevine: bool,
     /// PlayReady system ID: 9a04f079-9840-4286-ab92-e65be0885f95
     pub playready: bool,
+    /// ClearKey system. Not sent to SPEKE — PSSH is built locally.
+    #[serde(default)]
+    pub clearkey: bool,
 }
 
 impl Default for DrmSystemIds {
@@ -124,6 +127,7 @@ impl Default for DrmSystemIds {
         Self {
             widevine: true,
             playready: true,
+            clearkey: false,
         }
     }
 }
@@ -334,6 +338,13 @@ mod tests {
         let ids = DrmSystemIds::default();
         assert!(ids.widevine);
         assert!(ids.playready);
+        assert!(!ids.clearkey);
+    }
+
+    #[test]
+    fn drm_system_ids_clearkey_default() {
+        let ids = DrmSystemIds::default();
+        assert!(!ids.clearkey);
     }
 
     #[test]

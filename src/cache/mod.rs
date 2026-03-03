@@ -160,6 +160,11 @@ impl CacheKeys {
     pub fn jit_setup(content_id: &str, format: &str) -> String {
         format!("ep:{content_id}:{format}:jit_setup")
     }
+
+    /// Part data (LL-HLS chunk).
+    pub fn part(content_id: &str, format: &str, segment_number: u32, part_index: u32) -> String {
+        format!("ep:{content_id}:{format}:part:{segment_number}:{part_index}")
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +302,18 @@ mod tests {
     fn cache_keys_jit_setup() {
         assert_eq!(CacheKeys::jit_setup("abc", "hls"), "ep:abc:hls:jit_setup");
         assert_eq!(CacheKeys::jit_setup("abc", "dash"), "ep:abc:dash:jit_setup");
+    }
+
+    #[test]
+    fn cache_keys_part() {
+        assert_eq!(
+            CacheKeys::part("abc", "hls_cenc", 3, 2),
+            "ep:abc:hls_cenc:part:3:2"
+        );
+        assert_eq!(
+            CacheKeys::part("abc", "dash_cbcs", 0, 0),
+            "ep:abc:dash_cbcs:part:0:0"
+        );
     }
 
     #[test]

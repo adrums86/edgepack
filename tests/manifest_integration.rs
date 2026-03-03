@@ -28,6 +28,7 @@ fn progressive_output_hls_full_lifecycle() {
         playready_pro: None,
         fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
+        clearkey_pssh: None,
     };
 
     let mut po = ProgressiveOutput::new(
@@ -112,6 +113,7 @@ fn progressive_output_dash_full_lifecycle() {
         playready_pro: Some("<WRMHEADER></WRMHEADER>".into()),
         fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
+        clearkey_pssh: None,
     };
 
     let mut po = ProgressiveOutput::new(
@@ -411,6 +413,7 @@ fn progressive_output_hls_iso_lifecycle() {
         playready_pro: None,
         fairplay_key_uri: None,
         default_kid: "00112233445566778899aabbccddeeff".into(),
+        clearkey_pssh: None,
     };
 
     let mut po = ProgressiveOutput::new(

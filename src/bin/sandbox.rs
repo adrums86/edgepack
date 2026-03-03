@@ -268,6 +268,10 @@ async fn handle_repackage(
         target_schemes: target_schemes.clone(),
         container_format,
         key_ids: vec![],
+        raw_keys: vec![],
+        key_rotation: None,
+        clear_lead_segments: None,
+        drm_systems: vec![],
     };
 
     // Track the job

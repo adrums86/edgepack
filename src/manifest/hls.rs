@@ -10,6 +10,59 @@ fn hex_encode_base64(b64: &str) -> String {
     }
 }
 
+/// Emit HLS DRM KEY tags for a given ManifestDrmInfo.
+fn emit_hls_drm_keys(m3u8: &mut String, drm: &crate::manifest::types::ManifestDrmInfo) {
+    let method = drm.encryption_scheme.hls_method_string();
+
+    // FairPlay (CBCS only)
+    if let Some(ref key_uri) = drm.fairplay_key_uri {
+        m3u8.push_str(&format!(
+            "#EXT-X-KEY:METHOD={method},\
+             URI=\"{key_uri}\",\
+             KEYID=0x{},\
+             KEYFORMAT=\"com.apple.streamingkeydelivery\",\
+             KEYFORMATVERSIONS=\"1\"\n",
+            drm.default_kid
+        ));
+    }
+
+    // Widevine
+    if let Some(ref pssh) = drm.widevine_pssh {
+        m3u8.push_str(&format!(
+            "#EXT-X-KEY:METHOD={method},\
+             URI=\"data:text/plain;base64,{pssh}\",\
+             KEYID=0x{},\
+             KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\",\
+             KEYFORMATVERSIONS=\"1\"\n",
+            drm.default_kid
+        ));
+    }
+
+    // PlayReady
+    if let Some(ref pssh) = drm.playready_pssh {
+        m3u8.push_str(&format!(
+            "#EXT-X-KEY:METHOD={method},\
+             URI=\"data:text/plain;base64,{pssh}\",\
+             KEYID=0x{},\
+             KEYFORMAT=\"urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95\",\
+             KEYFORMATVERSIONS=\"1\"\n",
+            drm.default_kid
+        ));
+    }
+
+    // ClearKey
+    if let Some(ref pssh) = drm.clearkey_pssh {
+        m3u8.push_str(&format!(
+            "#EXT-X-KEY:METHOD={method},\
+             URI=\"data:text/plain;base64,{pssh}\",\
+             KEYID=0x{},\
+             KEYFORMAT=\"urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e\",\
+             KEYFORMATVERSIONS=\"1\"\n",
+            drm.default_kid
+        ));
+    }
+}
+
 /// Render an HLS M3U8 manifest from the current state.
 ///
 /// - During `Live` phase: produces a live playlist (no `#EXT-X-ENDLIST`)
@@ -17,9 +70,16 @@ fn hex_encode_base64(b64: &str) -> String {
 pub fn render(state: &ManifestState) -> Result<String> {
     let mut m3u8 = String::new();
 
+    // Determine if this is an LL-HLS playlist (version 9)
+    let is_ll_hls = state.part_target_duration.is_some() || !state.parts.is_empty();
+
     // Header
     m3u8.push_str("#EXTM3U\n");
-    m3u8.push_str("#EXT-X-VERSION:7\n");
+    if is_ll_hls {
+        m3u8.push_str("#EXT-X-VERSION:9\n");
+    } else {
+        m3u8.push_str("#EXT-X-VERSION:7\n");
+    }
 
     // Target duration (rounded up to nearest integer)
     let target_dur = state.target_duration.ceil() as u64;
@@ -30,6 +90,31 @@ pub fn render(state: &ManifestState) -> Result<String> {
         "#EXT-X-MEDIA-SEQUENCE:{}\n",
         state.media_sequence
     ));
+
+    // LL-HLS: Server Control
+    if let Some(ref sc) = state.server_control {
+        let mut attrs = Vec::new();
+        if sc.can_block_reload {
+            attrs.push("CAN-BLOCK-RELOAD=YES".to_string());
+        }
+        if let Some(phb) = sc.part_hold_back {
+            attrs.push(format!("PART-HOLD-BACK={phb:.5}"));
+        }
+        if let Some(hb) = sc.hold_back {
+            attrs.push(format!("HOLD-BACK={hb:.5}"));
+        }
+        if let Some(csu) = sc.can_skip_until {
+            attrs.push(format!("CAN-SKIP-UNTIL={csu:.5}"));
+        }
+        if !attrs.is_empty() {
+            m3u8.push_str(&format!("#EXT-X-SERVER-CONTROL:{}\n", attrs.join(",")));
+        }
+    }
+
+    // LL-HLS: Part Target Duration
+    if let Some(ptd) = state.part_target_duration {
+        m3u8.push_str(&format!("#EXT-X-PART-INF:PART-TARGET={ptd:.5}\n"));
+    }
 
     // Playlist type
     match state.phase {
@@ -49,44 +134,14 @@ pub fn render(state: &ManifestState) -> Result<String> {
     m3u8.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
 
     // DRM signaling — dynamic method based on encryption scheme
-    if let Some(ref drm) = state.drm_info {
-        let method = drm.encryption_scheme.hls_method_string();
+    // Clear lead: first N segments are unencrypted
+    let has_clear_lead = state.clear_lead_boundary.is_some() && state.drm_info.is_some();
+    let clear_lead_boundary = state.clear_lead_boundary.unwrap_or(0);
 
-        // FairPlay (CBCS only)
-        if let Some(ref key_uri) = drm.fairplay_key_uri {
-            m3u8.push_str(&format!(
-                "#EXT-X-KEY:METHOD={method},\
-                 URI=\"{key_uri}\",\
-                 KEYID=0x{},\
-                 KEYFORMAT=\"com.apple.streamingkeydelivery\",\
-                 KEYFORMATVERSIONS=\"1\"\n",
-                drm.default_kid
-            ));
-        }
-
-        // Widevine
-        if let Some(ref pssh) = drm.widevine_pssh {
-            m3u8.push_str(&format!(
-                "#EXT-X-KEY:METHOD={method},\
-                 URI=\"data:text/plain;base64,{pssh}\",\
-                 KEYID=0x{},\
-                 KEYFORMAT=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\",\
-                 KEYFORMATVERSIONS=\"1\"\n",
-                drm.default_kid
-            ));
-        }
-
-        // PlayReady
-        if let Some(ref pssh) = drm.playready_pssh {
-            m3u8.push_str(&format!(
-                "#EXT-X-KEY:METHOD={method},\
-                 URI=\"data:text/plain;base64,{pssh}\",\
-                 KEYID=0x{},\
-                 KEYFORMAT=\"urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95\",\
-                 KEYFORMATVERSIONS=\"1\"\n",
-                drm.default_kid
-            ));
-        }
+    if has_clear_lead {
+        m3u8.push_str("#EXT-X-KEY:METHOD=NONE\n");
+    } else if let Some(ref drm) = state.drm_info {
+        emit_hls_drm_keys(&mut m3u8, drm);
     }
 
     // Init segment (EXT-X-MAP)
@@ -94,8 +149,27 @@ pub fn render(state: &ManifestState) -> Result<String> {
         m3u8.push_str(&format!("#EXT-X-MAP:URI=\"{}\"\n", init.uri));
     }
 
+    // Key rotation state tracking
+    let mut last_key_period: Option<u32> = None;
+
     // Segments
     for segment in &state.segments {
+        // Clear lead transition
+        if has_clear_lead && segment.number == clear_lead_boundary {
+            if let Some(ref drm) = state.drm_info {
+                emit_hls_drm_keys(&mut m3u8, drm);
+            }
+        }
+
+        // Key rotation: emit new KEY tag when period changes
+        if let Some(period) = segment.key_period {
+            if last_key_period != Some(period) && !state.rotation_drm_info.is_empty() {
+                let drm_idx = period as usize % state.rotation_drm_info.len();
+                emit_hls_drm_keys(&mut m3u8, &state.rotation_drm_info[drm_idx]);
+                last_key_period = Some(period);
+            }
+        }
+
         // SCTE-35 ad break markers for this segment
         for ab in &state.ad_breaks {
             if ab.segment_number == segment.number {
@@ -125,6 +199,22 @@ pub fn render(state: &ManifestState) -> Result<String> {
         }
         m3u8.push_str(&format!("#EXTINF:{:.6},\n", segment.duration));
         m3u8.push_str(&format!("{}\n", segment.uri));
+
+        // LL-HLS: emit EXT-X-PART tags for parts belonging to this segment
+        if is_ll_hls {
+            for part in &state.parts {
+                if part.segment_number == segment.number {
+                    let mut part_attrs = format!(
+                        "DURATION={:.5},URI=\"{}\"",
+                        part.duration, part.uri
+                    );
+                    if part.independent {
+                        part_attrs.push_str(",INDEPENDENT=YES");
+                    }
+                    m3u8.push_str(&format!("#EXT-X-PART:{part_attrs}\n"));
+                }
+            }
+        }
     }
 
     // End list for completed manifests
@@ -160,6 +250,7 @@ mod tests {
                 duration: 6.006,
                 uri: format!("/base/segment_{i}.cmfv"),
                 byte_size: 1024,
+                key_period: None,
             });
         }
         s
@@ -223,6 +314,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: None,
         });
         let m3u8 = render(&state).unwrap();
         assert!(m3u8.contains("METHOD=SAMPLE-AES-CTR"));
@@ -240,6 +332,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: None,
         });
         let m3u8 = render(&state).unwrap();
         assert!(m3u8.contains("METHOD=SAMPLE-AES"));
@@ -256,6 +349,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "abcdef01234567890123456789abcdef".into(),
+            clearkey_pssh: None,
         });
         let m3u8 = render(&state).unwrap();
         assert!(m3u8.contains("KEYFORMAT=\"urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95\""));
@@ -271,6 +365,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "00000000000000000000000000000001".into(),
+            clearkey_pssh: None,
         });
         let m3u8 = render(&state).unwrap();
         let key_count = m3u8.matches("#EXT-X-KEY:").count();
@@ -287,6 +382,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: Some("skd://key-server/key-id".into()),
             default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: None,
         });
         let m3u8 = render(&state).unwrap();
         assert!(m3u8.contains("METHOD=SAMPLE-AES"));
@@ -379,6 +475,7 @@ mod tests {
             duration: 6.0,
             uri: "seg.cmfv".into(),
             byte_size: 100,
+            key_period: None,
         });
         let m3u8 = render(&state).unwrap();
         assert!(!m3u8.contains("#EXT-X-MAP"));
@@ -435,6 +532,7 @@ mod tests {
             playready_pro: None,
             fairplay_key_uri: None,
             default_kid: "00000000000000000000000000000001".into(),
+            clearkey_pssh: None,
         });
         state.variants.push(VariantInfo {
             id: "v1".into(),
@@ -679,6 +777,187 @@ mod tests {
         let m3u8 = render_master(&state, &uris).unwrap();
         assert!(m3u8.contains("LANGUAGE=\"eng\""));
         assert!(m3u8.contains("AUDIO=\"audio\""));
+    }
+
+    #[test]
+    fn render_with_clearkey() {
+        let mut state = make_live_state_with_segments(1);
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: None,
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: Some("CKDATA".into()),
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("KEYFORMAT=\"urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e\""));
+        assert!(m3u8.contains("CKDATA"));
+    }
+
+    #[test]
+    fn render_with_clear_lead() {
+        let mut state = make_live_state_with_segments(4);
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: Some("WV".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "00000000000000000000000000000001".into(),
+            clearkey_pssh: None,
+        });
+        state.clear_lead_boundary = Some(2);
+        let m3u8 = render(&state).unwrap();
+        // Should have METHOD=NONE at start
+        assert!(m3u8.contains("METHOD=NONE"));
+        // Should have DRM key at boundary
+        let none_pos = m3u8.find("METHOD=NONE").unwrap();
+        let drm_pos = m3u8.rfind("SAMPLE-AES-CTR").unwrap();
+        assert!(drm_pos > none_pos);
+    }
+
+    // --- LL-HLS rendering tests ---
+
+    #[test]
+    fn render_ll_hls_version_9() {
+        let mut state = make_live_state_with_segments(1);
+        state.part_target_duration = Some(0.33334);
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("#EXT-X-VERSION:9"));
+        assert!(!m3u8.contains("#EXT-X-VERSION:7"));
+    }
+
+    #[test]
+    fn render_ll_hls_part_inf() {
+        let mut state = make_live_state_with_segments(1);
+        state.part_target_duration = Some(0.33334);
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("#EXT-X-PART-INF:PART-TARGET=0.33334"));
+    }
+
+    #[test]
+    fn render_ll_hls_server_control() {
+        let mut state = make_live_state_with_segments(1);
+        state.part_target_duration = Some(0.33334);
+        state.server_control = Some(crate::manifest::types::ServerControl {
+            can_skip_until: Some(12.0),
+            hold_back: None,
+            part_hold_back: Some(1.0),
+            can_block_reload: true,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("#EXT-X-SERVER-CONTROL:"));
+        assert!(m3u8.contains("CAN-BLOCK-RELOAD=YES"));
+        assert!(m3u8.contains("PART-HOLD-BACK="));
+        assert!(m3u8.contains("CAN-SKIP-UNTIL="));
+    }
+
+    #[test]
+    fn render_ll_hls_parts_after_segments() {
+        let mut state = make_live_state_with_segments(2);
+        state.part_target_duration = Some(0.33334);
+        state.parts.push(crate::manifest::types::PartInfo {
+            segment_number: 0,
+            part_index: 0,
+            duration: 0.33334,
+            independent: true,
+            uri: "/base/part_0.0.cmfv".into(),
+            byte_size: 5000,
+        });
+        state.parts.push(crate::manifest::types::PartInfo {
+            segment_number: 0,
+            part_index: 1,
+            duration: 0.33334,
+            independent: false,
+            uri: "/base/part_0.1.cmfv".into(),
+            byte_size: 4000,
+        });
+        state.parts.push(crate::manifest::types::PartInfo {
+            segment_number: 1,
+            part_index: 0,
+            duration: 0.33334,
+            independent: true,
+            uri: "/base/part_1.0.cmfv".into(),
+            byte_size: 5000,
+        });
+        let m3u8 = render(&state).unwrap();
+        // Parts should appear after their segment's URI
+        let seg0_pos = m3u8.find("/base/segment_0.cmfv").unwrap();
+        let part00_pos = m3u8.find("/base/part_0.0.cmfv").unwrap();
+        let part01_pos = m3u8.find("/base/part_0.1.cmfv").unwrap();
+        assert!(part00_pos > seg0_pos);
+        assert!(part01_pos > part00_pos);
+        // Independent flag
+        assert!(m3u8.contains("INDEPENDENT=YES"));
+        // Part count
+        assert_eq!(m3u8.matches("#EXT-X-PART:").count(), 3);
+    }
+
+    #[test]
+    fn render_ll_hls_independent_flag() {
+        let mut state = make_live_state_with_segments(1);
+        state.part_target_duration = Some(0.5);
+        state.parts.push(crate::manifest::types::PartInfo {
+            segment_number: 0,
+            part_index: 0,
+            duration: 0.5,
+            independent: true,
+            uri: "/base/part.cmfv".into(),
+            byte_size: 1000,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("INDEPENDENT=YES"));
+    }
+
+    #[test]
+    fn render_backward_compat_no_parts_version_7() {
+        let state = make_live_state_with_segments(2);
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("#EXT-X-VERSION:7"));
+        assert!(!m3u8.contains("#EXT-X-VERSION:9"));
+        assert!(!m3u8.contains("#EXT-X-PART-INF"));
+        assert!(!m3u8.contains("#EXT-X-SERVER-CONTROL"));
+        assert!(!m3u8.contains("#EXT-X-PART:"));
+    }
+
+    #[test]
+    fn render_with_key_rotation() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.init_segment = Some(InitSegmentInfo { uri: "/base/init.mp4".into(), byte_size: 256 });
+        // Add segments with different key periods
+        for i in 0..6u32 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("/base/segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: Some(i / 3), // period changes at segment 3
+            });
+        }
+        state.rotation_drm_info.push(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: Some("WV_P0".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "00000000000000000000000000000001".into(),
+            clearkey_pssh: None,
+        });
+        state.rotation_drm_info.push(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: Some("WV_P1".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "00000000000000000000000000000002".into(),
+            clearkey_pssh: None,
+        });
+        let m3u8 = render(&state).unwrap();
+        // Should have KEY tags for both periods
+        assert!(m3u8.contains("WV_P0"));
+        assert!(m3u8.contains("WV_P1"));
     }
 }
 

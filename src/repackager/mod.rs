@@ -6,6 +6,26 @@ use crate::manifest::types::OutputFormat;
 use crate::media::container::ContainerFormat;
 use serde::{Deserialize, Serialize};
 
+/// A raw content encryption key provided directly (bypasses SPEKE).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawKeyEntry {
+    /// Key ID (KID) — 16 bytes.
+    pub kid: [u8; 16],
+    /// Content encryption key (CEK) — 16 bytes (AES-128).
+    pub key: [u8; 16],
+    /// Optional explicit IV — 16 bytes. If None, IVs come from senc boxes.
+    #[serde(default)]
+    pub iv: Option<[u8; 16]>,
+}
+
+/// Key rotation configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRotationConfig {
+    /// Number of segments per key rotation period.
+    /// 0 means rotation is disabled.
+    pub period_segments: u32,
+}
+
 /// A request to repackage content between encryption schemes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepackageRequest {
@@ -24,6 +44,21 @@ pub struct RepackageRequest {
     pub container_format: ContainerFormat,
     /// Optional: specific key IDs to request. If empty, derived from source.
     pub key_ids: Vec<String>,
+    /// Raw encryption keys (bypass SPEKE). If non-empty, SPEKE is skipped.
+    #[serde(default)]
+    pub raw_keys: Vec<RawKeyEntry>,
+    /// Key rotation configuration. If None, no rotation.
+    #[serde(default)]
+    pub key_rotation: Option<KeyRotationConfig>,
+    /// Number of initial segments to leave unencrypted (clear lead).
+    /// If None or 0, all segments use the target encryption scheme.
+    #[serde(default)]
+    pub clear_lead_segments: Option<u32>,
+    /// Explicit DRM systems to include in output (overrides auto-detection).
+    /// Valid values: "widevine", "playready", "fairplay", "clearkey".
+    /// If empty, uses default systems based on target scheme.
+    #[serde(default)]
+    pub drm_systems: Vec<String>,
 }
 
 fn default_target_schemes() -> Vec<EncryptionScheme> {
@@ -85,12 +120,20 @@ mod tests {
             target_schemes: vec![EncryptionScheme::Cenc],
             container_format: ContainerFormat::default(),
             key_ids: vec!["aabbccdd".to_string()],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
         };
         assert_eq!(req.content_id, "movie-123");
         assert_eq!(req.output_format, OutputFormat::Hls);
         assert_eq!(req.target_schemes, vec![EncryptionScheme::Cenc]);
         assert_eq!(req.container_format, ContainerFormat::Cmaf);
         assert_eq!(req.key_ids.len(), 1);
+        assert!(req.raw_keys.is_empty());
+        assert!(req.key_rotation.is_none());
+        assert!(req.clear_lead_segments.is_none());
+        assert!(req.drm_systems.is_empty());
     }
 
     #[test]
@@ -102,6 +145,10 @@ mod tests {
             target_schemes: vec![EncryptionScheme::Cbcs],
             container_format: ContainerFormat::Fmp4,
             key_ids: vec![],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -110,6 +157,8 @@ mod tests {
         assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cbcs]);
         assert_eq!(parsed.container_format, ContainerFormat::Fmp4);
         assert!(parsed.key_ids.is_empty());
+        assert!(parsed.raw_keys.is_empty());
+        assert!(parsed.key_rotation.is_none());
     }
 
     #[test]
@@ -119,6 +168,10 @@ mod tests {
         let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cenc]);
         assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
+        assert!(parsed.raw_keys.is_empty());
+        assert!(parsed.key_rotation.is_none());
+        assert!(parsed.clear_lead_segments.is_none());
+        assert!(parsed.drm_systems.is_empty());
     }
 
     #[test]
@@ -130,6 +183,10 @@ mod tests {
             target_schemes: vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs],
             container_format: ContainerFormat::default(),
             key_ids: vec![],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -200,6 +257,10 @@ mod tests {
             target_schemes: vec![EncryptionScheme::Cenc],
             container_format: ContainerFormat::default(),
             key_ids: vec![],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -254,5 +315,95 @@ mod tests {
             segments_total: None,
         };
         assert!(status.segments_total.is_none());
+    }
+
+    #[test]
+    fn raw_key_entry_construction() {
+        let entry = RawKeyEntry {
+            kid: [0xAA; 16],
+            key: [0xBB; 16],
+            iv: Some([0xCC; 16]),
+        };
+        assert_eq!(entry.kid, [0xAA; 16]);
+        assert_eq!(entry.key, [0xBB; 16]);
+        assert_eq!(entry.iv, Some([0xCC; 16]));
+    }
+
+    #[test]
+    fn raw_key_entry_serde_roundtrip() {
+        let entry = RawKeyEntry {
+            kid: [0x01; 16],
+            key: [0x02; 16],
+            iv: Some([0x03; 16]),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: RawKeyEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kid, entry.kid);
+        assert_eq!(parsed.key, entry.key);
+        assert_eq!(parsed.iv, entry.iv);
+    }
+
+    #[test]
+    fn raw_key_entry_no_iv() {
+        let entry = RawKeyEntry {
+            kid: [0x01; 16],
+            key: [0x02; 16],
+            iv: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: RawKeyEntry = serde_json::from_str(&json).unwrap();
+        assert!(parsed.iv.is_none());
+    }
+
+    #[test]
+    fn key_rotation_config_serde_roundtrip() {
+        let cfg = KeyRotationConfig { period_segments: 10 };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: KeyRotationConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.period_segments, 10);
+    }
+
+    #[test]
+    fn key_rotation_config_zero_means_disabled() {
+        let cfg = KeyRotationConfig { period_segments: 0 };
+        assert_eq!(cfg.period_segments, 0);
+    }
+
+    #[test]
+    fn repackage_request_with_raw_keys_serde() {
+        let req = RepackageRequest {
+            content_id: "raw-test".into(),
+            source_url: "https://example.com/source.m3u8".into(),
+            output_format: OutputFormat::Hls,
+            target_schemes: vec![EncryptionScheme::Cenc],
+            container_format: ContainerFormat::default(),
+            key_ids: vec![],
+            raw_keys: vec![RawKeyEntry {
+                kid: [0xAA; 16],
+                key: [0xBB; 16],
+                iv: None,
+            }],
+            key_rotation: Some(KeyRotationConfig { period_segments: 5 }),
+            clear_lead_segments: Some(2),
+            drm_systems: vec!["widevine".into(), "clearkey".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.raw_keys.len(), 1);
+        assert_eq!(parsed.raw_keys[0].kid, [0xAA; 16]);
+        assert_eq!(parsed.key_rotation.unwrap().period_segments, 5);
+        assert_eq!(parsed.clear_lead_segments, Some(2));
+        assert_eq!(parsed.drm_systems, vec!["widevine", "clearkey"]);
+    }
+
+    #[test]
+    fn repackage_request_new_fields_default_from_json() {
+        // Old JSON without new fields should still parse (backward compat)
+        let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
+        let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
+        assert!(parsed.raw_keys.is_empty());
+        assert!(parsed.key_rotation.is_none());
+        assert!(parsed.clear_lead_segments.is_none());
+        assert!(parsed.drm_systems.is_empty());
     }
 }

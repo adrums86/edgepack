@@ -31,6 +31,33 @@ pub struct WebhookPayload {
     /// Optional key IDs to request (hex strings).
     #[serde(default)]
     pub key_ids: Vec<String>,
+    /// Raw encryption keys (bypass SPEKE). Hex-encoded KID/key/IV.
+    #[serde(default)]
+    pub raw_keys: Vec<RawKeyInput>,
+    /// Key rotation configuration.
+    #[serde(default)]
+    pub key_rotation: Option<KeyRotationInput>,
+    /// Number of initial clear (unencrypted) segments.
+    #[serde(default)]
+    pub clear_lead_segments: Option<u32>,
+    /// Explicit DRM systems to include (e.g. ["widevine", "clearkey"]).
+    #[serde(default)]
+    pub drm_systems: Vec<String>,
+}
+
+/// Raw key input from webhook (hex-encoded strings).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RawKeyInput {
+    pub kid: String,
+    pub key: String,
+    #[serde(default)]
+    pub iv: Option<String>,
+}
+
+/// Key rotation input from webhook.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeyRotationInput {
+    pub period_segments: u32,
 }
 
 impl WebhookPayload {
@@ -69,6 +96,34 @@ pub struct WebhookResponse {
 pub struct ContinuePayload {
     pub content_id: String,
     pub format: String,
+}
+
+fn hex_decode_16(hex: &str, field_name: &str) -> Result<[u8; 16]> {
+    let hex = hex.trim();
+    if hex.len() != 32 {
+        return Err(EdgepackError::InvalidInput(format!(
+            "{field_name} must be 32 hex characters (16 bytes), got {} chars", hex.len()
+        )));
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| {
+            EdgepackError::InvalidInput(format!("invalid hex in {field_name} at position {}", i * 2))
+        })?;
+    }
+    Ok(bytes)
+}
+
+fn parse_raw_keys(inputs: &[RawKeyInput]) -> Result<Vec<crate::repackager::RawKeyEntry>> {
+    inputs.iter().map(|rk| {
+        let kid = hex_decode_16(&rk.kid, "kid")?;
+        let key = hex_decode_16(&rk.key, "key")?;
+        let iv = match &rk.iv {
+            Some(iv_hex) => Some(hex_decode_16(iv_hex, "iv")?),
+            None => None,
+        };
+        Ok(crate::repackager::RawKeyEntry { kid, key, iv })
+    }).collect()
 }
 
 /// Handle a POST /webhook/repackage request.
@@ -140,6 +195,25 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         ))
     })?;
 
+    // Validate DRM systems
+    let valid_drm_systems = ["widevine", "playready", "fairplay", "clearkey"];
+    for sys in &payload.drm_systems {
+        if !valid_drm_systems.contains(&sys.as_str()) {
+            return Err(EdgepackError::InvalidInput(format!(
+                "invalid drm_system: {sys} (expected one of: {})",
+                valid_drm_systems.join(", ")
+            )));
+        }
+    }
+
+    // Parse raw keys
+    let raw_keys = parse_raw_keys(&payload.raw_keys)?;
+
+    // Parse key rotation
+    let key_rotation = payload.key_rotation.as_ref().map(|kr| {
+        crate::repackager::KeyRotationConfig { period_segments: kr.period_segments }
+    });
+
     let request = RepackageRequest {
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
@@ -147,6 +221,10 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         target_schemes: target_schemes.clone(),
         container_format,
         key_ids: payload.key_ids,
+        raw_keys,
+        key_rotation,
+        clear_lead_segments: payload.clear_lead_segments,
+        drm_systems: payload.drm_systems,
     };
 
     // Hybrid mode (JIT feature): if JIT has already set up this content,
@@ -566,6 +644,10 @@ mod tests {
             target_scheme: None,
             container_format: "cmaf".into(),
             key_ids: vec!["aabb".into()],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
@@ -891,5 +973,81 @@ mod tests {
         let result = handle_continue(&req, &ctx);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid format"));
+    }
+
+    #[test]
+    fn webhook_with_raw_keys() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","raw_keys":[{"kid":"00112233445566778899aabbccddeeff","key":"aabbccddeeff00112233445566778899"}]}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.raw_keys.len(), 1);
+        assert_eq!(parsed.raw_keys[0].kid, "00112233445566778899aabbccddeeff");
+    }
+
+    #[test]
+    fn webhook_with_key_rotation() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","key_rotation":{"period_segments":10}}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert!(parsed.key_rotation.is_some());
+        assert_eq!(parsed.key_rotation.unwrap().period_segments, 10);
+    }
+
+    #[test]
+    fn webhook_with_clear_lead() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","clear_lead_segments":3}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.clear_lead_segments, Some(3));
+    }
+
+    #[test]
+    fn webhook_with_drm_systems() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","drm_systems":["widevine","clearkey"]}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.drm_systems, vec!["widevine", "clearkey"]);
+    }
+
+    #[test]
+    fn webhook_invalid_drm_system() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "drm_systems": ["widevine", "unknown_drm"]
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid drm_system"));
+    }
+
+    #[test]
+    fn webhook_payload_backward_compat_no_new_fields() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert!(parsed.raw_keys.is_empty());
+        assert!(parsed.key_rotation.is_none());
+        assert!(parsed.clear_lead_segments.is_none());
+        assert!(parsed.drm_systems.is_empty());
+    }
+
+    #[test]
+    fn raw_key_input_serde_roundtrip() {
+        let rk = RawKeyInput {
+            kid: "00112233445566778899aabbccddeeff".into(),
+            key: "aabbccddeeff00112233445566778899".into(),
+            iv: Some("11111111111111111111111111111111".into()),
+        };
+        let json = serde_json::to_string(&rk).unwrap();
+        let parsed: RawKeyInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kid, rk.kid);
+        assert_eq!(parsed.iv.unwrap(), "11111111111111111111111111111111");
+    }
+
+    #[test]
+    fn key_rotation_input_serde_roundtrip() {
+        let kr = KeyRotationInput { period_segments: 5 };
+        let json = serde_json::to_string(&kr).unwrap();
+        let parsed: KeyRotationInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.period_segments, 5);
     }
 }
