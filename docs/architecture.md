@@ -532,7 +532,7 @@ flowchart TD
 
 ## Planned Architecture Extensions
 
-All P0 and P1 items are complete. Remaining phases are P2.
+All P0 and P1 items are complete. Remaining phases are P2. See [`roadmap.md`](roadmap.md) for details.
 
 ---
 
