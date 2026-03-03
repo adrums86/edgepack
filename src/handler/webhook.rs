@@ -43,6 +43,9 @@ pub struct WebhookPayload {
     /// Explicit DRM systems to include (e.g. ["widevine", "clearkey"]).
     #[serde(default)]
     pub drm_systems: Vec<String>,
+    /// Enable I-frame / trick play playlist generation.
+    #[serde(default)]
+    pub enable_iframe_playlist: Option<bool>,
 }
 
 /// Raw key input from webhook (hex-encoded strings).
@@ -225,6 +228,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         key_rotation,
         clear_lead_segments: payload.clear_lead_segments,
         drm_systems: payload.drm_systems,
+        enable_iframe_playlist: payload.enable_iframe_playlist.unwrap_or(false),
     };
 
     // Hybrid mode (JIT feature): if JIT has already set up this content,
@@ -648,6 +652,7 @@ mod tests {
             key_rotation: None,
             clear_lead_segments: None,
             drm_systems: vec![],
+            enable_iframe_playlist: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
@@ -655,6 +660,7 @@ mod tests {
         assert_eq!(parsed.resolved_target_schemes(), vec!["cenc"]);
         assert_eq!(parsed.container_format, "cmaf");
         assert_eq!(parsed.key_ids.len(), 1);
+        assert!(parsed.enable_iframe_playlist.is_none());
     }
 
     #[test]
@@ -816,6 +822,21 @@ mod tests {
         let result = handle_repackage_webhook(&req, &ctx);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("duplicate target_scheme"));
+    }
+
+    #[test]
+    fn webhook_payload_enable_iframe_playlist() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","enable_iframe_playlist":true}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.enable_iframe_playlist, Some(true));
+    }
+
+    #[test]
+    fn webhook_payload_enable_iframe_playlist_default() {
+        // Old JSON without enable_iframe_playlist should parse with None default
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert!(parsed.enable_iframe_playlist.is_none());
     }
 
     // --- Source Config tests (JIT feature) ---

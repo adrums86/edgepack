@@ -135,6 +135,68 @@ pub fn handle_media_segment_request(
     }
 }
 
+/// Handle a request for an I-frame / trick play manifest.
+///
+/// - **HLS**: Renders an `#EXT-X-I-FRAMES-ONLY` playlist from ManifestState.
+/// - **DASH**: Returns 404 (trick play is embedded in the regular MPD).
+pub fn handle_iframe_manifest_request(
+    content_id: &str,
+    format: OutputFormat,
+    scheme: Option<&str>,
+    ctx: &HandlerContext,
+) -> Result<HttpResponse> {
+    // DASH embeds trick play in the regular MPD — no separate endpoint
+    if format == OutputFormat::Dash {
+        return Ok(HttpResponse::not_found(
+            "DASH trick play is embedded in the regular MPD, not a separate endpoint",
+        ));
+    }
+
+    let fmt = format_str(format);
+    let key = if let Some(s) = scheme {
+        CacheKeys::manifest_state_for_scheme(content_id, fmt, s)
+    } else {
+        CacheKeys::manifest_state(content_id, fmt)
+    };
+
+    let state_bytes = match ctx.cache.get(&key)? {
+        Some(data) => data,
+        None => {
+            return Ok(HttpResponse::not_found(&format!(
+                "manifest not found for {content_id}/{fmt}"
+            )));
+        }
+    };
+
+    let state: ManifestState = serde_json::from_slice(&state_bytes).map_err(|e| {
+        crate::error::EdgepackError::Cache(format!("deserialize manifest state: {e}"))
+    })?;
+
+    match manifest::render_iframe_manifest(&state)? {
+        Some(playlist) => {
+            let cache_control = match state.phase {
+                ManifestPhase::Complete => format!(
+                    "public, max-age={}, immutable",
+                    ctx.config.cache.vod_max_age
+                ),
+                ManifestPhase::Live => format!(
+                    "public, max-age={m}, s-maxage={m}",
+                    m = ctx.config.cache.live_manifest_max_age
+                ),
+                ManifestPhase::AwaitingFirstSegment => "no-cache".to_string(),
+            };
+            Ok(HttpResponse::ok_with_cache(
+                playlist.into_bytes(),
+                format.content_type(),
+                &cache_control,
+            ))
+        }
+        None => Ok(HttpResponse::not_found(&format!(
+            "I-frame playlist not available for {content_id}/{fmt}"
+        ))),
+    }
+}
+
 /// Handle a request for job status.
 pub fn handle_status_request(
     content_id: &str,
@@ -547,5 +609,28 @@ mod tests {
         let resp = handle_status_request("content-99", OutputFormat::Dash, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("content-99"));
+    }
+
+    #[test]
+    fn handle_iframe_manifest_hls_not_found() {
+        let ctx = test_context();
+        let resp = handle_iframe_manifest_request("content-1", OutputFormat::Hls, None, &ctx).unwrap();
+        assert_eq!(resp.status, 404);
+        assert!(String::from_utf8_lossy(&resp.body).contains("manifest not found"));
+    }
+
+    #[test]
+    fn handle_iframe_manifest_dash_returns_404() {
+        let ctx = test_context();
+        let resp = handle_iframe_manifest_request("content-1", OutputFormat::Dash, None, &ctx).unwrap();
+        assert_eq!(resp.status, 404);
+        assert!(String::from_utf8_lossy(&resp.body).contains("embedded in the regular MPD"));
+    }
+
+    #[test]
+    fn handle_iframe_manifest_with_scheme_not_found() {
+        let ctx = test_context();
+        let resp = handle_iframe_manifest_request("content-1", OutputFormat::Hls, Some("cenc"), &ctx).unwrap();
+        assert_eq!(resp.status, 404);
     }
 }

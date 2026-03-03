@@ -15,6 +15,17 @@ pub fn render_manifest(state: &ManifestState) -> Result<String> {
     }
 }
 
+/// Render an I-frame / trick play manifest.
+///
+/// - **HLS**: Returns the I-frame-only playlist (`#EXT-X-I-FRAMES-ONLY`).
+/// - **DASH**: Returns `Ok(None)` — trick play is embedded in the regular MPD.
+pub fn render_iframe_manifest(state: &ManifestState) -> Result<Option<String>> {
+    match state.format {
+        OutputFormat::Hls => hls::render_iframe_playlist(state),
+        OutputFormat::Dash => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

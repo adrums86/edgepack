@@ -95,10 +95,17 @@ pub fn render(state: &ManifestState) -> Result<String> {
         .collect();
 
     // Video AdaptationSet
+    let has_trick_play = state.enable_iframe_playlist && !state.iframe_segments.is_empty();
     if !video_variants.is_empty() || state.variants.is_empty() {
-        mpd.push_str(
-            "    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n",
-        );
+        if has_trick_play {
+            mpd.push_str(
+                "    <AdaptationSet id=\"1\" contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n",
+            );
+        } else {
+            mpd.push_str(
+                "    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n",
+            );
+        }
         mpd.push_str(&cp_xml);
 
         // CEA-608/708 closed caption Accessibility descriptors (inside video AdaptationSet)
@@ -142,6 +149,34 @@ pub fn render(state: &ManifestState) -> Result<String> {
         }
 
         mpd.push_str("    </AdaptationSet>\n");
+
+        // Trick play AdaptationSet (references main video via EssentialProperty)
+        if state.enable_iframe_playlist && !state.iframe_segments.is_empty() {
+            mpd.push_str("    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n");
+            mpd.push_str("      <EssentialProperty schemeIdUri=\"http://dashif.org/guidelines/trickmode\" value=\"1\"/>\n");
+            mpd.push_str(&build_segment_template(state));
+            if video_variants.is_empty() {
+                mpd.push_str("      <Representation id=\"video_trick\" bandwidth=\"200000\">\n");
+                mpd.push_str("      </Representation>\n");
+            } else {
+                for variant in &video_variants {
+                    mpd.push_str(&format!(
+                        "      <Representation id=\"{}_trick\" bandwidth=\"{}\"",
+                        variant.id,
+                        variant.bandwidth / 10
+                    ));
+                    if !variant.codecs.is_empty() {
+                        mpd.push_str(&format!(" codecs=\"{}\"", variant.codecs));
+                    }
+                    if let Some((w, h)) = variant.resolution {
+                        mpd.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
+                    }
+                    mpd.push_str(">\n");
+                    mpd.push_str("      </Representation>\n");
+                }
+            }
+            mpd.push_str("    </AdaptationSet>\n");
+        }
     }
 
     // Audio AdaptationSet

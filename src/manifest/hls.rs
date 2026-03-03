@@ -961,6 +961,80 @@ mod tests {
     }
 }
 
+/// Render an HLS I-frame-only playlist from the manifest state.
+///
+/// Returns `Ok(Some(playlist))` if I-frame data is available and enabled,
+/// `Ok(None)` if I-frame playlists are disabled or empty.
+///
+/// Uses `#EXT-X-I-FRAMES-ONLY` with `#EXT-X-BYTERANGE` pointing into regular segments.
+pub fn render_iframe_playlist(state: &ManifestState) -> Result<Option<String>> {
+    if !state.enable_iframe_playlist || state.iframe_segments.is_empty() {
+        return Ok(None);
+    }
+
+    let mut m3u8 = String::new();
+
+    // Header — version 4 required for EXT-X-BYTERANGE
+    m3u8.push_str("#EXTM3U\n");
+    m3u8.push_str("#EXT-X-VERSION:4\n");
+
+    // Target duration (from I-frame durations)
+    let max_dur = state
+        .iframe_segments
+        .iter()
+        .map(|f| f.duration)
+        .fold(0.0f64, f64::max);
+    let target_dur = max_dur.ceil() as u64;
+    m3u8.push_str(&format!("#EXT-X-TARGETDURATION:{target_dur}\n"));
+
+    m3u8.push_str(&format!(
+        "#EXT-X-MEDIA-SEQUENCE:{}\n",
+        state.media_sequence
+    ));
+
+    m3u8.push_str("#EXT-X-I-FRAMES-ONLY\n");
+
+    // Playlist type
+    match state.phase {
+        ManifestPhase::Complete => {
+            m3u8.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+        }
+        ManifestPhase::Live => {
+            m3u8.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+        }
+        ManifestPhase::AwaitingFirstSegment => {
+            return Ok(None);
+        }
+    }
+
+    // DRM KEY tags (same encryption as regular playlist)
+    if let Some(ref drm) = state.drm_info {
+        emit_hls_drm_keys(&mut m3u8, drm);
+    }
+
+    // Init segment map (same init as regular playlist)
+    if let Some(ref init) = state.init_segment {
+        m3u8.push_str(&format!("#EXT-X-MAP:URI=\"{}\"\n", init.uri));
+    }
+
+    // I-frame entries
+    for iframe in &state.iframe_segments {
+        m3u8.push_str(&format!("#EXTINF:{:.6},\n", iframe.duration));
+        m3u8.push_str(&format!(
+            "#EXT-X-BYTERANGE:{}@{}\n",
+            iframe.byte_length, iframe.byte_offset
+        ));
+        m3u8.push_str(&format!("{}\n", iframe.segment_uri));
+    }
+
+    // End list
+    if state.phase == ManifestPhase::Complete {
+        m3u8.push_str("#EXT-X-ENDLIST\n");
+    }
+
+    Ok(Some(m3u8))
+}
+
 /// Render an HLS master playlist referencing variant streams.
 pub fn render_master(state: &ManifestState, variant_playlist_uris: &[String]) -> Result<String> {
     use crate::manifest::types::TrackMediaType;
@@ -1088,6 +1162,22 @@ pub fn render_master(state: &ManifestState, variant_playlist_uris: &[String]) ->
         }
         m3u8.push_str(&format!("#EXT-X-STREAM-INF:{attrs}\n"));
         m3u8.push_str(&format!("{uri}\n"));
+    }
+
+    // I-Frame stream info for each video variant (when enabled and data available)
+    if state.enable_iframe_playlist && !state.iframe_segments.is_empty() {
+        for variant in state.variants.iter() {
+            if variant.track_type != TrackMediaType::Video {
+                continue;
+            }
+            let mut attrs = format!("BANDWIDTH={}", variant.bandwidth / 10);
+            attrs.push_str(&format!(",CODECS=\"{}\"", variant.codecs));
+            if let Some((w, h)) = variant.resolution {
+                attrs.push_str(&format!(",RESOLUTION={w}x{h}"));
+            }
+            attrs.push_str(",URI=\"iframes\"");
+            m3u8.push_str(&format!("#EXT-X-I-FRAME-STREAM-INF:{attrs}\n"));
+        }
     }
 
     Ok(m3u8)

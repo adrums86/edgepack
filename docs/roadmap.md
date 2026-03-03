@@ -13,12 +13,13 @@
 | 9 | LL-HLS & LL-DASH | ✅ |
 | 10 | MPEG-TS Input (feature-gated) | ✅ |
 | 11 | Advanced DRM | ✅ |
+| 12 | Trick Play & I-Frame Playlists | ✅ |
 | 16 | Compatibility Validation & Hardening | ✅ |
 | 17 | CDN Provider Adapters & Binary Optimization | ✅ |
 
 # Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–11, 16, and 17 are complete. All P0 and P1 items are done. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–12, 16, and 17 are complete. All P0 and P1 items are done. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -123,8 +124,17 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - New: `tests/advanced_drm.rs` (15 integration tests)
 - Result: 1,003 tests total with `--features jit,cloudflare` (55 new tests from baseline 948)
 
-### Phase 12: Trick Play & I-Frame Playlists — P2
-- HLS `#EXT-X-I-FRAMES-ONLY`, DASH trick play Representation
+### ~~Phase 12: Trick Play & I-Frame Playlists~~ ✅ Complete
+- HLS `#EXT-X-I-FRAMES-ONLY` media playlists with `#EXT-X-BYTERANGE` (byte ranges into existing rewritten segments — no duplicate storage)
+- HLS master playlist `#EXT-X-I-FRAME-STREAM-INF` for each video variant
+- DASH trick play `<AdaptationSet>` with `<EssentialProperty schemeIdUri="http://dashif.org/guidelines/trickmode">`
+- I-frame detection reuses existing `chunk.rs` infrastructure (first IDR chunk per segment)
+- `IFrameSegmentInfo` type, `enable_iframe_playlist` opt-in field (default false)
+- Dedicated route: `GET /repackage/{id}/{fmt}/iframes` for HLS I-frame playlist
+- DASH trick play embedded in regular MPD (no separate endpoint)
+- Sandbox writes `iframes.m3u8` alongside regular HLS output
+- New: `tests/trick_play.rs` (27 integration tests)
+- Result: 1,111 tests total with `--features jit,cloudflare` (39 new tests)
 
 ### Phase 13: DVR Window & Time-Shift — P2
 - Sliding window manifests, DVR start-over, live-to-VOD
@@ -199,6 +209,6 @@ cargo build --release --features jit,cloudflare # All features (excl. TS)
 cargo build --release --features jit,cloudflare,ts # All features (incl. TS input)
 ```
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (12–15, 18–19) are P2.
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (13–15, 18–19) are P2.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

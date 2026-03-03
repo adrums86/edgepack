@@ -5,8 +5,8 @@ use crate::drm::speke::SpekeClient;
 use crate::drm::{ContentKey, DrmKeySet};
 use crate::error::{EdgepackError, Result};
 use crate::manifest::types::{
-    ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo, SourceManifest,
-    TrackMediaType, VariantInfo,
+    IFrameSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, SegmentInfo,
+    SourceManifest, TrackMediaType, VariantInfo,
 };
 use crate::media::codec::{extract_tracks, TrackInfo, TrackKeyMapping};
 use crate::media::compat;
@@ -204,6 +204,11 @@ impl RepackagePipeline {
                 progressive.set_ll_dash_info(ll.clone());
             }
 
+            // Thread I-frame playlist flag
+            if request.enable_iframe_playlist {
+                progressive.set_enable_iframe_playlist(true);
+            }
+
             outputs.push((target_scheme, progressive));
         }
 
@@ -277,27 +282,42 @@ impl RepackagePipeline {
 
                 let new_segment = segment::rewrite_segment(&seg_data, &params)?;
 
-                // LL-HLS: detect chunks and add parts if source has parts
-                if !source.parts.is_empty() {
-                    let boundaries = crate::media::chunk::detect_chunk_boundaries(&new_segment);
-                    if boundaries.len() > 1 {
-                        // Multi-chunk segment: extract each chunk as a part
-                        let part_duration = if boundaries.len() > 0 {
-                            duration / boundaries.len() as f64
-                        } else {
-                            duration
-                        };
-                        for (pi, boundary) in boundaries.iter().enumerate() {
-                            if let Some(chunk_data) = crate::media::chunk::extract_chunk(&new_segment, boundary) {
-                                progressive.add_part(
-                                    i as u32,
-                                    pi as u32,
-                                    chunk_data,
-                                    part_duration,
-                                    boundary.independent,
-                                );
-                            }
+                // Detect chunk boundaries (needed for LL-HLS parts and/or I-frame playlists)
+                let need_chunks = !source.parts.is_empty() || request.enable_iframe_playlist;
+                let boundaries = if need_chunks {
+                    crate::media::chunk::detect_chunk_boundaries(&new_segment)
+                } else {
+                    Vec::new()
+                };
+
+                // LL-HLS: extract parts from multi-chunk segments
+                if !source.parts.is_empty() && boundaries.len() > 1 {
+                    let part_duration = duration / boundaries.len() as f64;
+                    for (pi, boundary) in boundaries.iter().enumerate() {
+                        if let Some(chunk_data) = crate::media::chunk::extract_chunk(&new_segment, boundary) {
+                            progressive.add_part(
+                                i as u32,
+                                pi as u32,
+                                chunk_data,
+                                part_duration,
+                                boundary.independent,
+                            );
                         }
+                    }
+                }
+
+                // I-frame playlist: record byte range of first IDR chunk
+                if request.enable_iframe_playlist {
+                    if let Some(idr) = boundaries.iter().find(|b| b.independent) {
+                        let ext = request.container_format.video_segment_extension();
+                        let seg_uri = format!("{}segment_{}{ext}", progressive.manifest_state().base_url, i);
+                        progressive.add_iframe_info(IFrameSegmentInfo {
+                            segment_number: i as u32,
+                            byte_offset: idr.offset as u64,
+                            byte_length: idr.size as u64,
+                            duration,
+                            segment_uri: seg_uri,
+                        });
                     }
                 }
 
@@ -573,6 +593,11 @@ impl RepackagePipeline {
             progressive.set_variants(build_variants_from_tracks(&tracks));
             progressive.set_init_segment(new_init);
 
+            // Thread I-frame playlist flag
+            if request.enable_iframe_playlist {
+                progressive.set_enable_iframe_playlist(true);
+            }
+
             // Process first segment for this scheme
             let params = SegmentRewriteParams {
                 source_key: source_key.clone(),
@@ -587,6 +612,22 @@ impl RepackagePipeline {
                 segment_number: 0,
             };
             let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+
+            // I-frame playlist: record byte range of first IDR chunk
+            if request.enable_iframe_playlist {
+                let boundaries = crate::media::chunk::detect_chunk_boundaries(&new_segment);
+                if let Some(idr) = boundaries.iter().find(|b| b.independent) {
+                    let ext = container_format.video_segment_extension();
+                    let seg_uri = format!("/repackage/{content_id}/{fmt}_{scheme_str}/segment_0{ext}");
+                    progressive.add_iframe_info(IFrameSegmentInfo {
+                        segment_number: 0,
+                        byte_offset: idr.offset as u64,
+                        byte_length: idr.size as u64,
+                        duration: first_duration,
+                        segment_uri: seg_uri,
+                    });
+                }
+            }
 
             // Store segment
             self.cache.set(
@@ -777,6 +818,22 @@ impl RepackagePipeline {
                 })?;
             let mut manifest_state: ManifestState = serde_json::from_slice(&state_data)
                 .map_err(|e| EdgepackError::Cache(format!("deserialize manifest state: {e}")))?;
+
+            // I-frame playlist: record byte range of first IDR chunk
+            if manifest_state.enable_iframe_playlist {
+                let boundaries = crate::media::chunk::detect_chunk_boundaries(&new_segment);
+                if let Some(idr) = boundaries.iter().find(|b| b.independent) {
+                    let ext = continuation.container_format.video_segment_extension();
+                    let seg_uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
+                    manifest_state.iframe_segments.push(IFrameSegmentInfo {
+                        segment_number: i as u32,
+                        byte_offset: idr.offset as u64,
+                        byte_length: idr.size as u64,
+                        duration,
+                        segment_uri: seg_uri,
+                    });
+                }
+            }
 
             let ext = continuation.container_format.video_segment_extension();
             let uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
@@ -1141,6 +1198,8 @@ impl RepackagePipeline {
             part_target_duration: None,
             server_control: None,
             ll_dash_info: None,
+            iframe_segments: Vec::new(),
+            enable_iframe_playlist: false,
         };
 
         let state_json = serde_json::to_vec(&manifest_state)

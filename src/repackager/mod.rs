@@ -59,6 +59,10 @@ pub struct RepackageRequest {
     /// If empty, uses default systems based on target scheme.
     #[serde(default)]
     pub drm_systems: Vec<String>,
+    /// Whether to generate I-frame / trick play playlists.
+    /// Default: false (opt-in to avoid overhead for clients that don't need trick play).
+    #[serde(default)]
+    pub enable_iframe_playlist: bool,
 }
 
 fn default_target_schemes() -> Vec<EncryptionScheme> {
@@ -124,6 +128,7 @@ mod tests {
             key_rotation: None,
             clear_lead_segments: None,
             drm_systems: vec![],
+            enable_iframe_playlist: false,
         };
         assert_eq!(req.content_id, "movie-123");
         assert_eq!(req.output_format, OutputFormat::Hls);
@@ -149,6 +154,7 @@ mod tests {
             key_rotation: None,
             clear_lead_segments: None,
             drm_systems: vec![],
+            enable_iframe_playlist: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -187,6 +193,7 @@ mod tests {
             key_rotation: None,
             clear_lead_segments: None,
             drm_systems: vec![],
+            enable_iframe_playlist: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -261,6 +268,7 @@ mod tests {
             key_rotation: None,
             clear_lead_segments: None,
             drm_systems: vec![],
+            enable_iframe_playlist: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -386,6 +394,7 @@ mod tests {
             key_rotation: Some(KeyRotationConfig { period_segments: 5 }),
             clear_lead_segments: Some(2),
             drm_systems: vec!["widevine".into(), "clearkey".into()],
+            enable_iframe_playlist: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -405,5 +414,6 @@ mod tests {
         assert!(parsed.key_rotation.is_none());
         assert!(parsed.clear_lead_segments.is_none());
         assert!(parsed.drm_systems.is_empty());
+        assert!(!parsed.enable_iframe_playlist);
     }
 }

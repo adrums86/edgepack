@@ -1,7 +1,7 @@
 use crate::manifest;
 use crate::manifest::types::{
-    AdBreakInfo, InitSegmentInfo, LowLatencyDashInfo, ManifestDrmInfo, ManifestPhase,
-    ManifestState, OutputFormat, PartInfo, SegmentInfo, ServerControl, VariantInfo,
+    AdBreakInfo, IFrameSegmentInfo, InitSegmentInfo, LowLatencyDashInfo, ManifestDrmInfo,
+    ManifestPhase, ManifestState, OutputFormat, PartInfo, SegmentInfo, ServerControl, VariantInfo,
 };
 use crate::media::container::ContainerFormat;
 
@@ -152,6 +152,16 @@ impl ProgressiveOutput {
     /// Set the LL-DASH low-latency parameters.
     pub fn set_ll_dash_info(&mut self, info: LowLatencyDashInfo) {
         self.state.ll_dash_info = Some(info);
+    }
+
+    /// Add I-frame segment info (for trick play / I-frame-only playlists).
+    pub fn add_iframe_info(&mut self, info: IFrameSegmentInfo) {
+        self.state.iframe_segments.push(info);
+    }
+
+    /// Enable or disable I-frame playlist generation.
+    pub fn set_enable_iframe_playlist(&mut self, enable: bool) {
+        self.state.enable_iframe_playlist = enable;
     }
 
     /// Get part data by segment number and part index.
@@ -588,6 +598,45 @@ mod tests {
         assert!(po.manifest_state().part_target_duration.is_none());
         po.set_part_target_duration(0.33334);
         assert_eq!(po.manifest_state().part_target_duration, Some(0.33334));
+    }
+
+    // --- I-frame / trick play tests ---
+
+    #[test]
+    fn add_iframe_info_updates_state() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            Some(make_drm_info()),
+            ContainerFormat::default(),
+        );
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 100], 6.0);
+        po.add_iframe_info(IFrameSegmentInfo {
+            segment_number: 0,
+            byte_offset: 0,
+            byte_length: 50,
+            duration: 6.0,
+            segment_uri: "/base/segment_0.cmfv".into(),
+        });
+        assert_eq!(po.manifest_state().iframe_segments.len(), 1);
+        assert_eq!(po.manifest_state().iframe_segments[0].segment_number, 0);
+        assert_eq!(po.manifest_state().iframe_segments[0].byte_length, 50);
+    }
+
+    #[test]
+    fn set_enable_iframe_playlist_updates_state() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            None,
+            ContainerFormat::default(),
+        );
+        assert!(!po.manifest_state().enable_iframe_playlist);
+        po.set_enable_iframe_playlist(true);
+        assert!(po.manifest_state().enable_iframe_playlist);
     }
 
     #[test]
