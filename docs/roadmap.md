@@ -172,10 +172,12 @@ The current binary (~648 KB base, ~685 KB full) is well within cold start budget
 - Combine multiple source manifests (HLS/DASH) into a single unified output manifest
 - Feature-gated behind `#[cfg(feature = "merge")]` to keep it modular and avoid binary impact on builds that don't need it
 - Accept an array of source manifest URLs in the webhook payload (`source_urls: Vec<String>`) instead of a single `source_url`
+- Mixed-format input: each source can be a different manifest format (e.g., HLS M3U8 + DASH MPD) — auto-detected per URL via the existing `hls_input`/`dash_input` parsers, then normalized into `SourceManifest` before merging
 - Each source is fetched independently, parsed into `SourceManifest`, and its variants/tracks are merged into a unified manifest
 - Variant deduplication: detect overlapping bitrates/resolutions across sources and apply configurable conflict resolution (prefer first, prefer highest quality, error)
-- Track type merging: combine video variants from one source with audio/subtitle tracks from another (e.g., separate audio-only and video-only CMAF sources)
+- Track type merging: combine video variants from one source with audio/subtitle tracks from another (e.g., separate audio-only and video-only CMAF sources, or an HLS video source merged with a DASH audio source)
 - Per-source encryption: each source may have a different encryption scheme — decrypt each independently, re-encrypt all to the target scheme(s)
+- Per-source container format: sources may use different container formats (CMAF, fMP4, TS) — each is parsed/transmuxed independently before merging into the target output format
 - Per-source init segments: each variant retains its own init segment (no re-muxing across sources)
 - Unified DRM signaling: merged manifest gets a single consistent set of DRM tags/ContentProtection elements
 - HLS: merged master playlist with all `#EXT-X-STREAM-INF` entries, unified `#EXT-X-MEDIA` groups for audio/subtitle renditions
