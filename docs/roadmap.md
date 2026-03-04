@@ -168,6 +168,23 @@ The current binary (~648 KB base, ~685 KB full) is well within cold start budget
 - Env var defaults (`CACHE_MAX_AGE_SEGMENTS`, `CACHE_MAX_AGE_MANIFEST_LIVE`, `CACHE_MAX_AGE_MANIFEST_FINAL`) with per-request override via webhook/JIT query params
 - Sandbox UI controls for cache header tuning
 
+### Phase 20: Multi-Source Manifest Merging — P2
+- Combine multiple source manifests (HLS/DASH) into a single unified output manifest
+- Feature-gated behind `#[cfg(feature = "merge")]` to keep it modular and avoid binary impact on builds that don't need it
+- Accept an array of source manifest URLs in the webhook payload (`source_urls: Vec<String>`) instead of a single `source_url`
+- Each source is fetched independently, parsed into `SourceManifest`, and its variants/tracks are merged into a unified manifest
+- Variant deduplication: detect overlapping bitrates/resolutions across sources and apply configurable conflict resolution (prefer first, prefer highest quality, error)
+- Track type merging: combine video variants from one source with audio/subtitle tracks from another (e.g., separate audio-only and video-only CMAF sources)
+- Per-source encryption: each source may have a different encryption scheme — decrypt each independently, re-encrypt all to the target scheme(s)
+- Per-source init segments: each variant retains its own init segment (no re-muxing across sources)
+- Unified DRM signaling: merged manifest gets a single consistent set of DRM tags/ContentProtection elements
+- HLS: merged master playlist with all `#EXT-X-STREAM-INF` entries, unified `#EXT-X-MEDIA` groups for audio/subtitle renditions
+- DASH: merged MPD with multiple `<AdaptationSet>` elements, one per source track type
+- Segment URIs remain source-specific (each segment is fetched and repackaged from its original source)
+- Pipeline changes: `RepackagePipeline` accepts `Vec<SourceManifest>`, iterates sources to build merged `ManifestState` before entering the segment processing loop
+- Sandbox UI: multi-URL input field for testing merged output
+- New: `src/manifest/merge.rs` for manifest merging logic
+
 ### ~~Phase 16: Compatibility Validation & Hardening~~ ✅ Complete
 - Codec/scheme compatibility validation (`src/media/compat.rs`): VP9+CBCS error, HEVC+CENC subsample warning, AV1+CBCS warning, DV RPU warning, text track encryption error
 - HDR format detection (HDR10, HDR10+, Dolby Vision, HLG) from codec strings
@@ -209,6 +226,6 @@ cargo build --release --features jit,cloudflare # All features (excl. TS)
 cargo build --release --features jit,cloudflare,ts # All features (incl. TS input)
 ```
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (13–15, 18–19) are P2.
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (13–15, 18–20) are P2.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`
