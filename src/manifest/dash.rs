@@ -17,7 +17,8 @@ pub fn render(state: &ManifestState) -> Result<String> {
         ManifestPhase::AwaitingFirstSegment => return Ok(mpd),
     };
 
-    let total_duration = state.segments.iter().map(|s| s.duration).sum::<f64>();
+    let windowed = state.windowed_segments();
+    let total_duration = windowed.iter().map(|s| s.duration).sum::<f64>();
     let duration_str = format_iso8601_duration(total_duration);
 
     mpd.push_str(&format!(
@@ -38,6 +39,10 @@ pub fn render(state: &ManifestState) -> Result<String> {
         ManifestPhase::Live => {
             mpd.push_str(" minimumUpdatePeriod=\"PT1S\"");
             mpd.push_str(" availabilityStartTime=\"1970-01-01T00:00:00Z\"");
+            if let Some(window) = state.dvr_window_duration {
+                let tsbd = format_iso8601_duration(window);
+                mpd.push_str(&format!(" timeShiftBufferDepth=\"{tsbd}\""));
+            }
         }
         _ => {}
     }
@@ -50,12 +55,13 @@ pub fn render(state: &ManifestState) -> Result<String> {
     // Period
     mpd.push_str("  <Period id=\"0\">\n");
 
-    // SCTE-35 EventStream (ad break signaling)
-    if !state.ad_breaks.is_empty() {
+    // SCTE-35 EventStream (ad break signaling, windowed for DVR)
+    let windowed_breaks = state.windowed_ad_breaks();
+    if !windowed_breaks.is_empty() {
         mpd.push_str(
             "    <EventStream schemeIdUri=\"urn:scte:scte35:2013:bin\" timescale=\"90000\">\n",
         );
-        for ab in &state.ad_breaks {
+        for ab in &windowed_breaks {
             let pts = (ab.presentation_time * 90000.0) as u64;
             let dur = ab
                 .duration
@@ -95,7 +101,8 @@ pub fn render(state: &ManifestState) -> Result<String> {
         .collect();
 
     // Video AdaptationSet
-    let has_trick_play = state.enable_iframe_playlist && !state.iframe_segments.is_empty();
+    let windowed_iframes = state.windowed_iframe_segments();
+    let has_trick_play = state.enable_iframe_playlist && !windowed_iframes.is_empty();
     if !video_variants.is_empty() || state.variants.is_empty() {
         if has_trick_play {
             mpd.push_str(
@@ -151,7 +158,7 @@ pub fn render(state: &ManifestState) -> Result<String> {
         mpd.push_str("    </AdaptationSet>\n");
 
         // Trick play AdaptationSet (references main video via EssentialProperty)
-        if state.enable_iframe_playlist && !state.iframe_segments.is_empty() {
+        if state.enable_iframe_playlist && !windowed_iframes.is_empty() {
             mpd.push_str("    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n");
             mpd.push_str("      <EssentialProperty schemeIdUri=\"http://dashif.org/guidelines/trickmode\" value=\"1\"/>\n");
             mpd.push_str(&build_segment_template(state));
@@ -303,12 +310,15 @@ fn build_segment_template(state: &ManifestState) -> String {
 
     let timescale = 1000u32; // millisecond timescale
 
+    let segments = state.windowed_segments();
+    let start_number = segments.first().map(|s| s.number).unwrap_or(0);
+
     let seg_ext = state.container_format.video_segment_extension();
     let mut xml = format!(
         "      <SegmentTemplate timescale=\"{timescale}\" \
          initialization=\"{init_uri}\" \
          media=\"{base}segment_$Number${seg_ext}\" \
-         startNumber=\"0\"",
+         startNumber=\"{start_number}\"",
         base = state.base_url
     );
 
@@ -326,7 +336,7 @@ fn build_segment_template(state: &ManifestState) -> String {
     xml.push_str(">\n");
 
     xml.push_str("        <SegmentTimeline>\n");
-    for segment in &state.segments {
+    for segment in segments {
         let duration_ms = (segment.duration * timescale as f64) as u64;
         xml.push_str(&format!(
             "          <S d=\"{duration_ms}\"/>\n"

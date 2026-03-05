@@ -164,6 +164,11 @@ impl ProgressiveOutput {
         self.state.enable_iframe_playlist = enable;
     }
 
+    /// Set the DVR sliding window duration in seconds.
+    pub fn set_dvr_window_duration(&mut self, duration: f64) {
+        self.state.dvr_window_duration = Some(duration);
+    }
+
     /// Get part data by segment number and part index.
     pub fn part_data(&self, segment_number: u32, part_index: u32) -> Option<&[u8]> {
         self.part_data
@@ -654,5 +659,21 @@ mod tests {
             availability_time_complete: false,
         });
         assert!(po.manifest_state().ll_dash_info.is_some());
+    }
+
+    // --- DVR Window tests ---
+
+    #[test]
+    fn set_dvr_window_duration_updates_state() {
+        let mut po = ProgressiveOutput::new(
+            "c1".into(),
+            OutputFormat::Hls,
+            "/base/".into(),
+            None,
+            ContainerFormat::default(),
+        );
+        assert!(po.manifest_state().dvr_window_duration.is_none());
+        po.set_dvr_window_duration(3600.0);
+        assert_eq!(po.manifest_state().dvr_window_duration, Some(3600.0));
     }
 }

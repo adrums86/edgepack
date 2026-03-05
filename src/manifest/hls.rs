@@ -85,10 +85,10 @@ pub fn render(state: &ManifestState) -> Result<String> {
     let target_dur = state.target_duration.ceil() as u64;
     m3u8.push_str(&format!("#EXT-X-TARGETDURATION:{target_dur}\n"));
 
-    // Media sequence
+    // Media sequence (windowed for DVR)
     m3u8.push_str(&format!(
         "#EXT-X-MEDIA-SEQUENCE:{}\n",
-        state.media_sequence
+        state.windowed_media_sequence()
     ));
 
     // LL-HLS: Server Control
@@ -122,7 +122,11 @@ pub fn render(state: &ManifestState) -> Result<String> {
             m3u8.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
         }
         ManifestPhase::Live => {
-            m3u8.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+            // When DVR window is active, omit PLAYLIST-TYPE to allow segments to slide out.
+            // Without a DVR window, use EVENT (append-only, all segments stay).
+            if !state.is_dvr_active() {
+                m3u8.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+            }
         }
         ManifestPhase::AwaitingFirstSegment => {
             // Shouldn't render in this state, but handle gracefully
@@ -152,8 +156,8 @@ pub fn render(state: &ManifestState) -> Result<String> {
     // Key rotation state tracking
     let mut last_key_period: Option<u32> = None;
 
-    // Segments
-    for segment in &state.segments {
+    // Segments (windowed for DVR)
+    for segment in state.windowed_segments() {
         // Clear lead transition
         if has_clear_lead && segment.number == clear_lead_boundary {
             if let Some(ref drm) = state.drm_info {
@@ -968,7 +972,8 @@ mod tests {
 ///
 /// Uses `#EXT-X-I-FRAMES-ONLY` with `#EXT-X-BYTERANGE` pointing into regular segments.
 pub fn render_iframe_playlist(state: &ManifestState) -> Result<Option<String>> {
-    if !state.enable_iframe_playlist || state.iframe_segments.is_empty() {
+    let iframes = state.windowed_iframe_segments();
+    if !state.enable_iframe_playlist || iframes.is_empty() {
         return Ok(None);
     }
 
@@ -979,8 +984,7 @@ pub fn render_iframe_playlist(state: &ManifestState) -> Result<Option<String>> {
     m3u8.push_str("#EXT-X-VERSION:4\n");
 
     // Target duration (from I-frame durations)
-    let max_dur = state
-        .iframe_segments
+    let max_dur = iframes
         .iter()
         .map(|f| f.duration)
         .fold(0.0f64, f64::max);
@@ -989,7 +993,7 @@ pub fn render_iframe_playlist(state: &ManifestState) -> Result<Option<String>> {
 
     m3u8.push_str(&format!(
         "#EXT-X-MEDIA-SEQUENCE:{}\n",
-        state.media_sequence
+        state.windowed_media_sequence()
     ));
 
     m3u8.push_str("#EXT-X-I-FRAMES-ONLY\n");
@@ -1000,7 +1004,9 @@ pub fn render_iframe_playlist(state: &ManifestState) -> Result<Option<String>> {
             m3u8.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
         }
         ManifestPhase::Live => {
-            m3u8.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+            if !state.is_dvr_active() {
+                m3u8.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+            }
         }
         ManifestPhase::AwaitingFirstSegment => {
             return Ok(None);
@@ -1017,8 +1023,8 @@ pub fn render_iframe_playlist(state: &ManifestState) -> Result<Option<String>> {
         m3u8.push_str(&format!("#EXT-X-MAP:URI=\"{}\"\n", init.uri));
     }
 
-    // I-frame entries
-    for iframe in &state.iframe_segments {
+    // I-frame entries (windowed for DVR)
+    for iframe in &iframes {
         m3u8.push_str(&format!("#EXTINF:{:.6},\n", iframe.duration));
         m3u8.push_str(&format!(
             "#EXT-X-BYTERANGE:{}@{}\n",

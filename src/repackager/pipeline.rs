@@ -209,6 +209,11 @@ impl RepackagePipeline {
                 progressive.set_enable_iframe_playlist(true);
             }
 
+            // Thread DVR window duration
+            if let Some(dvr_window) = request.dvr_window_duration {
+                progressive.set_dvr_window_duration(dvr_window);
+            }
+
             outputs.push((target_scheme, progressive));
         }
 
@@ -596,6 +601,11 @@ impl RepackagePipeline {
             // Thread I-frame playlist flag
             if request.enable_iframe_playlist {
                 progressive.set_enable_iframe_playlist(true);
+            }
+
+            // Thread DVR window duration
+            if let Some(dvr_window) = request.dvr_window_duration {
+                progressive.set_dvr_window_duration(dvr_window);
             }
 
             // Process first segment for this scheme
@@ -1200,6 +1210,7 @@ impl RepackagePipeline {
             ll_dash_info: None,
             iframe_segments: Vec::new(),
             enable_iframe_playlist: false,
+            dvr_window_duration: None,
         };
 
         let state_json = serde_json::to_vec(&manifest_state)

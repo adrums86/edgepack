@@ -578,3 +578,33 @@ pub fn make_dash_iframe_manifest_state(segment_count: u32, phase: ManifestPhase)
     }
     state
 }
+
+/// Build an HLS ManifestState with DVR window for testing.
+pub fn make_hls_dvr_manifest_state(
+    segment_count: u32,
+    phase: ManifestPhase,
+    dvr_window_duration: f64,
+) -> ManifestState {
+    let mut state = make_hls_manifest_state(segment_count, phase);
+    state.dvr_window_duration = Some(dvr_window_duration);
+    // Override segment durations to exact 6.0s for precise windowing math in tests
+    for seg in &mut state.segments {
+        seg.duration = 6.0;
+    }
+    state
+}
+
+/// Build a DASH ManifestState with DVR window for testing.
+pub fn make_dash_dvr_manifest_state(
+    segment_count: u32,
+    phase: ManifestPhase,
+    dvr_window_duration: f64,
+) -> ManifestState {
+    let mut state = make_dash_manifest_state(segment_count, phase);
+    state.dvr_window_duration = Some(dvr_window_duration);
+    // Override segment durations to exact 6.0s for precise windowing math in tests
+    for seg in &mut state.segments {
+        seg.duration = 6.0;
+    }
+    state
+}

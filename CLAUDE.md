@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~665 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~668 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
 
 ## Build Commands
 
@@ -207,6 +207,24 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **Key types:** `IFrameSegmentInfo` (segment_number, byte_offset, byte_length, duration, segment_uri). `ManifestState` extended with `iframe_segments: Vec<IFrameSegmentInfo>` and `enable_iframe_playlist: bool` (both `#[serde(default)]` for backward compat).
 
+### DVR Sliding Window (Phase 13)
+
+**Configurable window:** Enabled via `dvr_window_duration: Option<f64>` on `RepackageRequest`, `WebhookPayload`, and `ManifestState`. When set, only the most recent N seconds of segments are rendered in live manifests. Older segments remain accessible by direct URL — they are not pruned from `ManifestState`.
+
+**Filter-during-rendering:** Segments are filtered at render time, not removed from state. This preserves full segment history for live-to-VOD transitions (Complete phase renders all segments regardless of window). Trade-off: ManifestState grows with stream length (~1.5 MB for 24h at 6s segments — acceptable for Redis).
+
+**Windowing helpers** on `ManifestState`:
+- `windowed_segments()` — returns slice of segments within the DVR window from live edge
+- `windowed_media_sequence()` — first segment number in the window (for HLS `#EXT-X-MEDIA-SEQUENCE`)
+- `windowed_iframe_segments()` — filters I-frame segments by windowed segment numbers
+- `windowed_parts()` — filters LL-HLS parts by windowed segment numbers
+- `windowed_ad_breaks()` — filters SCTE-35 ad breaks by windowed segment numbers
+- `is_dvr_active()` — true when window is set and phase is Live
+
+**HLS behavior:** When DVR active, omits `#EXT-X-PLAYLIST-TYPE:EVENT` (allows segments to slide out of window). Without DVR, keeps `EVENT`. Complete phase stays `VOD`. Media sequence and segment list use windowed values.
+
+**DASH behavior:** Adds `timeShiftBufferDepth` attribute (ISO 8601 duration) to MPD element when DVR active. `startNumber` in `<SegmentTemplate>` is dynamic (first windowed segment number). `<SegmentTimeline>` only includes windowed entries. Complete phase omits `timeShiftBufferDepth` and renders all segments.
+
 ### MPEG-TS Input (Phase 10)
 
 **Feature-gated:** All TS code is behind `#[cfg(feature = "ts")]` — zero binary impact on non-TS builds.
@@ -296,7 +314,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,111 tests** total (with `--features jit,cloudflare`): 838 unit tests and 273 integration tests. With `--features jit,cloudflare,ts`: **1,190 tests** (885 unit + 305 integration). Without optional features: **1,055 tests**. All run on the native host target.
+The project has **1,154 tests** total (with `--features jit,cloudflare`): 856 unit tests and 298 integration tests. With `--features jit,cloudflare,ts`: **1,233 tests** (903 unit + 330 integration). Without optional features: **1,097 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -304,13 +322,13 @@ Per-feature binary size tests in `tests/wasm_binary_size.rs` prevent dependency 
 
 | Test | Features | Limit | Current Size | Functions |
 |------|----------|-------|-------------|-----------|
-| `wasm_base_binary_size` | none | 700 KB | ~665 KB | ~1,973 |
-| `wasm_jit_binary_size` | `jit` | 750 KB | ~697 KB | ~2,030 |
-| `wasm_full_binary_size` | `jit,cloudflare` | 750 KB | ~701 KB | ~2,033 |
+| `wasm_base_binary_size` | none | 700 KB | ~668 KB | ~1,973 |
+| `wasm_jit_binary_size` | `jit` | 750 KB | ~700 KB | ~2,030 |
+| `wasm_full_binary_size` | `jit,cloudflare` | 750 KB | ~704 KB | ~2,033 |
 
 JIT adds ~33 KB (60 functions) over base. Cloudflare adds only ~4.5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
 
-### Unit Tests (885 with all features incl. ts)
+### Unit Tests (903 with all features incl. ts)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -322,7 +340,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme, per-track KID assignment via TrackKeyMapping, multi-KID PSSH v1 generation), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not), clear→encrypted sinf injection (`create_protection_info`), encrypted→clear sinf stripping (`strip_protection_info`), clear→clear ftyp-only rewrite (`rewrite_ftyp_only`)
 - **Codec string extraction**: RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C, wvtt, stpp), track metadata parsing (hdlr handler type, mdhd timescale + language, tkhd track_id, sinf/tenc default_kid), TrackKeyMapping construction and serde roundtrips
 - **Segment rewriting**: Four-way dispatch (encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear pass-through), scheme-aware decrypt/re-encrypt with optional source/target keys
-- **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering, subtitle rendition groups (HLS `TYPE=SUBTITLES`, DASH text AdaptationSet), CEA-608/708 closed caption signaling (HLS `TYPE=CLOSED-CAPTIONS` with `INSTREAM-ID`, DASH `Accessibility` descriptors), I-frame playlist rendering (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE), master playlist I-frame stream signaling (`#EXT-X-I-FRAME-STREAM-INF`), DASH trick play AdaptationSet with EssentialProperty trickmode
+- **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering, subtitle rendition groups (HLS `TYPE=SUBTITLES`, DASH text AdaptationSet), CEA-608/708 closed caption signaling (HLS `TYPE=CLOSED-CAPTIONS` with `INSTREAM-ID`, DASH `Accessibility` descriptors), I-frame playlist rendering (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE), master playlist I-frame stream signaling (`#EXT-X-I-FRAME-STREAM-INF`), DASH trick play AdaptationSet with EssentialProperty trickmode, DVR sliding window (windowed segments/media sequence/playlist type for HLS, timeShiftBufferDepth/startNumber for DASH, live-to-VOD transitions)
 - **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements, `#EXT-X-DATERANGE` SCTE-35 ad break extraction, DASH `<EventStream>` SCTE-35 event parsing
 - **SCTE-35 parsing**: `emsg` box parsing (v0/v1), SCTE-35 splice_info_section binary parsing (splice_insert, time_signal), scheme URI detection, emsg builder roundtrips
 - **Compatibility validation**: Codec/scheme compatibility checks (VP9+CBCS error, HEVC+CENC warning, etc.), HDR format detection (HDR10, Dolby Vision, HLG), init/media segment structure validation, repackage request pre-flight validation
@@ -335,7 +353,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (305 with all features incl. ts)
+### Integration Tests (330 with all features incl. ts)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -357,6 +375,7 @@ tests/
 ├── advanced_drm.rs           15 tests: ClearKey, raw key mode, key rotation, clear lead, DRM systems override
 ├── ll_hls_dash.rs            16 tests: chunk detection, LL-HLS/LL-DASH parsing+rendering, progressive parts, serde
 ├── trick_play.rs             27 tests: HLS I-frame playlist (BYTERANGE, DRM, endlist, disabled), master I-frame stream, DASH trick play, serde compat, container formats, route handling
+├── dvr_window.rs             25 tests: HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
 └── wasm_binary_size.rs        5 tests: per-feature WASM binary size guards (base, jit, full, ts, full+ts)
 ```
@@ -369,6 +388,7 @@ tests/
 - `make_drm_key_set()` / `make_drm_key_set_with_fairplay()` — builds DrmKeySet with system-specific PSSH data
 - `make_hls_manifest_state()` / `make_dash_manifest_state()` — builds ManifestState with DRM info and segments
 - `make_hls_iframe_manifest_state()` / `make_dash_iframe_manifest_state()` — builds ManifestState with DRM info, segments, and I-frame segment info (enable_iframe_playlist=true)
+- `make_hls_dvr_manifest_state()` / `make_dash_dvr_manifest_state()` — builds ManifestState with DVR window duration and exact 6.0s segment durations for precise windowing math
 - Test constants: `TEST_SOURCE_KEY`, `TEST_TARGET_KEY`, `TEST_KID`, `TEST_IV` (all `[u8; 16]`)
 
 To run only integration tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'`
@@ -534,4 +554,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Refactoring Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–12, 16, and 17 are complete (all P0/P1 done). Remaining P2 phases: 13 (DVR), 14 (Content Steering), 15 (TS Output), 18 (Binary Size Monitoring), 19 (Configurable Cache-Control Headers).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–13, 16, and 17 are complete (all P0/P1 done). Remaining P2 phases: 14 (Content Steering), 15 (TS Output), 18 (Binary Size Monitoring), 19 (Configurable Cache-Control Headers).
