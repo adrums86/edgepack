@@ -147,12 +147,17 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - New: `tests/dvr_window.rs` (25 integration tests)
 - Result: 1,154 tests total with `--features jit,cloudflare` (43 new tests)
 
-### Phase 14: Content Steering & CDN Optimization — P2
-- HLS/DASH content steering, edge location awareness
-
-### Phase 15: TS Segment Output — P2
-- CMAF-to-TS muxer, HLS-TS manifests, AES-128 segment encryption
-- New: `src/media/ts_mux.rs`
+### Phase 14: Content Steering & CDN Optimization — P2 ✅
+- Content steering directive injection in HLS master playlists (`#EXT-X-CONTENT-STEERING`) and DASH MPDs (`<ContentSteering>`)
+- Webhook-driven steering config: `server_uri`, `default_pathway_id`, `query_before_start`
+- DASH source pass-through: `<ContentSteering>` elements extracted from input MPDs and preserved in output
+- Override priority: webhook config takes precedence over source-extracted steering
+- New type: `ContentSteeringConfig` (server_uri, default_pathway_id, query_before_start)
+- New webhook field: `content_steering` on `WebhookPayload` with validation (reject empty `server_uri`)
+- Pipeline threading in both `execute()` and `execute_first()` paths
+- HLS pass-through not applicable (edgepack parses media playlists; steering tag only in master playlists)
+- New: `tests/content_steering.rs` (20 integration tests)
+- Result: 1,275 tests total with `--features jit,cloudflare,ts` (85 new tests)
 
 ### Phase 18: Binary Size Monitoring & Selective Feature Gating — P2
 The current binary (~648 KB base, ~685 KB full) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
@@ -195,6 +200,15 @@ The current binary (~648 KB base, ~685 KB full) is well within cold start budget
 - Sandbox UI: multi-URL input field for testing merged output
 - New: `src/manifest/merge.rs` for manifest merging logic
 
+### Phase 21: Generic HLS/DASH Pipeline — P2
+- Ensure the HLS and DASH pipelines (input and output) are generic, meaning the manifests may differ fundamentally but the segments they reference are the same
+- Currently each output format (HLS, DASH) has separate manifest rendering, but both formats can reference the same underlying CMAF/fMP4 segments
+- Goal: a single source can produce both HLS and DASH output simultaneously without re-fetching or re-encrypting segments — only the manifest layer differs
+- Segment cache keys should be format-agnostic where possible (init segments and media segments are identical across HLS and DASH for CMAF content)
+- Manifest state should cleanly separate format-specific fields (HLS playlist type, DASH MPD attributes) from shared state (segments, DRM info, content steering)
+- Dual-format output: a single webhook request with `output_formats: ["hls", "dash"]` produces both manifest types referencing the same cached segments
+- Reduces storage, processing time, and cache pressure for multi-format deployments
+
 ### ~~Phase 16: Compatibility Validation & Hardening~~ ✅ Complete
 - Codec/scheme compatibility validation (`src/media/compat.rs`): VP9+CBCS error, HEVC+CENC subsample warning, AV1+CBCS warning, DV RPU warning, text track encryption error
 - HDR format detection (HDR10, HDR10+, Dolby Vision, HLG) from codec strings
@@ -236,6 +250,10 @@ cargo build --release --features jit,cloudflare # All features (excl. TS)
 cargo build --release --features jit,cloudflare,ts # All features (incl. TS input)
 ```
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (13–15, 18–20) are P2.
+### Phase 22: TS Segment Output — P3
+- CMAF-to-TS muxer, HLS-TS manifests, AES-128 segment encryption
+- New: `src/media/ts_mux.rs`
+
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18–21) are P2, Phase 22 is P3.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

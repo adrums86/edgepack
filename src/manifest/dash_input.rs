@@ -6,7 +6,7 @@
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
-use crate::manifest::types::{AdBreakInfo, LowLatencyDashInfo, SourceManifest};
+use crate::manifest::types::{AdBreakInfo, ContentSteeringConfig, LowLatencyDashInfo, SourceManifest};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use crate::url::Url;
@@ -37,6 +37,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     let mut base_url_override: Option<String> = None;
     let mut ll_dash_info: Option<LowLatencyDashInfo> = None;
     let mut total_duration_secs: Option<f64> = None;
+    let mut dash_content_steering: Option<ContentSteeringConfig> = None;
     let mut ad_breaks: Vec<AdBreakInfo> = Vec::new();
     let mut in_scte35_event_stream = false;
     let mut event_stream_timescale: u64 = 90000;
@@ -141,6 +142,37 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                         }
                         if d > 0 {
                             timeline_entries.push((d, r));
+                        }
+                    }
+                    b"ContentSteering" => {
+                        let mut proxy_url: Option<String> = None;
+                        let mut default_sl: Option<String> = None;
+                        let mut qbs: Option<bool> = None;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"proxyServerURL" => {
+                                    proxy_url = Some(
+                                        String::from_utf8_lossy(&attr.value).to_string(),
+                                    );
+                                }
+                                b"defaultServiceLocation" => {
+                                    default_sl = Some(
+                                        String::from_utf8_lossy(&attr.value).to_string(),
+                                    );
+                                }
+                                b"queryBeforeStart" => {
+                                    let val = String::from_utf8_lossy(&attr.value);
+                                    qbs = Some(val == "true");
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(url) = proxy_url {
+                            dash_content_steering = Some(ContentSteeringConfig {
+                                server_uri: url,
+                                default_pathway_id: default_sl,
+                                query_before_start: qbs,
+                            });
                         }
                     }
                     b"ContentProtection" => {
@@ -371,6 +403,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
         is_ts_source: false,
         aes128_key_url: None,
         aes128_iv: None,
+        content_steering: dash_content_steering,
     })
 }
 
@@ -843,5 +876,61 @@ mod tests {
     fn parse_no_ll_dash_attributes_backward_compat() {
         let result = parse_dash_manifest(&minimal_static_mpd(), BASE_URL).unwrap();
         assert!(result.ll_dash_info.is_none());
+    }
+
+    // --- Content steering tests ---
+
+    #[test]
+    fn parse_content_steering_full() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT18.018S">
+  <ContentSteering proxyServerURL="https://steer.example.com/v1" defaultServiceLocation="cdn-a" queryBeforeStart="true"/>
+  <Period>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="90000">
+          <SegmentTimeline>
+            <S d="540540" r="2"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        let cs = result.content_steering.unwrap();
+        assert_eq!(cs.server_uri, "https://steer.example.com/v1");
+        assert_eq!(cs.default_pathway_id.as_deref(), Some("cdn-a"));
+        assert_eq!(cs.query_before_start, Some(true));
+    }
+
+    #[test]
+    fn parse_content_steering_minimal() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT18.018S">
+  <ContentSteering proxyServerURL="https://steer.example.com/v1"/>
+  <Period>
+    <AdaptationSet>
+      <Representation>
+        <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="90000">
+          <SegmentTimeline>
+            <S d="540540" r="2"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        let cs = result.content_steering.unwrap();
+        assert_eq!(cs.server_uri, "https://steer.example.com/v1");
+        assert!(cs.default_pathway_id.is_none());
+        assert!(cs.query_before_start.is_none());
+    }
+
+    #[test]
+    fn parse_no_content_steering_backward_compat() {
+        let result = parse_dash_manifest(&minimal_static_mpd(), BASE_URL).unwrap();
+        assert!(result.content_steering.is_none());
     }
 }

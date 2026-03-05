@@ -67,6 +67,10 @@ pub struct RepackageRequest {
     /// segments within this window from the live edge. None = all segments (EVENT playlist).
     #[serde(default)]
     pub dvr_window_duration: Option<f64>,
+    /// Content steering configuration. When set, output manifests include content
+    /// steering directives (HLS `#EXT-X-CONTENT-STEERING`, DASH `<ContentSteering>`).
+    #[serde(default)]
+    pub content_steering: Option<crate::manifest::types::ContentSteeringConfig>,
 }
 
 fn default_target_schemes() -> Vec<EncryptionScheme> {
@@ -134,6 +138,7 @@ mod tests {
             drm_systems: vec![],
             enable_iframe_playlist: false,
             dvr_window_duration: None,
+            content_steering: None,
         };
         assert_eq!(req.content_id, "movie-123");
         assert_eq!(req.output_format, OutputFormat::Hls);
@@ -161,6 +166,7 @@ mod tests {
             drm_systems: vec![],
             enable_iframe_playlist: false,
             dvr_window_duration: None,
+            content_steering: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -201,6 +207,7 @@ mod tests {
             drm_systems: vec![],
             enable_iframe_playlist: false,
             dvr_window_duration: None,
+            content_steering: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -277,6 +284,7 @@ mod tests {
             drm_systems: vec![],
             enable_iframe_playlist: false,
             dvr_window_duration: None,
+            content_steering: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -404,6 +412,7 @@ mod tests {
             drm_systems: vec!["widevine".into(), "clearkey".into()],
             enable_iframe_playlist: false,
             dvr_window_duration: None,
+            content_steering: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();

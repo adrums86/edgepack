@@ -157,6 +157,7 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         is_ts_source,
         aes128_key_url,
         aes128_iv,
+        content_steering: None,
     })
 }
 

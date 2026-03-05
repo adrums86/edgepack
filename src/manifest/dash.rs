@@ -52,6 +52,19 @@ pub fn render(state: &ManifestState) -> Result<String> {
         " minBufferTime=\"{target_dur}\">\n"
     ));
 
+    // Content steering
+    if let Some(ref cs) = state.content_steering {
+        mpd.push_str("  <ContentSteering");
+        mpd.push_str(&format!(" proxyServerURL=\"{}\"", cs.server_uri));
+        if let Some(ref sl) = cs.default_pathway_id {
+            mpd.push_str(&format!(" defaultServiceLocation=\"{sl}\""));
+        }
+        if let Some(qbs) = cs.query_before_start {
+            mpd.push_str(&format!(" queryBeforeStart=\"{qbs}\""));
+        }
+        mpd.push_str("/>\n");
+    }
+
     // Period
     mpd.push_str("  <Period id=\"0\">\n");
 
@@ -946,5 +959,72 @@ mod tests {
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e"));
         assert!(mpd.contains("<cenc:pssh>CKDATA</cenc:pssh>"));
+    }
+
+    // --- Content steering tests ---
+
+    #[test]
+    fn render_content_steering_full() {
+        let mut state = make_live_state_with_segments(1);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: Some("cdn-a".into()),
+            query_before_start: Some(true),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("<ContentSteering"));
+        assert!(mpd.contains("proxyServerURL=\"https://steer.example.com/v1\""));
+        assert!(mpd.contains("defaultServiceLocation=\"cdn-a\""));
+        assert!(mpd.contains("queryBeforeStart=\"true\""));
+        assert!(mpd.contains("/>"));
+    }
+
+    #[test]
+    fn render_content_steering_proxy_url_only() {
+        let mut state = make_live_state_with_segments(1);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: None,
+            query_before_start: None,
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("proxyServerURL=\"https://steer.example.com/v1\""));
+        assert!(!mpd.contains("defaultServiceLocation"));
+        assert!(!mpd.contains("queryBeforeStart"));
+    }
+
+    #[test]
+    fn render_content_steering_query_before_start_false() {
+        let mut state = make_live_state_with_segments(1);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: None,
+            query_before_start: Some(false),
+        });
+        let mpd = render(&state).unwrap();
+        assert!(mpd.contains("queryBeforeStart=\"false\""));
+    }
+
+    #[test]
+    fn render_no_content_steering_backward_compat() {
+        let state = make_live_state_with_segments(1);
+        let mpd = render(&state).unwrap();
+        assert!(!mpd.contains("ContentSteering"));
+    }
+
+    #[test]
+    fn render_content_steering_position() {
+        let mut state = make_live_state_with_segments(1);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: None,
+            query_before_start: None,
+        });
+        let mpd = render(&state).unwrap();
+        let mpd_close = mpd.find("minBufferTime").unwrap();
+        let steering_pos = mpd.find("<ContentSteering").unwrap();
+        let period_pos = mpd.find("<Period").unwrap();
+        assert!(steering_pos > mpd_close, "steering should be after MPD opening tag");
+        assert!(steering_pos < period_pos, "steering should be before Period");
     }
 }

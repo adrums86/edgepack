@@ -963,6 +963,113 @@ mod tests {
         assert!(m3u8.contains("WV_P0"));
         assert!(m3u8.contains("WV_P1"));
     }
+
+    // --- Content steering tests ---
+
+    #[test]
+    fn render_master_content_steering_full() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: Some("cdn-a".into()),
+            query_before_start: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: Some((1280, 720)),
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
+        assert!(m3u8.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://steer.example.com/v1\",PATHWAY-ID=\"cdn-a\""));
+    }
+
+    #[test]
+    fn render_master_content_steering_server_uri_only() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: None,
+            query_before_start: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: Some((1280, 720)),
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
+        assert!(m3u8.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://steer.example.com/v1\""));
+        assert!(!m3u8.contains("PATHWAY-ID"));
+    }
+
+    #[test]
+    fn render_master_no_content_steering_backward_compat() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: Some((1280, 720)),
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
+        assert!(!m3u8.contains("CONTENT-STEERING"));
+    }
+
+    #[test]
+    fn render_master_content_steering_tag_position() {
+        let mut state = make_state(ManifestPhase::Live);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: Some("cdn-a".into()),
+            query_before_start: None,
+        });
+        state.drm_info = Some(ManifestDrmInfo {
+            encryption_scheme: EncryptionScheme::Cenc,
+            widevine_pssh: Some("WV_PSSH".into()),
+            playready_pssh: None,
+            playready_pro: None,
+            fairplay_key_uri: None,
+            default_kid: "0123456789abcdef0123456789abcdef".into(),
+            clearkey_pssh: None,
+        });
+        state.variants.push(VariantInfo {
+            id: "v1".into(),
+            bandwidth: 2_000_000,
+            codecs: "avc1.64001f".into(),
+            resolution: Some((1280, 720)),
+            frame_rate: None,
+            track_type: TrackMediaType::Video,
+            language: None,
+        });
+        let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
+        let ind_pos = m3u8.find("#EXT-X-INDEPENDENT-SEGMENTS").unwrap();
+        let steer_pos = m3u8.find("#EXT-X-CONTENT-STEERING").unwrap();
+        let session_pos = m3u8.find("#EXT-X-SESSION-KEY").unwrap();
+        assert!(steer_pos > ind_pos, "steering should be after INDEPENDENT-SEGMENTS");
+        assert!(steer_pos < session_pos, "steering should be before SESSION-KEY");
+    }
+
+    #[test]
+    fn render_media_playlist_never_has_content_steering() {
+        let mut state = make_live_state_with_segments(2);
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: Some("cdn-a".into()),
+            query_before_start: None,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(!m3u8.contains("CONTENT-STEERING"));
+    }
 }
 
 /// Render an HLS I-frame-only playlist from the manifest state.
@@ -1050,6 +1157,18 @@ pub fn render_master(state: &ManifestState, variant_playlist_uris: &[String]) ->
     m3u8.push_str("#EXTM3U\n");
     m3u8.push_str("#EXT-X-VERSION:7\n");
     m3u8.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+
+    // Content steering
+    if let Some(ref cs) = state.content_steering {
+        m3u8.push_str(&format!(
+            "#EXT-X-CONTENT-STEERING:SERVER-URI=\"{}\"",
+            cs.server_uri
+        ));
+        if let Some(ref pathway) = cs.default_pathway_id {
+            m3u8.push_str(&format!(",PATHWAY-ID=\"{pathway}\""));
+        }
+        m3u8.push('\n');
+    }
 
     // Content protection at master level
     if let Some(ref drm) = state.drm_info {

@@ -118,6 +118,29 @@ pub struct AdBreakInfo {
 /// of the first independent (IDR) moof+mdat chunk. Used to build
 /// HLS `#EXT-X-I-FRAMES-ONLY` playlists with `#EXT-X-BYTERANGE`
 /// and DASH trick play `<AdaptationSet>`.
+/// Content Steering configuration for CDN optimization.
+///
+/// When present, the manifest includes content steering directives that
+/// instruct the player to periodically query a steering server for
+/// CDN pathway preferences.
+///
+/// - **HLS**: Rendered as `#EXT-X-CONTENT-STEERING` in the multivariant playlist
+/// - **DASH**: Rendered as `<ContentSteering>` element inside `<MPD>`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentSteeringConfig {
+    /// Steering server URI (required).
+    /// HLS: `SERVER-URI` attribute. DASH: `proxyServerURL` attribute.
+    pub server_uri: String,
+    /// Default pathway/service location identifier (optional).
+    /// HLS: `PATHWAY-ID` attribute. DASH: `defaultServiceLocation` attribute.
+    #[serde(default)]
+    pub default_pathway_id: Option<String>,
+    /// Whether to query the steering server before playback starts (DASH only).
+    /// HLS ignores this field. DASH: `queryBeforeStart` attribute.
+    #[serde(default)]
+    pub query_before_start: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IFrameSegmentInfo {
     /// Segment number (matches SegmentInfo.number).
@@ -262,6 +285,10 @@ pub struct ManifestState {
     /// When None, all segments are rendered (EVENT playlist for HLS).
     #[serde(default)]
     pub dvr_window_duration: Option<f64>,
+    /// Content steering configuration for CDN optimization.
+    /// When set, manifests include content steering directives.
+    #[serde(default)]
+    pub content_steering: Option<ContentSteeringConfig>,
 }
 
 /// Lifecycle phase of the manifest.
@@ -305,6 +332,7 @@ impl ManifestState {
             iframe_segments: Vec::new(),
             enable_iframe_playlist: false,
             dvr_window_duration: None,
+            content_steering: None,
         }
     }
 
@@ -440,6 +468,10 @@ pub struct SourceManifest {
     /// AES-128 IV for TS segment decryption (hex-decoded from manifest).
     #[serde(default)]
     pub aes128_iv: Option<[u8; 16]>,
+    /// Content steering configuration parsed from source manifest.
+    /// HLS: not applicable (media playlists only). DASH: `<ContentSteering>` element.
+    #[serde(default)]
+    pub content_steering: Option<ContentSteeringConfig>,
 }
 
 #[cfg(test)]
@@ -931,6 +963,7 @@ mod tests {
             aes128_key_url: Some("https://keys.example.com/key".to_string()),
             aes128_iv: Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            content_steering: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: SourceManifest = serde_json::from_str(&json).unwrap();
@@ -1240,5 +1273,81 @@ mod tests {
 
         state.phase = ManifestPhase::Complete;
         assert!(!state.is_dvr_active()); // Some(30), Complete
+    }
+
+    // ── Content Steering ──────────────────────────────────────────
+
+    #[test]
+    fn content_steering_config_serde_roundtrip_full() {
+        let config = ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: Some("cdn-a".into()),
+            query_before_start: Some(true),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: ContentSteeringConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.server_uri, "https://steer.example.com/v1");
+        assert_eq!(parsed.default_pathway_id, Some("cdn-a".into()));
+        assert_eq!(parsed.query_before_start, Some(true));
+    }
+
+    #[test]
+    fn content_steering_config_serde_minimal() {
+        let json = r#"{"server_uri":"https://steer.example.com"}"#;
+        let parsed: ContentSteeringConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.server_uri, "https://steer.example.com");
+        assert!(parsed.default_pathway_id.is_none());
+        assert!(parsed.query_before_start.is_none());
+    }
+
+    #[test]
+    fn manifest_state_content_steering_serde_roundtrip() {
+        let mut state = ManifestState::new("cs-test".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.content_steering = Some(ContentSteeringConfig {
+            server_uri: "https://steer.example.com/v1".into(),
+            default_pathway_id: Some("cdn-a".into()),
+            query_before_start: None,
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: ManifestState = serde_json::from_str(&json).unwrap();
+        let cs = parsed.content_steering.unwrap();
+        assert_eq!(cs.server_uri, "https://steer.example.com/v1");
+        assert_eq!(cs.default_pathway_id, Some("cdn-a".into()));
+    }
+
+    #[test]
+    fn manifest_state_no_content_steering_backward_compat() {
+        let json = r#"{"content_id":"c","format":"Hls","phase":"Live","init_segment":null,"segments":[],"target_duration":6.0,"variants":[],"drm_info":null,"media_sequence":0,"base_url":"/"}"#;
+        let parsed: ManifestState = serde_json::from_str(json).unwrap();
+        assert!(parsed.content_steering.is_none());
+    }
+
+    #[test]
+    fn source_manifest_content_steering_serde_roundtrip() {
+        let source = SourceManifest {
+            init_segment_url: "/init.mp4".into(),
+            segment_urls: vec![],
+            segment_durations: vec![],
+            is_live: false,
+            source_scheme: None,
+            ad_breaks: vec![],
+            parts: vec![],
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info: None,
+            is_ts_source: false,
+            aes128_key_url: None,
+            aes128_iv: None,
+            content_steering: Some(ContentSteeringConfig {
+                server_uri: "https://dash-steer.example.com".into(),
+                default_pathway_id: Some("loc-1".into()),
+                query_before_start: Some(false),
+            }),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        let parsed: SourceManifest = serde_json::from_str(&json).unwrap();
+        let cs = parsed.content_steering.unwrap();
+        assert_eq!(cs.server_uri, "https://dash-steer.example.com");
+        assert_eq!(cs.query_before_start, Some(false));
     }
 }

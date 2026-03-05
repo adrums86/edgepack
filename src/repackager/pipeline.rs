@@ -214,6 +214,13 @@ impl RepackagePipeline {
                 progressive.set_dvr_window_duration(dvr_window);
             }
 
+            // Thread content steering (webhook override > source)
+            let effective_steering = request.content_steering.clone()
+                .or_else(|| source.content_steering.clone());
+            if let Some(cs) = effective_steering {
+                progressive.set_content_steering(cs);
+            }
+
             outputs.push((target_scheme, progressive));
         }
 
@@ -606,6 +613,13 @@ impl RepackagePipeline {
             // Thread DVR window duration
             if let Some(dvr_window) = request.dvr_window_duration {
                 progressive.set_dvr_window_duration(dvr_window);
+            }
+
+            // Thread content steering (webhook override > source)
+            let effective_steering = request.content_steering.clone()
+                .or_else(|| source.content_steering.clone());
+            if let Some(cs) = effective_steering {
+                progressive.set_content_steering(cs);
             }
 
             // Process first segment for this scheme
@@ -1211,6 +1225,7 @@ impl RepackagePipeline {
             iframe_segments: Vec::new(),
             enable_iframe_playlist: false,
             dvr_window_duration: None,
+            content_steering: None,
         };
 
         let state_json = serde_json::to_vec(&manifest_state)

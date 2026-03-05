@@ -1,7 +1,8 @@
 use crate::manifest;
 use crate::manifest::types::{
-    AdBreakInfo, IFrameSegmentInfo, InitSegmentInfo, LowLatencyDashInfo, ManifestDrmInfo,
-    ManifestPhase, ManifestState, OutputFormat, PartInfo, SegmentInfo, ServerControl, VariantInfo,
+    AdBreakInfo, ContentSteeringConfig, IFrameSegmentInfo, InitSegmentInfo, LowLatencyDashInfo,
+    ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat, PartInfo, SegmentInfo,
+    ServerControl, VariantInfo,
 };
 use crate::media::container::ContainerFormat;
 
@@ -167,6 +168,11 @@ impl ProgressiveOutput {
     /// Set the DVR sliding window duration in seconds.
     pub fn set_dvr_window_duration(&mut self, duration: f64) {
         self.state.dvr_window_duration = Some(duration);
+    }
+
+    /// Set the content steering configuration.
+    pub fn set_content_steering(&mut self, config: ContentSteeringConfig) {
+        self.state.content_steering = Some(config);
     }
 
     /// Get part data by segment number and part index.

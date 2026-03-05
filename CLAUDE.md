@@ -4,7 +4,7 @@ This file provides context for Claude (Opus 4.6) when working on this codebase.
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~668 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~668 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, webhook override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
 
 ## Build Commands
 
@@ -225,6 +225,22 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **DASH behavior:** Adds `timeShiftBufferDepth` attribute (ISO 8601 duration) to MPD element when DVR active. `startNumber` in `<SegmentTemplate>` is dynamic (first windowed segment number). `<SegmentTimeline>` only includes windowed entries. Complete phase omits `timeShiftBufferDepth` and renders all segments.
 
+### Content Steering (Phase 14)
+
+**Content steering** allows a steering server to dynamically direct players between CDNs or content pathways at runtime. The player periodically queries a steering server URL, which returns JSON with pathway priorities.
+
+**Core type:** `ContentSteeringConfig` in `manifest/types.rs` — `server_uri: String`, `default_pathway_id: Option<String>`, `query_before_start: Option<bool>`. Fields on both `ManifestState` and `SourceManifest` (both `#[serde(default)]` for backward compat).
+
+**HLS output:** `#EXT-X-CONTENT-STEERING:SERVER-URI="...",PATHWAY-ID="..."` tag in master playlists only (after `#EXT-X-INDEPENDENT-SEGMENTS`, before `#EXT-X-SESSION-KEY`). Media playlists never contain steering tags.
+
+**DASH output:** `<ContentSteering proxyServerURL="..." defaultServiceLocation="..." queryBeforeStart="..."/>` element in MPD (after `minBufferTime>` close, before `<Period>`).
+
+**DASH source pass-through:** `dash_input.rs` parser extracts `<ContentSteering>` elements from source MPDs into `SourceManifest.content_steering`. HLS input parser does not extract steering (media playlists don't contain it).
+
+**Override priority:** Webhook `content_steering` config takes precedence over source-extracted steering: `request.content_steering.clone().or_else(|| source.content_steering.clone())`.
+
+**Webhook input:** `ContentSteeringInput` struct on `WebhookPayload` with validation (reject empty `server_uri`). Converted to `ContentSteeringConfig` before threading into pipeline.
+
 ### MPEG-TS Input (Phase 10)
 
 **Feature-gated:** All TS code is behind `#[cfg(feature = "ts")]` — zero binary impact on non-TS builds.
@@ -314,7 +330,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,154 tests** total (with `--features jit,cloudflare`): 856 unit tests and 298 integration tests. With `--features jit,cloudflare,ts`: **1,233 tests** (903 unit + 330 integration). Without optional features: **1,097 tests**. All run on the native host target.
+The project has **1,196 tests** total (with `--features jit,cloudflare`): 878 unit tests and 318 integration tests. With `--features jit,cloudflare,ts`: **1,275 tests** (925 unit + 350 integration). Without optional features: **1,139 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -376,6 +392,7 @@ tests/
 ├── ll_hls_dash.rs            16 tests: chunk detection, LL-HLS/LL-DASH parsing+rendering, progressive parts, serde
 ├── trick_play.rs             27 tests: HLS I-frame playlist (BYTERANGE, DRM, endlist, disabled), master I-frame stream, DASH trick play, serde compat, container formats, route handling
 ├── dvr_window.rs             25 tests: HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats
+├── content_steering.rs       20 tests: HLS master steering tag (full, URI-only, position, backward compat), DASH steering element (full, proxy-only, qbs, position), DASH input parsing (full, minimal, backward compat), serde roundtrips, override priority
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
 └── wasm_binary_size.rs        5 tests: per-feature WASM binary size guards (base, jit, full, ts, full+ts)
 ```
@@ -554,4 +571,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Refactoring Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–13, 16, and 17 are complete (all P0/P1 done). Remaining P2 phases: 14 (Content Steering), 15 (TS Output), 18 (Binary Size Monitoring), 19 (Configurable Cache-Control Headers).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, and 17 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 19 (Configurable Cache-Control Headers), 20 (Multi-Source Manifest Merging), 21 (Generic HLS/DASH Pipeline). P3: 22 (TS Segment Output).

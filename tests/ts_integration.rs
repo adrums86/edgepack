@@ -757,6 +757,7 @@ fn source_manifest_ts_fields_serde_roundtrip() {
         is_ts_source: true,
         aes128_key_url: Some("https://keys.example.com/key.bin".to_string()),
         aes128_iv: Some([0u8; 16]),
+        content_steering: None,
     };
 
     let json = serde_json::to_string(&source).unwrap();

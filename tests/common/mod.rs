@@ -6,8 +6,8 @@
 
 use edgepack::drm::{system_ids, ContentKey, DrmKeySet, DrmSystemData};
 use edgepack::manifest::types::{
-    IFrameSegmentInfo, InitSegmentInfo, ManifestDrmInfo, ManifestPhase, ManifestState,
-    OutputFormat, SegmentInfo,
+    ContentSteeringConfig, IFrameSegmentInfo, InitSegmentInfo, ManifestDrmInfo, ManifestPhase,
+    ManifestState, OutputFormat, SegmentInfo,
 };
 use edgepack::media::cmaf;
 use edgepack::media::container::ContainerFormat;
@@ -606,5 +606,33 @@ pub fn make_dash_dvr_manifest_state(
     for seg in &mut state.segments {
         seg.duration = 6.0;
     }
+    state
+}
+
+/// Build an HLS ManifestState with content steering for testing.
+pub fn make_hls_content_steering_manifest_state(
+    segment_count: u32,
+    phase: ManifestPhase,
+) -> ManifestState {
+    let mut state = make_hls_manifest_state(segment_count, phase);
+    state.content_steering = Some(ContentSteeringConfig {
+        server_uri: "https://steer.example.com/v1".into(),
+        default_pathway_id: Some("cdn-a".into()),
+        query_before_start: None,
+    });
+    state
+}
+
+/// Build a DASH ManifestState with content steering for testing.
+pub fn make_dash_content_steering_manifest_state(
+    segment_count: u32,
+    phase: ManifestPhase,
+) -> ManifestState {
+    let mut state = make_dash_manifest_state(segment_count, phase);
+    state.content_steering = Some(ContentSteeringConfig {
+        server_uri: "https://steer.example.com/v1".into(),
+        default_pathway_id: Some("cdn-a".into()),
+        query_before_start: Some(true),
+    });
     state
 }

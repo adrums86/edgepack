@@ -50,6 +50,9 @@ pub struct WebhookPayload {
     /// window instead of EVENT type. None = all segments rendered (EVENT playlist).
     #[serde(default)]
     pub dvr_window_duration: Option<f64>,
+    /// Content steering configuration. When set, output manifests include steering directives.
+    #[serde(default)]
+    pub content_steering: Option<ContentSteeringInput>,
 }
 
 /// Raw key input from webhook (hex-encoded strings).
@@ -65,6 +68,19 @@ pub struct RawKeyInput {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyRotationInput {
     pub period_segments: u32,
+}
+
+/// Content steering input from webhook.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContentSteeringInput {
+    /// Steering server URI (required).
+    pub server_uri: String,
+    /// Default pathway ID (HLS) / service location (DASH).
+    #[serde(default)]
+    pub default_pathway_id: Option<String>,
+    /// Whether to query the steering server before playback starts (DASH only).
+    #[serde(default)]
+    pub query_before_start: Option<bool>,
 }
 
 impl WebhookPayload {
@@ -230,6 +246,23 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         }
     }
 
+    // Parse content steering
+    let content_steering = match &payload.content_steering {
+        Some(cs) => {
+            if cs.server_uri.is_empty() {
+                return Err(EdgepackError::InvalidInput(
+                    "content_steering.server_uri must not be empty".into(),
+                ));
+            }
+            Some(crate::manifest::types::ContentSteeringConfig {
+                server_uri: cs.server_uri.clone(),
+                default_pathway_id: cs.default_pathway_id.clone(),
+                query_before_start: cs.query_before_start,
+            })
+        }
+        None => None,
+    };
+
     let request = RepackageRequest {
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
@@ -243,6 +276,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         drm_systems: payload.drm_systems,
         enable_iframe_playlist: payload.enable_iframe_playlist.unwrap_or(false),
         dvr_window_duration: payload.dvr_window_duration,
+        content_steering,
     };
 
     // Hybrid mode (JIT feature): if JIT has already set up this content,
@@ -668,6 +702,7 @@ mod tests {
             drm_systems: vec![],
             enable_iframe_playlist: None,
             dvr_window_duration: None,
+            content_steering: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
@@ -677,6 +712,7 @@ mod tests {
         assert_eq!(parsed.key_ids.len(), 1);
         assert!(parsed.enable_iframe_playlist.is_none());
         assert!(parsed.dvr_window_duration.is_none());
+        assert!(parsed.content_steering.is_none());
     }
 
     #[test]
@@ -1132,5 +1168,49 @@ mod tests {
         let result = handle_repackage_webhook(&req, &ctx);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("dvr_window_duration must be a positive number"));
+    }
+
+    // --- Content steering tests ---
+
+    #[test]
+    fn webhook_payload_content_steering() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","content_steering":{"server_uri":"https://steer.example.com/v1","default_pathway_id":"cdn-a","query_before_start":true}}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        let cs = parsed.content_steering.unwrap();
+        assert_eq!(cs.server_uri, "https://steer.example.com/v1");
+        assert_eq!(cs.default_pathway_id.as_deref(), Some("cdn-a"));
+        assert_eq!(cs.query_before_start, Some(true));
+    }
+
+    #[test]
+    fn webhook_payload_content_steering_minimal() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","content_steering":{"server_uri":"https://steer.example.com/v1"}}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        let cs = parsed.content_steering.unwrap();
+        assert_eq!(cs.server_uri, "https://steer.example.com/v1");
+        assert!(cs.default_pathway_id.is_none());
+        assert!(cs.query_before_start.is_none());
+    }
+
+    #[test]
+    fn webhook_payload_content_steering_default() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert!(parsed.content_steering.is_none());
+    }
+
+    #[test]
+    fn webhook_invalid_content_steering_empty_uri() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "content_steering": {"server_uri": ""}
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("server_uri must not be empty"));
     }
 }
