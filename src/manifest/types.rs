@@ -257,6 +257,11 @@ pub struct ManifestState {
     /// Whether trick play / I-frame playlist generation is enabled for this content.
     #[serde(default)]
     pub enable_iframe_playlist: bool,
+    /// DVR sliding window duration in seconds. When set and phase is Live,
+    /// manifests only render segments within this window from the live edge.
+    /// When None, all segments are rendered (EVENT playlist for HLS).
+    #[serde(default)]
+    pub dvr_window_duration: Option<f64>,
 }
 
 /// Lifecycle phase of the manifest.
@@ -299,11 +304,98 @@ impl ManifestState {
             ll_dash_info: None,
             iframe_segments: Vec::new(),
             enable_iframe_playlist: false,
+            dvr_window_duration: None,
         }
     }
 
     pub fn is_complete(&self) -> bool {
         self.phase == ManifestPhase::Complete
+    }
+
+    /// Return the slice of segments visible within the DVR window.
+    ///
+    /// If `dvr_window_duration` is `None` or phase is `Complete`, returns all segments.
+    /// Otherwise, returns segments from the live edge backward within the window duration.
+    pub fn windowed_segments(&self) -> &[SegmentInfo] {
+        match (self.dvr_window_duration, self.phase) {
+            (Some(window), ManifestPhase::Live) if window > 0.0 => {
+                let mut acc = 0.0;
+                let mut start_idx = self.segments.len();
+                for (i, seg) in self.segments.iter().enumerate().rev() {
+                    acc += seg.duration;
+                    if acc > window {
+                        start_idx = i + 1;
+                        break;
+                    }
+                    start_idx = i;
+                }
+                &self.segments[start_idx..]
+            }
+            _ => &self.segments,
+        }
+    }
+
+    /// The media_sequence value for the first segment in the DVR window.
+    pub fn windowed_media_sequence(&self) -> u32 {
+        match (self.dvr_window_duration, self.phase) {
+            (Some(window), ManifestPhase::Live) if window > 0.0 => {
+                self.windowed_segments()
+                    .first()
+                    .map(|s| s.number)
+                    .unwrap_or(self.media_sequence)
+            }
+            _ => self.media_sequence,
+        }
+    }
+
+    /// Return I-frame segment infos filtered to the DVR window.
+    pub fn windowed_iframe_segments(&self) -> Vec<&IFrameSegmentInfo> {
+        let windowed = self.windowed_segments();
+        if windowed.len() == self.segments.len() {
+            return self.iframe_segments.iter().collect();
+        }
+        let first_num = windowed.first().map(|s| s.number).unwrap_or(0);
+        let last_num = windowed.last().map(|s| s.number).unwrap_or(0);
+        self.iframe_segments
+            .iter()
+            .filter(|f| f.segment_number >= first_num && f.segment_number <= last_num)
+            .collect()
+    }
+
+    /// Return parts filtered to the DVR window.
+    pub fn windowed_parts(&self) -> Vec<&PartInfo> {
+        let windowed = self.windowed_segments();
+        if windowed.len() == self.segments.len() {
+            return self.parts.iter().collect();
+        }
+        let first_num = windowed.first().map(|s| s.number).unwrap_or(0);
+        let last_num = windowed.last().map(|s| s.number).unwrap_or(0);
+        self.parts
+            .iter()
+            .filter(|p| p.segment_number >= first_num && p.segment_number <= last_num)
+            .collect()
+    }
+
+    /// Return ad breaks filtered to the DVR window.
+    pub fn windowed_ad_breaks(&self) -> Vec<&AdBreakInfo> {
+        let windowed = self.windowed_segments();
+        if windowed.len() == self.segments.len() {
+            return self.ad_breaks.iter().collect();
+        }
+        let first_num = windowed.first().map(|s| s.number).unwrap_or(0);
+        let last_num = windowed.last().map(|s| s.number).unwrap_or(0);
+        self.ad_breaks
+            .iter()
+            .filter(|ab| ab.segment_number >= first_num && ab.segment_number <= last_num)
+            .collect()
+    }
+
+    /// Whether the DVR window is active (set and phase is Live).
+    pub fn is_dvr_active(&self) -> bool {
+        matches!(
+            (self.dvr_window_duration, self.phase),
+            (Some(w), ManifestPhase::Live) if w > 0.0
+        )
     }
 }
 
@@ -918,5 +1010,235 @@ mod tests {
         let parsed: ManifestState = serde_json::from_str(json).unwrap();
         assert!(parsed.iframe_segments.is_empty());
         assert!(!parsed.enable_iframe_playlist);
+    }
+
+    // --- DVR Window type tests ---
+
+    #[test]
+    fn manifest_state_new_dvr_defaults() {
+        let state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        assert!(state.dvr_window_duration.is_none());
+        assert!(!state.is_dvr_active());
+    }
+
+    #[test]
+    fn manifest_state_serde_backward_compat_no_dvr_fields() {
+        let json = r#"{"content_id":"c","format":"Hls","phase":"Live","init_segment":null,"segments":[],"target_duration":6.0,"variants":[],"drm_info":null,"media_sequence":0,"base_url":"/"}"#;
+        let parsed: ManifestState = serde_json::from_str(json).unwrap();
+        assert!(parsed.dvr_window_duration.is_none());
+    }
+
+    #[test]
+    fn dvr_window_duration_serde_roundtrip() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.dvr_window_duration = Some(3600.0);
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: ManifestState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.dvr_window_duration, Some(3600.0));
+    }
+
+    #[test]
+    fn windowed_segments_no_window_returns_all() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        for i in 0..10 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+        }
+        assert_eq!(state.windowed_segments().len(), 10);
+    }
+
+    #[test]
+    fn windowed_segments_window_smaller_than_total() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.dvr_window_duration = Some(30.0);
+        for i in 0..10 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+        }
+        // 10 segments * 6s = 60s total, window = 30s → last 5 segments
+        let windowed = state.windowed_segments();
+        assert_eq!(windowed.len(), 5);
+        assert_eq!(windowed[0].number, 5);
+        assert_eq!(windowed[4].number, 9);
+    }
+
+    #[test]
+    fn windowed_segments_window_larger_than_total() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.dvr_window_duration = Some(3600.0);
+        for i in 0..3 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+        }
+        // 3 segments * 6s = 18s, window = 3600s → all segments
+        assert_eq!(state.windowed_segments().len(), 3);
+    }
+
+    #[test]
+    fn windowed_segments_complete_phase_ignores_window() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Complete;
+        state.dvr_window_duration = Some(30.0);
+        for i in 0..10 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+        }
+        // Complete phase ignores window — returns all segments
+        assert_eq!(state.windowed_segments().len(), 10);
+    }
+
+    #[test]
+    fn windowed_media_sequence() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.dvr_window_duration = Some(30.0);
+        for i in 0..10 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+        }
+        assert_eq!(state.windowed_media_sequence(), 5);
+    }
+
+    #[test]
+    fn windowed_media_sequence_no_window() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        for i in 0..10 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+        }
+        assert_eq!(state.windowed_media_sequence(), 0);
+    }
+
+    #[test]
+    fn windowed_iframe_segments_filters() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.dvr_window_duration = Some(18.0);
+        for i in 0..5 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+            state.iframe_segments.push(IFrameSegmentInfo {
+                segment_number: i,
+                byte_offset: 0,
+                byte_length: 500,
+                duration: 6.0,
+                segment_uri: format!("segment_{i}.cmfv"),
+            });
+        }
+        // Window = 18s → last 3 segments (2,3,4)
+        let windowed = state.windowed_iframe_segments();
+        assert_eq!(windowed.len(), 3);
+        assert_eq!(windowed[0].segment_number, 2);
+        assert_eq!(windowed[2].segment_number, 4);
+    }
+
+    #[test]
+    fn windowed_parts_filters() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.dvr_window_duration = Some(12.0);
+        for i in 0..4 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+            state.parts.push(PartInfo {
+                segment_number: i,
+                part_index: 0,
+                duration: 0.33,
+                independent: true,
+                uri: format!("part_{i}.0.cmfv"),
+                byte_size: 100,
+            });
+        }
+        // Window = 12s → last 2 segments (2,3)
+        let windowed = state.windowed_parts();
+        assert_eq!(windowed.len(), 2);
+        assert_eq!(windowed[0].segment_number, 2);
+    }
+
+    #[test]
+    fn windowed_ad_breaks_filters() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.dvr_window_duration = Some(12.0);
+        for i in 0..4 {
+            state.segments.push(SegmentInfo {
+                number: i,
+                duration: 6.0,
+                uri: format!("segment_{i}.cmfv"),
+                byte_size: 1024,
+                key_period: None,
+            });
+        }
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1, presentation_time: 6.0, duration: Some(15.0),
+            scte35_cmd: None, segment_number: 1,
+        });
+        state.ad_breaks.push(AdBreakInfo {
+            id: 2, presentation_time: 18.0, duration: None,
+            scte35_cmd: None, segment_number: 3,
+        });
+        // Window = 12s → segments 2,3. Ad break at seg 1 excluded, seg 3 included.
+        let windowed = state.windowed_ad_breaks();
+        assert_eq!(windowed.len(), 1);
+        assert_eq!(windowed[0].id, 2);
+    }
+
+    #[test]
+    fn is_dvr_active_cases() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        assert!(!state.is_dvr_active()); // None, AwaitingFirstSegment
+
+        state.phase = ManifestPhase::Live;
+        assert!(!state.is_dvr_active()); // None, Live
+
+        state.dvr_window_duration = Some(30.0);
+        assert!(state.is_dvr_active()); // Some(30), Live
+
+        state.phase = ManifestPhase::Complete;
+        assert!(!state.is_dvr_active()); // Some(30), Complete
     }
 }

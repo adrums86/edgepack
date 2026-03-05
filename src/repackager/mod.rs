@@ -63,6 +63,10 @@ pub struct RepackageRequest {
     /// Default: false (opt-in to avoid overhead for clients that don't need trick play).
     #[serde(default)]
     pub enable_iframe_playlist: bool,
+    /// DVR sliding window duration in seconds. When set, live manifests only render
+    /// segments within this window from the live edge. None = all segments (EVENT playlist).
+    #[serde(default)]
+    pub dvr_window_duration: Option<f64>,
 }
 
 fn default_target_schemes() -> Vec<EncryptionScheme> {
@@ -129,6 +133,7 @@ mod tests {
             clear_lead_segments: None,
             drm_systems: vec![],
             enable_iframe_playlist: false,
+            dvr_window_duration: None,
         };
         assert_eq!(req.content_id, "movie-123");
         assert_eq!(req.output_format, OutputFormat::Hls);
@@ -155,6 +160,7 @@ mod tests {
             clear_lead_segments: None,
             drm_systems: vec![],
             enable_iframe_playlist: false,
+            dvr_window_duration: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -194,6 +200,7 @@ mod tests {
             clear_lead_segments: None,
             drm_systems: vec![],
             enable_iframe_playlist: false,
+            dvr_window_duration: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -269,6 +276,7 @@ mod tests {
             clear_lead_segments: None,
             drm_systems: vec![],
             enable_iframe_playlist: false,
+            dvr_window_duration: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -395,6 +403,7 @@ mod tests {
             clear_lead_segments: Some(2),
             drm_systems: vec!["widevine".into(), "clearkey".into()],
             enable_iframe_playlist: false,
+            dvr_window_duration: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -415,5 +424,6 @@ mod tests {
         assert!(parsed.clear_lead_segments.is_none());
         assert!(parsed.drm_systems.is_empty());
         assert!(!parsed.enable_iframe_playlist);
+        assert!(parsed.dvr_window_duration.is_none());
     }
 }

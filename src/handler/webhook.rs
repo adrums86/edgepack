@@ -46,6 +46,10 @@ pub struct WebhookPayload {
     /// Enable I-frame / trick play playlist generation.
     #[serde(default)]
     pub enable_iframe_playlist: Option<bool>,
+    /// DVR sliding window duration in seconds. When set, live manifests use a sliding
+    /// window instead of EVENT type. None = all segments rendered (EVENT playlist).
+    #[serde(default)]
+    pub dvr_window_duration: Option<f64>,
 }
 
 /// Raw key input from webhook (hex-encoded strings).
@@ -217,6 +221,15 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         crate::repackager::KeyRotationConfig { period_segments: kr.period_segments }
     });
 
+    // Validate DVR window duration
+    if let Some(dvr_window) = payload.dvr_window_duration {
+        if dvr_window <= 0.0 {
+            return Err(EdgepackError::InvalidInput(
+                "dvr_window_duration must be a positive number".into(),
+            ));
+        }
+    }
+
     let request = RepackageRequest {
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
@@ -229,6 +242,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         clear_lead_segments: payload.clear_lead_segments,
         drm_systems: payload.drm_systems,
         enable_iframe_playlist: payload.enable_iframe_playlist.unwrap_or(false),
+        dvr_window_duration: payload.dvr_window_duration,
     };
 
     // Hybrid mode (JIT feature): if JIT has already set up this content,
@@ -653,6 +667,7 @@ mod tests {
             clear_lead_segments: None,
             drm_systems: vec![],
             enable_iframe_playlist: None,
+            dvr_window_duration: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
@@ -661,6 +676,7 @@ mod tests {
         assert_eq!(parsed.container_format, "cmaf");
         assert_eq!(parsed.key_ids.len(), 1);
         assert!(parsed.enable_iframe_playlist.is_none());
+        assert!(parsed.dvr_window_duration.is_none());
     }
 
     #[test]
@@ -1070,5 +1086,51 @@ mod tests {
         let json = serde_json::to_string(&kr).unwrap();
         let parsed: KeyRotationInput = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.period_segments, 5);
+    }
+
+    // --- DVR Window webhook tests ---
+
+    #[test]
+    fn webhook_payload_dvr_window_duration() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","dvr_window_duration":3600.0}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.dvr_window_duration, Some(3600.0));
+    }
+
+    #[test]
+    fn webhook_payload_dvr_window_duration_default() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert!(parsed.dvr_window_duration.is_none());
+    }
+
+    #[test]
+    fn webhook_invalid_dvr_window_zero() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "dvr_window_duration": 0.0
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dvr_window_duration must be a positive number"));
+    }
+
+    #[test]
+    fn webhook_invalid_dvr_window_negative() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "dvr_window_duration": -10.0
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("dvr_window_duration must be a positive number"));
     }
 }

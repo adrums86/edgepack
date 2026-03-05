@@ -136,8 +136,16 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - New: `tests/trick_play.rs` (27 integration tests)
 - Result: 1,111 tests total with `--features jit,cloudflare` (39 new tests)
 
-### Phase 13: DVR Window & Time-Shift — P2
-- Sliding window manifests, DVR start-over, live-to-VOD
+### Phase 13: DVR Window & Time-Shift — P2 ✅
+- DVR sliding window manifests for live streams (configurable `dvr_window_duration`)
+- Segments filtered during rendering (ManifestState retains all segments for live-to-VOD transitions)
+- HLS: omits `PLAYLIST-TYPE:EVENT` when DVR active, dynamic `MEDIA-SEQUENCE`, windowed segments/parts/iframes/ad breaks
+- DASH: `timeShiftBufferDepth` attribute, dynamic `startNumber` in SegmentTimeline, windowed ad break events
+- Complete phase ignores window — full VOD manifest with all segments
+- Windowing helpers on ManifestState: `windowed_segments()`, `windowed_media_sequence()`, `windowed_iframe_segments()`, `windowed_parts()`, `windowed_ad_breaks()`, `is_dvr_active()`
+- Webhook validation: `dvr_window_duration` must be positive when provided
+- New: `tests/dvr_window.rs` (25 integration tests)
+- Result: 1,154 tests total with `--features jit,cloudflare` (43 new tests)
 
 ### Phase 14: Content Steering & CDN Optimization — P2
 - HLS/DASH content steering, edge location awareness

@@ -273,6 +273,7 @@ async fn handle_repackage(
         clear_lead_segments: None,
         drm_systems: vec![],
         enable_iframe_playlist: false,
+        dvr_window_duration: None,
     };
 
     // Track the job

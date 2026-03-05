@@ -85,6 +85,7 @@ fn repackage_request_with_all_advanced_drm_fields() {
         clear_lead_segments: Some(3),
         drm_systems: vec!["widevine".into(), "clearkey".into()],
         enable_iframe_playlist: false,
+        dvr_window_duration: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -285,6 +286,7 @@ fn clearkey_combined_with_widevine() {
         clear_lead_segments: None,
         drm_systems: vec!["widevine".into(), "clearkey".into()],
         enable_iframe_playlist: false,
+        dvr_window_duration: None,
     };
     assert_eq!(req.drm_systems.len(), 2);
 }
