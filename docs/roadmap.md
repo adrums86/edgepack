@@ -254,6 +254,121 @@ cargo build --release --features jit,cloudflare,ts # All features (incl. TS inpu
 - CMAF-to-TS muxer, HLS-TS manifests, AES-128 segment encryption
 - New: `src/media/ts_mux.rs`
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18–21) are P2, Phase 22 is P3.
+### Phase 23: MoQ Ingest — P3 (feature-gated, requires research)
+
+**Goal:** Accept Media over QUIC (MoQ) streams from an upstream MoQ relay as a source input format, converting them to HLS/DASH output with encryption transforms — analogous to how edgepack currently ingests HLS/DASH manifests and CMAF/fMP4/TS segments.
+
+**Primary use case:** edgepack subscribes to a MoQ relay as a MOQT subscriber, receives media groups/objects, and produces repackaged HLS/DASH + CMAF/fMP4 output with configurable encryption (CBCS/CENC/clear). The MoQ relay handles fan-out from the publisher; edgepack handles the MoQ-to-HLS/DASH bridge at the edge.
+
+**Feature gate:** `#[cfg(feature = "moq")]` — heavy dependency surface (QUIC stack, async runtime, WebTransport) must not impact non-MoQ builds.
+
+#### Relevant Specifications
+
+| Spec | Draft | Purpose |
+|------|-------|---------|
+| MOQT (Media over QUIC Transport) | `draft-ietf-moq-transport` (v16+) | Core pub/sub transport: tracks, groups, objects, subscriptions |
+| LOC (Low Overhead Container) | `draft-ietf-moq-loc` | Lightweight media container for MOQT objects |
+| MoQ Catalog Format | `draft-ietf-moq-catalogformat` | JSON catalog for track discovery and codec signaling |
+| MSF (MOQT Streaming Format) | `draft-ietf-moq-msf` | Media packaging over MOQT (successor to WARP) |
+| Secure Objects | `draft-jennings-moq-secure-objects` | E2E encryption (SFrame-based) for MOQT objects |
+
+**Note:** All specs are active IETF drafts — none have reached RFC status. Implementation should track the latest drafts and be prepared for breaking changes.
+
+#### Rust Ecosystem
+
+| Crate | Purpose | Notes |
+|-------|---------|-------|
+| `moq-lite` | Core MOQT pub/sub (broadcasts, tracks, groups, frames) | Active development (moq-dev/moq) |
+| `hang` | Media layer atop moq-lite (catalog, codecs, LOC) | Active development (moq-dev/moq) |
+| `moq-native` | Quinn QUIC + rustls endpoint config helpers | Active development |
+| `web-transport-quinn` | WebTransport over Quinn | Active development |
+| `quinn` | Async Rust QUIC implementation | Mature, widely used |
+| `wtransport` | Pure Rust async WebTransport (alternative) | Active development |
+
+All MoQ crates require `tokio` async runtime and native QUIC (UDP sockets).
+
+#### Architecture Constraint: WASI P2 and QUIC
+
+**The fundamental constraint:** MOQT runs over QUIC or WebTransport, both of which require UDP sockets and an async runtime. WASI P2 only exposes `wasi:http` in CDN edge runtimes (Cloudflare Workers, Fastly Compute, etc.) — `wasi:sockets/udp` is specified but not implemented by CDN providers. Additionally, edgepack uses synchronous blocking I/O, while MOQT requires persistent bidirectional async connections.
+
+**Implication:** The MOQT transport layer (QUIC subscriber, WebTransport session) cannot run inside the WASM binary on current CDN edge runtimes. Two architectural approaches:
+
+**Approach A — Native MoQ subscriber sidecar:**
+- A native binary (using `moq-native` + `moq-lite` + `hang`) runs alongside the WASM binary
+- The sidecar subscribes to the MoQ relay, reassembles groups, writes CMAF segments + catalog-derived metadata to the cache backend (Redis/KV)
+- The WASM binary reads from cache and applies encryption transforms + manifest generation as it does today for HLS/DASH sources
+- Catalog metadata is converted to `SourceManifest` format in the cache
+- Pro: cleanest separation, reuses existing edgepack pipeline unchanged
+- Con: requires deploying and managing a separate process
+
+**Approach B — Native binary with embedded pipeline (no WASM):**
+- A single native binary combines the MoQ subscriber and the edgepack repackaging pipeline
+- Uses `moq-native` for transport and links against edgepack as an `rlib`
+- Pro: single deployment unit, direct in-process data flow
+- Con: loses WASM portability, ties deployment to a specific platform
+
+**Future: WASI P3** may add native `async`, `stream<T>`, and `future<T>` types, potentially enabling a WASM-native QUIC stack if CDN runtimes also implement `wasi:sockets/udp`. This would unify the architecture but is not available today.
+
+#### Components
+
+**1. MoQ Catalog Parser** (`src/moq/catalog.rs`)
+- Parse JSON catalog format (`draft-ietf-moq-catalogformat`)
+- Extract track namespaces, names, codec parameters, selection properties (bitrate, resolution, framerate)
+- Handle `initData` (base64 codec config) and `initTrack` references
+- Support delta updates via JSON Patch
+- Convert to edgepack's `SourceManifest` / `VariantInfo` types
+- **This component is pure JSON parsing — could run in WASM**
+
+**2. LOC Container Parser** (`src/moq/loc.rs`)
+- Parse LOC header extensions (timestamp, timescale, video config, frame marking)
+- Extract raw codec bitstream from LOC payload
+- Map to existing codec handling (H.264/H.265/AAC/VP9/AV1)
+- Handle LOC encryption (Secure Objects) if present
+- **Pure byte manipulation — could run in WASM**
+
+**3. LOC-to-CMAF Transmuxer** (`src/moq/transmux.rs`)
+- Convert LOC-packaged media objects to CMAF moof+mdat segments
+- Similar pattern to existing TS-to-CMAF transmux (`media/transmux.rs`)
+- Synthesize init segments from LOC codec config
+- Build trun/mdat from LOC frame payloads
+- **Pure byte manipulation — could run in WASM**
+
+**4. CMAF-over-MoQ Passthrough**
+- When upstream MoQ content uses `packaging: "cmaf"` (objects are CMAF chunks)
+- Reuse existing ISOBMFF parser (`media/cmaf.rs`) directly
+- Most natural integration path — only transport changes, not container
+- **Already implemented for CMAF — just needs data flow wiring**
+
+**5. MOQT Subscriber** (`src/moq/subscriber.rs`)
+- MOQT session setup (SETUP message exchange, version negotiation)
+- SUBSCRIBE to video/audio tracks by namespace + name
+- Group/object reassembly (ordered by Group ID, Object ID)
+- Handle subgroup dependencies, join points (group boundaries = keyframes)
+- FETCH for past groups (DVR/catch-up)
+- Session lifecycle (GOAWAY, reconnection)
+- **Requires QUIC/WebTransport — must run as native code**
+
+**6. MoQ-to-HLS/DASH Bridge** (pipeline integration)
+- Convert reassembled MoQ groups into the segment processing pipeline
+- Map MoQ track metadata to `ManifestState` / `VariantInfo`
+- Generate progressive HLS/DASH manifests as groups arrive (live streaming)
+- Apply encryption transforms (CBCS/CENC) via existing pipeline
+- Thread `dvr_window_duration`, content steering, SCTE-35 (if signaled in catalog)
+
+#### Research Required Before Implementation
+
+This phase requires significant research and prototyping before implementation begins:
+
+- [ ] **Spec stability assessment:** Monitor MOQT transport spec progression toward RFC. Breaking changes between drafts may invalidate implementation work
+- [ ] **Relay compatibility testing:** Test against live MoQ relays (moq-relay, Cloudflare's relay infrastructure) to understand real-world protocol behavior
+- [ ] **LOC vs CMAF packaging prevalence:** Determine which packaging format is more common from MoQ publishers to prioritize parser implementation order
+- [ ] **Catalog format maturity:** The catalog spec is still evolving — assess whether the JSON schema is stable enough to build against
+- [ ] **WASI P3 timeline:** Track WASI P3 async support and CDN runtime adoption — this determines whether a WASM-native approach becomes viable
+- [ ] **Binary size impact:** Profile the dependency tree of `moq-lite` + `hang` + `quinn` to estimate WASM binary size impact (expected to be very large — likely requires native-only build)
+- [ ] **Sidecar vs embedded architecture decision:** Prototype both approaches to evaluate operational complexity, latency, and deployment patterns
+- [ ] **E2E encryption interop:** Understand how MoQ Secure Objects (SFrame) interacts with edgepack's DRM encryption — potential double-encryption or key management complexity
+- [ ] **Live-to-VOD with MoQ:** Design how MoQ's group-based delivery maps to edgepack's `ManifestPhase` state machine (AwaitingFirstSegment → Live → Complete)
+
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18–21) are P2, Phases 22–23 are P3.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

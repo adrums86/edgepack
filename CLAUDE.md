@@ -571,4 +571,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Refactoring Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, and 17 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 19 (Configurable Cache-Control Headers), 20 (Multi-Source Manifest Merging), 21 (Generic HLS/DASH Pipeline). P3: 22 (TS Segment Output).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, and 17 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 19 (Configurable Cache-Control Headers), 20 (Multi-Source Manifest Merging), 21 (Generic HLS/DASH Pipeline). P3: 22 (TS Segment Output), 23 (MoQ Ingest — feature-gated, requires research).
