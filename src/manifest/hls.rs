@@ -4,8 +4,15 @@ use crate::manifest::types::{ManifestPhase, ManifestState};
 /// Decode base64 SCTE-35 command and return hex-encoded string.
 fn hex_encode_base64(b64: &str) -> String {
     use base64::Engine;
+    use std::fmt::Write;
     match base64::engine::general_purpose::STANDARD.decode(b64) {
-        Ok(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Ok(bytes) => {
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for b in &bytes {
+                let _ = write!(hex, "{b:02x}");
+            }
+            hex
+        }
         Err(_) => b64.to_string(), // fallback: pass through as-is
     }
 }

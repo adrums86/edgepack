@@ -8,7 +8,7 @@ mod common;
 use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::manifest::types::{
     ContentSteeringConfig, ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat,
-    SourceManifest, TrackMediaType, VariantInfo,
+    TrackMediaType, VariantInfo,
 };
 use edgepack::media::container::ContainerFormat;
 use edgepack::repackager::RepackageRequest;

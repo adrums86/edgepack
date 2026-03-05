@@ -1358,15 +1358,6 @@ fn build_key_set_from_raw_keys(raw_keys: &[crate::repackager::RawKeyEntry]) -> D
     }
 }
 
-/// Determine the key period index for a segment number.
-/// Returns None if rotation is disabled.
-fn key_period_for_segment(segment_number: u32, period_segments: u32) -> Option<u32> {
-    if period_segments == 0 {
-        return None;
-    }
-    Some(segment_number / period_segments)
-}
-
 /// Build a TrackKeyMapping from extracted tracks and protection info.
 ///
 /// Priority:
@@ -2763,29 +2754,6 @@ mod tests {
         let ks = build_key_set_from_raw_keys(&raw);
         let found = find_key_for_kid(&ks, &[0xBB; 16]).unwrap();
         assert_eq!(found.key, vec![0x22; 16]);
-    }
-
-    // --- key_period_for_segment tests ---
-
-    #[test]
-    fn key_period_disabled_when_zero() {
-        assert!(key_period_for_segment(5, 0).is_none());
-    }
-
-    #[test]
-    fn key_period_boundary_detection() {
-        assert_eq!(key_period_for_segment(0, 3), Some(0));
-        assert_eq!(key_period_for_segment(2, 3), Some(0));
-        assert_eq!(key_period_for_segment(3, 3), Some(1));
-        assert_eq!(key_period_for_segment(5, 3), Some(1));
-        assert_eq!(key_period_for_segment(6, 3), Some(2));
-    }
-
-    #[test]
-    fn key_period_single_segment_periods() {
-        assert_eq!(key_period_for_segment(0, 1), Some(0));
-        assert_eq!(key_period_for_segment(1, 1), Some(1));
-        assert_eq!(key_period_for_segment(100, 1), Some(100));
     }
 
     // --- build_manifest_drm_info with drm_systems_override tests ---

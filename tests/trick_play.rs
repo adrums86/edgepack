@@ -11,13 +11,12 @@
 
 mod common;
 
-use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::manifest;
 use edgepack::manifest::hls;
 use edgepack::manifest::dash;
 use edgepack::manifest::types::*;
 use edgepack::media::container::ContainerFormat;
-use edgepack::repackager::{RepackageRequest, RawKeyEntry, KeyRotationConfig};
+use edgepack::repackager::RepackageRequest;
 
 // ─── HLS I-Frame Playlist Rendering ───────────────────────────────
 

@@ -92,12 +92,15 @@ fn rewrite_encrypted_to_encrypted(segment_data: &[u8], params: &SegmentRewritePa
     let source_key = params.source_key.as_ref().ok_or_else(|| {
         EdgepackError::SegmentRewrite("source_key required for encrypted source".into())
     })?;
-    let source_key_bytes: [u8; 16] = source_key.key.clone().try_into().map_err(|_| {
+    let source_key_bytes: [u8; 16] = source_key.key.as_slice().try_into().map_err(|_| {
         EdgepackError::Encryption("source key must be 16 bytes".into())
     })?;
     let decryptor = create_decryptor(params.source_scheme, source_key_bytes, params.source_pattern);
 
     let mut sample_offset = 0usize;
+    let mut subsample_buf: Vec<(u32, u32)> = Vec::new();
+    let pad_source_iv = params.source_scheme == EncryptionScheme::Cbcs;
+
     for (i, entry) in senc_box.entries.iter().enumerate() {
         let sample_size = sample_sizes.get(i).copied().unwrap_or(0) as usize;
         if sample_offset + sample_size > data.len() {
@@ -109,14 +112,17 @@ fn rewrite_encrypted_to_encrypted(segment_data: &[u8], params: &SegmentRewritePa
 
         let sample_data = &mut data[sample_offset..sample_offset + sample_size];
         let iv = resolve_iv(i, entry, &params.constant_iv)?;
-        let decryption_iv = if params.source_scheme == EncryptionScheme::Cbcs {
-            pad_iv_to_16(&iv)
+        let padded_iv: [u8; 16];
+        let decryption_iv: &[u8] = if pad_source_iv {
+            padded_iv = pad_iv_to_16(iv);
+            &padded_iv
         } else {
             iv
         };
 
-        let subsamples = subsample_pairs(entry);
-        decryptor.decrypt_sample(sample_data, &decryption_iv, subsamples.as_deref())?;
+        let has_subs = fill_subsample_pairs(entry, &mut subsample_buf);
+        let subsamples = if has_subs { Some(subsample_buf.as_slice()) } else { None };
+        decryptor.decrypt_sample(sample_data, decryption_iv, subsamples)?;
         sample_offset += sample_size;
     }
 
@@ -124,7 +130,7 @@ fn rewrite_encrypted_to_encrypted(segment_data: &[u8], params: &SegmentRewritePa
     let target_key = params.target_key.as_ref().ok_or_else(|| {
         EdgepackError::SegmentRewrite("target_key required for encrypted target".into())
     })?;
-    let target_key_bytes: [u8; 16] = target_key.key.clone().try_into().map_err(|_| {
+    let target_key_bytes: [u8; 16] = target_key.key.as_slice().try_into().map_err(|_| {
         EdgepackError::Encryption("target key must be 16 bytes".into())
     })?;
     let encryptor = create_encryptor(params.target_scheme, target_key_bytes, params.target_pattern);
@@ -137,8 +143,9 @@ fn rewrite_encrypted_to_encrypted(segment_data: &[u8], params: &SegmentRewritePa
         let sample_data = &mut data[sample_offset..sample_offset + sample_size];
 
         let new_iv = encryptor.generate_iv(params.segment_number, i as u32);
-        let subsamples = subsample_pairs(entry);
-        encryptor.encrypt_sample(sample_data, &new_iv, subsamples.as_deref())?;
+        let has_subs = fill_subsample_pairs(entry, &mut subsample_buf);
+        let subsamples = if has_subs { Some(subsample_buf.as_slice()) } else { None };
+        encryptor.encrypt_sample(sample_data, &new_iv, subsamples)?;
 
         new_senc_entries.push(SencEntry {
             iv: new_iv,
@@ -174,7 +181,7 @@ fn rewrite_clear_to_encrypted(segment_data: &[u8], params: &SegmentRewriteParams
     let target_key = params.target_key.as_ref().ok_or_else(|| {
         EdgepackError::SegmentRewrite("target_key required for encrypted target".into())
     })?;
-    let target_key_bytes: [u8; 16] = target_key.key.clone().try_into().map_err(|_| {
+    let target_key_bytes: [u8; 16] = target_key.key.as_slice().try_into().map_err(|_| {
         EdgepackError::Encryption("target key must be 16 bytes".into())
     })?;
     let encryptor = create_encryptor(params.target_scheme, target_key_bytes, params.target_pattern);
@@ -230,12 +237,15 @@ fn rewrite_encrypted_to_clear(segment_data: &[u8], params: &SegmentRewriteParams
     let source_key = params.source_key.as_ref().ok_or_else(|| {
         EdgepackError::SegmentRewrite("source_key required for encrypted source".into())
     })?;
-    let source_key_bytes: [u8; 16] = source_key.key.clone().try_into().map_err(|_| {
+    let source_key_bytes: [u8; 16] = source_key.key.as_slice().try_into().map_err(|_| {
         EdgepackError::Encryption("source key must be 16 bytes".into())
     })?;
     let decryptor = create_decryptor(params.source_scheme, source_key_bytes, params.source_pattern);
 
     let mut sample_offset = 0usize;
+    let mut subsample_buf: Vec<(u32, u32)> = Vec::new();
+    let pad_source_iv = params.source_scheme == EncryptionScheme::Cbcs;
+
     for (i, entry) in senc_box.entries.iter().enumerate() {
         let sample_size = sample_sizes.get(i).copied().unwrap_or(0) as usize;
         if sample_offset + sample_size > data.len() {
@@ -247,14 +257,17 @@ fn rewrite_encrypted_to_clear(segment_data: &[u8], params: &SegmentRewriteParams
 
         let sample_data = &mut data[sample_offset..sample_offset + sample_size];
         let iv = resolve_iv(i, entry, &params.constant_iv)?;
-        let decryption_iv = if params.source_scheme == EncryptionScheme::Cbcs {
-            pad_iv_to_16(&iv)
+        let padded_iv: [u8; 16];
+        let decryption_iv: &[u8] = if pad_source_iv {
+            padded_iv = pad_iv_to_16(iv);
+            &padded_iv
         } else {
             iv
         };
 
-        let subsamples = subsample_pairs(entry);
-        decryptor.decrypt_sample(sample_data, &decryption_iv, subsamples.as_deref())?;
+        let has_subs = fill_subsample_pairs(entry, &mut subsample_buf);
+        let subsamples = if has_subs { Some(subsample_buf.as_slice()) } else { None };
+        decryptor.decrypt_sample(sample_data, decryption_iv, subsamples)?;
         sample_offset += sample_size;
     }
 
@@ -294,11 +307,12 @@ fn find_moof_mdat<'a>(segment_data: &'a [u8]) -> Result<(BoxHeader, &'a [u8], Bo
 }
 
 /// Resolve the IV for a sample from the senc entry or constant IV.
-fn resolve_iv(sample_index: usize, entry: &SencEntry, constant_iv: &Option<Vec<u8>>) -> Result<Vec<u8>> {
+/// Returns a reference to avoid cloning per sample.
+fn resolve_iv<'a>(sample_index: usize, entry: &'a SencEntry, constant_iv: &'a Option<Vec<u8>>) -> Result<&'a [u8]> {
     if !entry.iv.is_empty() {
-        Ok(entry.iv.clone())
+        Ok(&entry.iv)
     } else if let Some(ref constant) = constant_iv {
-        Ok(constant.clone())
+        Ok(constant)
     } else {
         Err(EdgepackError::SegmentRewrite(
             format!("no IV for sample {sample_index}: senc entry has no IV and no constant IV configured")
@@ -306,13 +320,16 @@ fn resolve_iv(sample_index: usize, entry: &SencEntry, constant_iv: &Option<Vec<u
     }
 }
 
-/// Extract subsample pairs from a senc entry.
-fn subsample_pairs(entry: &SencEntry) -> Option<Vec<(u32, u32)>> {
-    entry.subsamples.as_ref().map(|subs| {
-        subs.iter()
-            .map(|s| (s.clear_bytes as u32, s.encrypted_bytes))
-            .collect()
-    })
+/// Extract subsample pairs from a senc entry into a reusable buffer.
+/// Caller provides the buffer to avoid per-sample heap allocation.
+fn fill_subsample_pairs(entry: &SencEntry, buf: &mut Vec<(u32, u32)>) -> bool {
+    if let Some(subs) = &entry.subsamples {
+        buf.clear();
+        buf.extend(subs.iter().map(|s| (s.clear_bytes as u32, s.encrypted_bytes)));
+        true
+    } else {
+        false
+    }
 }
 
 /// Parse the moof box to extract senc and trun information.
@@ -589,10 +606,11 @@ fn rebuild_mdat(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Pad an IV to 16 bytes (required for CBC mode).
-fn pad_iv_to_16(iv: &[u8]) -> Vec<u8> {
-    let mut padded = vec![0u8; 16];
-    let start = 16 - iv.len().min(16);
-    padded[start..].copy_from_slice(&iv[..iv.len().min(16)]);
+fn pad_iv_to_16(iv: &[u8]) -> [u8; 16] {
+    let mut padded = [0u8; 16];
+    let len = iv.len().min(16);
+    let start = 16 - len;
+    padded[start..].copy_from_slice(&iv[..len]);
     padded
 }
 
@@ -614,13 +632,13 @@ mod tests {
     fn pad_iv_to_16_from_16_bytes() {
         let iv = [0xAA; 16];
         let padded = pad_iv_to_16(&iv);
-        assert_eq!(padded, iv.to_vec());
+        assert_eq!(padded, iv);
     }
 
     #[test]
     fn pad_iv_to_16_empty() {
         let padded = pad_iv_to_16(&[]);
-        assert_eq!(padded, vec![0u8; 16]);
+        assert_eq!(padded, [0u8; 16]);
     }
 
     #[test]
