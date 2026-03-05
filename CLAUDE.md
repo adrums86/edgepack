@@ -325,12 +325,13 @@ Pipeline output is written to `sandbox/output/{content_id}/{format}_{scheme}/` (
 | `reqwest` | 0.12 | Native HTTP client for sandbox (sandbox feature, non-wasm32 only) |
 | `tower-http` | 0.6 | Static file serving for local paths (sandbox feature, non-wasm32 only) |
 | `tracing-subscriber` | 0.3 | Log output for sandbox (sandbox feature, non-wasm32 only) |
+| `criterion` | 0.5 | Benchmark framework for JIT latency measurement (dev-dependency only) |
 
 URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `url` crate, saving ~200 KB of ICU/IDNA Unicode tables in the WASM binary. Core crates are chosen for WASM compatibility (no system dependencies, no async runtime requirements). Sandbox crates are gated behind `cfg(not(target_arch = "wasm32"))` and never appear in the WASM build.
 
 ## Tests
 
-The project has **1,196 tests** total (with `--features jit,cloudflare`): 878 unit tests and 318 integration tests. With `--features jit,cloudflare,ts`: **1,275 tests** (925 unit + 350 integration). Without optional features: **1,139 tests**. All run on the native host target.
+The project has **1,211 tests** total (with `--features jit,cloudflare`): 875 unit tests and 336 integration tests. With `--features jit,cloudflare,ts`: **1,290 tests** (922 unit + 368 integration). Without optional features: **1,154 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -344,7 +345,7 @@ Per-feature binary size tests in `tests/wasm_binary_size.rs` prevent dependency 
 
 JIT adds ~33 KB (60 functions) over base. Cloudflare adds only ~4.5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
 
-### Unit Tests (903 with all features incl. ts)
+### Unit Tests (922 with all features incl. ts)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -369,7 +370,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (330 with all features incl. ts)
+### Integration Tests (368 with all features incl. ts)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -394,6 +395,7 @@ tests/
 ├── dvr_window.rs             25 tests: HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats
 ├── content_steering.rs       20 tests: HLS master steering tag (full, URI-only, position, backward compat), DASH steering element (full, proxy-only, qbs, position), DASH input parsing (full, minimal, backward compat), serde roundtrips, override priority
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
+├── output_integrity.rs       18 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame)
 └── wasm_binary_size.rs        5 tests: per-feature WASM binary size guards (base, jit, full, ts, full+ts)
 ```
 
@@ -417,6 +419,29 @@ To run a specific suite: `cargo test --target $(rustc -vV | grep host | awk '{pr
 When adding new functionality, follow the existing pattern:
 - **Unit tests**: Add `#[cfg(test)] mod tests { ... }` at the bottom of the source file, import `use super::*;`, and create small focused test functions with descriptive names.
 - **Integration tests**: For cross-module workflows, add tests to the appropriate file in `tests/` or create a new file. Use shared fixtures from `tests/common/mod.rs`. Add `mod common;` at the top of each integration test file.
+- **Output integrity tests**: `tests/output_integrity.rs` validates structural correctness of every input/output lane. When adding new encryption paths or container format support, add corresponding integrity tests.
+- **ISOBMFF parsing in tests**: When calling `parse_trun`/`parse_senc`/`parse_pssh`, pass the box **payload** (after the box header), not the full box including the header. The `header_size` field on `BoxHeader` is `u8`.
+
+### Benchmarks
+
+Criterion benchmarks in `benches/jit_latency.rs` measure JIT-critical latencies:
+
+```bash
+# Run all benchmarks
+cargo bench --target $(rustc -vV | grep host | awk '{print $2}')
+
+# Run a specific benchmark group
+cargo bench --target $(rustc -vV | grep host | awk '{print $2}') --bench jit_latency -- segment_rewrite
+```
+
+| Benchmark Group | What's Measured |
+|----------------|-----------------|
+| `segment_rewrite` | Segment re-encryption: CBCS→CENC, clear→CENC, passthrough (4/32/128 samples × 1KB) |
+| `init_rewrite` | Init segment DRM scheme transform: CBCS→CENC, clear→CENC |
+| `manifest_render` | HLS/DASH manifest generation (10/50/200 segments), HLS I-frame (50 segments), HLS live (6 segments) |
+| `manifest_parse` | HLS/DASH manifest input parsing (50 segments) |
+
+Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mod.rs`). They run on native targets — WASM performance is proportional but not identical.
 
 ## Coding Conventions
 

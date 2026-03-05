@@ -14,12 +14,14 @@
 | 10 | MPEG-TS Input (feature-gated) | ✅ |
 | 11 | Advanced DRM | ✅ |
 | 12 | Trick Play & I-Frame Playlists | ✅ |
+| 13 | DVR Window & Time-Shift | ✅ |
+| 14 | Content Steering & CDN Optimization | ✅ |
 | 16 | Compatibility Validation & Hardening | ✅ |
 | 17 | CDN Provider Adapters & Binary Optimization | ✅ |
 
 # Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–12, 16, and 17 are complete. All P0 and P1 items are done. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, and 17 are complete. All P0 and P1 items are done. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -157,7 +159,9 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Pipeline threading in both `execute()` and `execute_first()` paths
 - HLS pass-through not applicable (edgepack parses media playlists; steering tag only in master playlists)
 - New: `tests/content_steering.rs` (20 integration tests)
-- Result: 1,275 tests total with `--features jit,cloudflare,ts` (85 new tests)
+- Result: 1,290 tests total with `--features jit,cloudflare,ts` (85 new phase tests + 18 output integrity tests)
+- Output integrity tests (`tests/output_integrity.rs`): structural validation of rewritten segments across all 4 encryption lanes (enc→enc, clear→enc, enc→clear, clear→clear), mdat/trun size consistency, encrypt-decrypt plaintext recovery roundtrip, I-frame BYTERANGE chunk validation, init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame)
+- Criterion benchmarks (`benches/jit_latency.rs`): segment rewrite latency (CBCS→CENC, clear→CENC, passthrough at 4/32/128 samples), init rewrite latency, manifest render/parse latency (HLS/DASH at varying segment counts)
 
 ### Phase 18: Binary Size Monitoring & Selective Feature Gating — P2
 The current binary (~648 KB base, ~685 KB full) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).

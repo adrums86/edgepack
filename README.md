@@ -144,7 +144,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **1,111 tests** (838 unit + 273 integration) with `--features jit,cloudflare`. With TS: **1,190 tests** (885 unit + 305 integration) with `--features jit,cloudflare,ts`. All tests cover every module, plus per-feature binary size guards for each build variant. To run tests for a specific module:
+The project includes **1,211 tests** (875 unit + 336 integration) with `--features jit,cloudflare`. With TS: **1,290 tests** (922 unit + 368 integration) with `--features jit,cloudflare,ts`. All tests cover every module, plus per-feature binary size guards for each build variant and output integrity tests validating structural correctness of every input/output lane. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -160,7 +160,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
 ```
 
-#### Unit Test Coverage (885 tests with all features)
+#### Unit Test Coverage (922 tests with all features)
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
@@ -175,7 +175,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryptio
 | `handler` | 89 | HTTP routing, path parsing incl. scheme-qualified formats (`hls_cenc`, `dash_cbcs`), segment number parsing (all 7 extensions), webhook validation (target_schemes array, backward compat, duplicate/invalid rejection), I-frame manifest handler, response construction |
 | `http_client` | 9 | Response construction, native stub errors |
 
-#### Integration Test Coverage (305 tests with all features)
+#### Integration Test Coverage (371 tests with all features)
 
 Integration tests live in `tests/` and use synthetic CMAF fixtures — no external services or network required.
 
@@ -196,11 +196,33 @@ Integration tests live in `tests/` and use synthetic CMAF fixtures — no extern
 | `scte35_integration` | 13 | emsg extraction, SCTE-35 parsing, HLS/DASH ad break rendering, source manifest ad marker roundtrip, AdBreakInfo serde |
 | `trick_play` | 27 | HLS I-frame playlist rendering (BYTERANGE, DRM, init map, endlist, disabled), HLS master I-frame stream signaling, DASH trick play AdaptationSet, manifest dispatcher, serde backward compat, container format variations, route handling |
 | `ts_integration` | 30 | MPEG-TS demux, PES/TS packet parsing, TS-to-CMAF transmux, init segment synthesis, HLS-TS manifest parsing, AES-128 decryption (ts feature) |
+| `output_integrity` | 18 | Rewritten segment ISOBMFF structure validation (all 4 encryption lanes), mdat/trun size consistency, encrypt-decrypt plaintext recovery, I-frame BYTERANGE chunk validation (pre/post rewrite), init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame) |
 | `wasm_binary_size` | 5 | Per-feature WASM binary size guards (base ≤700 KB, JIT ≤750 KB, full excl. TS ≤750 KB, TS ≤800 KB, full incl. TS ≤850 KB) with function count reporting |
 
 All tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data programmatically — no external test media files needed. Multi-key tests use separate video/audio KIDs and keys to verify per-track tenc, multi-KID PSSH, and TrackKeyMapping behavior.
 
-> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare,ts` to include all 1,190 tests. Without optional features: 1,055 tests.
+> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare,ts` to include all 1,290 tests. Without optional features: 1,154 tests.
+
+#### JIT Latency Benchmarks
+
+[Criterion](https://docs.rs/criterion) benchmarks measure the core operations that determine first-byte latency in JIT mode:
+
+```bash
+# Run all benchmarks
+cargo bench --target $(rustc -vV | grep host | awk '{print $2}')
+
+# Run a specific benchmark group
+cargo bench --target $(rustc -vV | grep host | awk '{print $2}') --bench jit_latency -- segment_rewrite
+```
+
+| Benchmark Group | What's Measured |
+|----------------|-----------------|
+| `segment_rewrite` | Segment re-encryption at 4/32/128 samples × 1KB: CBCS→CENC, clear→CENC, passthrough |
+| `init_rewrite` | Init segment DRM scheme transform: CBCS→CENC, clear→CENC |
+| `manifest_render` | HLS/DASH manifest generation at 10/50/200 segments, HLS I-frame at 50 segments, HLS live at 6 segments |
+| `manifest_parse` | HLS/DASH manifest input parsing at 50 segments |
+
+Benchmarks run on native targets (not WASM). WASM performance is proportional but not identical — use binary size as the cold-start proxy for WASM instantiation latency.
 
 ## Configuration
 
@@ -550,7 +572,7 @@ The runtime is fully implemented and compiles to a ~665 KB WASM component that i
 
 ## Roadmap
 
-Phases 1–12, 16, and 17 are complete. All P0 and P1 items are done. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. See [`docs/roadmap.md`](docs/roadmap.md) for detailed phase descriptions.
+Phases 1–14, 16, and 17 are complete. All P0 and P1 items are done. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. See [`docs/roadmap.md`](docs/roadmap.md) for detailed phase descriptions.
 
 ## License
 

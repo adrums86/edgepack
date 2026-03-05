@@ -42,6 +42,13 @@ reqwest = { version = "0.12", features = ["blocking"], optional = true }
 tower-http = { version = "0.6", features = ["fs"], optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "jit_latency"
+harness = false
+
 [profile.release]
 opt-level = "z"
 lto = true
