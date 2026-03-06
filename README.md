@@ -144,7 +144,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **1,331 tests** (924 unit + 407 integration) with `--features jit,cloudflare`. With TS: **1,410 tests** (971 unit + 439 integration) with `--features jit,cloudflare,ts`. All tests cover every module, plus per-feature binary size guards for each build variant and output integrity tests validating structural correctness of every input/output lane. To run tests for a specific module:
+The project includes **1,436 tests** (924 unit + 512 integration) with `--features jit,cloudflare`. With TS: **1,515 tests** (971 unit + 544 integration) with `--features jit,cloudflare,ts`. All tests cover every module, plus per-feature binary size guards for each build variant, output integrity tests validating structural correctness of every input/output lane, and 105 end-to-end tests exercising full pipeline flows and feature combinations. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -175,7 +175,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryptio
 | `handler` | 113 | HTTP routing, path parsing incl. scheme-qualified formats (`hls_cenc`, `dash_cbcs`), segment number parsing (all 7 extensions), webhook validation (target_schemes array, output_formats array, backward compat, duplicate/invalid rejection), I-frame manifest handler, response construction |
 | `http_client` | 9 | Response construction, native stub errors |
 
-#### Integration Test Coverage (439 tests with all features)
+#### Integration Test Coverage (544 tests with all features)
 
 Integration tests live in `tests/` and use synthetic CMAF fixtures — no external services or network required.
 
@@ -200,12 +200,13 @@ Integration tests live in `tests/` and use synthetic CMAF fixtures — no extern
 | `scte35_integration` | 13 | emsg extraction, SCTE-35 parsing, HLS/DASH ad break rendering, source manifest ad marker roundtrip, AdBreakInfo serde |
 | `trick_play` | 27 | HLS I-frame playlist rendering (BYTERANGE, DRM, init map, endlist, disabled), HLS master I-frame stream signaling, DASH trick play AdaptationSet, manifest dispatcher, serde backward compat, container format variations, route handling |
 | `ts_integration` | 30 | MPEG-TS demux, PES/TS packet parsing, TS-to-CMAF transmux, init segment synthesis, HLS-TS manifest parsing, AES-128 decryption (ts feature) |
+| `e2e` | 105 | Full pipeline E2E: encryption transforms ×2 formats (18), container×format×encryption matrix (18), feature combinations incl. DVR+iframes+DRM+steering+dual-format (30), lifecycle phase transitions (18), edge cases & boundary conditions (21) |
 | `output_integrity` | 21 | Rewritten segment ISOBMFF structure validation (all 4 encryption lanes), mdat/trun size consistency, encrypt-decrypt plaintext recovery, I-frame BYTERANGE chunk validation (pre/post rewrite), init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame), cache-control body invariants (manifest body unchanged with overrides, AwaitingFirstSegment safety) |
 | `wasm_binary_size` | 5 | Per-feature WASM binary size guards (base ≤720 KB, JIT ≤750 KB, full excl. TS ≤750 KB, TS ≤800 KB, full incl. TS ≤850 KB) with function count reporting |
 
 All tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data programmatically — no external test media files needed. Multi-key tests use separate video/audio KIDs and keys to verify per-track tenc, multi-KID PSSH, and TrackKeyMapping behavior.
 
-> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare,ts` to include all 1,410 tests. Without optional features: 1,274 tests.
+> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare,ts` to include all 1,515 tests. Without optional features: 1,379 tests.
 
 #### JIT Latency Benchmarks
 

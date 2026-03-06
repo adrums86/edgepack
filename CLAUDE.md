@@ -353,7 +353,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,331 tests** total (with `--features jit,cloudflare`): 924 unit tests and 407 integration tests. With `--features jit,cloudflare,ts`: **1,410 tests** (971 unit + 439 integration). Without optional features: **1,274 tests**. All run on the native host target.
+The project has **1,436 tests** total (with `--features jit,cloudflare`): 924 unit tests and 512 integration tests. With `--features jit,cloudflare,ts`: **1,515 tests** (971 unit + 544 integration). Without optional features: **1,379 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -392,7 +392,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (439 with all features incl. ts)
+### Integration Tests (544 with all features incl. ts)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -418,6 +418,7 @@ tests/
 ├── dvr_window.rs             25 tests: HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats
 ├── content_steering.rs       20 tests: HLS master steering tag (full, URI-only, position, backward compat), DASH steering element (full, proxy-only, qbs, position), DASH input parsing (full, minimal, backward compat), serde roundtrips, override priority
 ├── cache_control.rs          43 tests: system defaults (HLS/DASH, all phases), per-request overrides (live/final/segment max-age, s-maxage split, immutable toggle), safety invariants, progressive output integration (HLS + DASH), backward compat, DVR + cache control, container format + cache control, system CacheConfig overrides, DASH per-request overrides, segment handler design documentation, JIT cache_control:None documentation
+├── e2e.rs                   105 tests: full pipeline E2E — encryption transforms ×2 formats (18), container×format×encryption matrix (18), feature combinations incl. DVR+iframes+DRM+steering+dual-format (30), lifecycle phase transitions (18), edge cases & boundary conditions (21)
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
 ├── output_integrity.rs       21 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants
 └── wasm_binary_size.rs        5 tests: per-feature WASM binary size guards (base, jit, full, ts, full+ts)
@@ -432,6 +433,13 @@ tests/
 - `make_hls_manifest_state()` / `make_dash_manifest_state()` — builds ManifestState with DRM info and segments
 - `make_hls_iframe_manifest_state()` / `make_dash_iframe_manifest_state()` — builds ManifestState with DRM info, segments, and I-frame segment info (enable_iframe_playlist=true)
 - `make_hls_dvr_manifest_state()` / `make_dash_dvr_manifest_state()` — builds ManifestState with DVR window duration and exact 6.0s segment durations for precise windowing math
+- `build_cenc_init_segment()` — builds a synthetic CENC init segment (schm=cenc, 8-byte IV, 0:0 pattern)
+- `build_cenc_media_segment(sample_count, sample_size, key, iv_size)` — builds a CENC-encrypted media segment using AES-128-CTR
+- `make_manifest_state_with_container(format, container, segment_count, phase)` — generic ManifestState builder for any OutputFormat/ContainerFormat combination
+- `assert_valid_hls(manifest, expected_segments)` / `assert_valid_dash(manifest, expected_segments)` — structural validation + parse roundtrip helpers
+- `full_segment_rewrite(source, source_scheme, target_scheme, source_key, target_key)` — convenience wrapper for `rewrite_segment()` with auto IV size/pattern
+- `full_init_rewrite(source, source_scheme, target_scheme, key_set, container)` — 4-way init rewrite dispatcher
+- `assert_valid_segment_structure(segment, expected_samples, expect_senc)` — moof/mdat structure + trun/senc validation
 - Test constants: `TEST_SOURCE_KEY`, `TEST_TARGET_KEY`, `TEST_KID`, `TEST_IV` (all `[u8; 16]`)
 
 To run only integration tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'`
