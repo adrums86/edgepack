@@ -4,7 +4,7 @@
 
 A lightweight media repackager that runs as a WebAssembly module directly on CDN edge nodes. Compiled from Rust to `wasm32-wasip2`, the ~692 KB binary instantiates in under 1 ms — enabling **just-in-time packaging** where content is repackaged on the first viewer request rather than pre-processed in a central origin. This eliminates the origin packaging bottleneck: no batch jobs, no packaging queues, no storage of pre-packaged variants.
 
-edgepack repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4 ↔ ISO BMFF), producing progressive output manifests and segments cached at the CDN with configurable TTLs. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (CBCS + CENC simultaneously), **multi-key DRM** with per-track keying, **configurable cache-control headers** (env var defaults, per-request webhook overrides, safety invariants), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **subtitle/text track pass-through** (WebVTT/TTML, CEA-608/708), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **low-latency streaming** (LL-HLS partial segments, LL-DASH), **trick play** (HLS I-frame playlists, DASH trick play AdaptationSets), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), and codec string extraction for manifest signaling.
+edgepack repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4 ↔ ISO BMFF), producing progressive output manifests and segments cached at the CDN with configurable TTLs. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (CBCS + CENC simultaneously), **multi-key DRM** with per-track keying, **configurable cache-control headers** (env var defaults, per-request webhook overrides, safety invariants), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **subtitle/text track pass-through** (WebVTT/TTML, CEA-608/708), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **low-latency streaming** (LL-HLS partial segments, LL-DASH), **trick play** (HLS I-frame playlists, DASH trick play AdaptationSets), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), and codec string extraction for manifest signaling.
 
 ## Why WASM at the Edge
 
@@ -82,7 +82,7 @@ target/wasm32-wasip2/release/edgepack.wasm
 |---------|-------------|
 | `jit` | JIT on-demand packaging (manifest/init/segment on GET cache miss) |
 | `cloudflare` | Cloudflare Workers KV cache backend |
-| `ts` | MPEG-TS input support (TS demux + CMAF transmux) |
+| `ts` | MPEG-TS input (TS demux + CMAF transmux) and output (CMAF→TS mux + AES-128 encryption) |
 | `sandbox` | Local development sandbox with web UI (native binary, not WASM) |
 
 #### Binary Size by Build Variant
@@ -144,7 +144,7 @@ On x86-64 Linux:
 cargo test --target x86_64-unknown-linux-gnu
 ```
 
-The project includes **1,436 tests** (924 unit + 512 integration) with `--features jit,cloudflare`. With TS: **1,515 tests** (971 unit + 544 integration) with `--features jit,cloudflare,ts`. All tests cover every module, plus per-feature binary size guards for each build variant, output integrity tests validating structural correctness of every input/output lane, and 105 end-to-end tests exercising full pipeline flows and feature combinations. To run tests for a specific module:
+The project includes **1,437 tests** (924 unit + 513 integration) with `--features jit,cloudflare`. With TS: **1,603 tests** (971 unit + 632 integration) with `--features jit,cloudflare,ts`. All tests cover every module, plus per-feature binary size guards for each build variant, output integrity tests validating structural correctness of every input/output lane, and 105 end-to-end tests exercising full pipeline flows and feature combinations. To run tests for a specific module:
 
 ```bash
 # Run all tests in the drm module
@@ -175,7 +175,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryptio
 | `handler` | 113 | HTTP routing, path parsing incl. scheme-qualified formats (`hls_cenc`, `dash_cbcs`), segment number parsing (all 7 extensions), webhook validation (target_schemes array, output_formats array, backward compat, duplicate/invalid rejection), I-frame manifest handler, response construction |
 | `http_client` | 9 | Response construction, native stub errors |
 
-#### Integration Test Coverage (544 tests with all features)
+#### Integration Test Coverage (632 tests with all features)
 
 Integration tests live in `tests/` and use synthetic CMAF fixtures — no external services or network required.
 
@@ -200,13 +200,14 @@ Integration tests live in `tests/` and use synthetic CMAF fixtures — no extern
 | `scte35_integration` | 13 | emsg extraction, SCTE-35 parsing, HLS/DASH ad break rendering, source manifest ad marker roundtrip, AdBreakInfo serde |
 | `trick_play` | 27 | HLS I-frame playlist rendering (BYTERANGE, DRM, init map, endlist, disabled), HLS master I-frame stream signaling, DASH trick play AdaptationSet, manifest dispatcher, serde backward compat, container format variations, route handling |
 | `ts_integration` | 30 | MPEG-TS demux, PES/TS packet parsing, TS-to-CMAF transmux, init segment synthesis, HLS-TS manifest parsing, AES-128 decryption (ts feature) |
+| `ts_output` | 46 | ContainerFormat::Ts (serde, extension, validation), HLS-TS manifest (no EXT-X-MAP, VERSION:3, AES-128 KEY, .ts URIs), TS muxer (PAT/PMT/PES roundtrip, AVCC↔AnnexB, ADTS, encryption), webhook TS acceptance/rejection, key endpoint routing, handler routing (ts feature) |
 | `e2e` | 105 | Full pipeline E2E: encryption transforms ×2 formats (18), container×format×encryption matrix (18), feature combinations incl. DVR+iframes+DRM+steering+dual-format (30), lifecycle phase transitions (18), edge cases & boundary conditions (21) |
-| `output_integrity` | 21 | Rewritten segment ISOBMFF structure validation (all 4 encryption lanes), mdat/trun size consistency, encrypt-decrypt plaintext recovery, I-frame BYTERANGE chunk validation (pre/post rewrite), init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame), cache-control body invariants (manifest body unchanged with overrides, AwaitingFirstSegment safety) |
+| `output_integrity` | 25 | Rewritten segment ISOBMFF structure validation (all 4 encryption lanes), mdat/trun size consistency, encrypt-decrypt plaintext recovery, I-frame BYTERANGE chunk validation (pre/post rewrite), init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame), cache-control body invariants (manifest body unchanged with overrides, AwaitingFirstSegment safety), TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip |
 | `wasm_binary_size` | 5 | Per-feature WASM binary size guards (base ≤720 KB, JIT ≤750 KB, full excl. TS ≤750 KB, TS ≤800 KB, full incl. TS ≤850 KB) with function count reporting |
 
 All tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data programmatically — no external test media files needed. Multi-key tests use separate video/audio KIDs and keys to verify per-track tenc, multi-KID PSSH, and TrackKeyMapping behavior.
 
-> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare,ts` to include all 1,515 tests. Without optional features: 1,379 tests.
+> **Note:** Some test suites require feature flags. Run with `--features jit,cloudflare,ts` to include all 1,603 tests. Without optional features: 1,379 tests.
 
 #### JIT Latency Benchmarks
 
@@ -299,12 +300,15 @@ GET /repackage/{content_id}/{format}/manifest
 GET /repackage/{content_id}/{format}/init.mp4
 GET /repackage/{content_id}/{format}/segment_{n}.{ext}
 GET /repackage/{content_id}/{format}/iframes
+GET /repackage/{content_id}/{format}/key
 ```
 
 - `{content_id}` — unique content identifier
 - `{format}` — `hls`, `dash`, or scheme-qualified: `hls_cenc`, `hls_cbcs`, `dash_cenc`, `dash_cbcs`, `hls_none`, `dash_none`
 - `{n}` — segment number (0-indexed)
 - `{ext}` — any CMAF or ISOBMFF segment extension (see [Supported Segment Extensions](#supported-segment-extensions))
+
+The `/key` endpoint serves the raw 16-byte AES-128 key for HLS-TS `#EXT-X-KEY:METHOD=AES-128` URI. Only valid when the container format is TS and content is encrypted.
 
 The `/iframes` endpoint serves HLS I-frame-only playlists (`#EXT-X-I-FRAMES-ONLY`) for trick play (fast-forward/rewind scrubbing). These playlists use `#EXT-X-BYTERANGE` to reference byte ranges within existing segment files — no duplicate segment storage. For DASH, trick play is embedded in the regular MPD as a separate `<AdaptationSet>` with `<EssentialProperty>`. The iframes endpoint requires `enable_iframe_playlist: true` in the webhook payload.
 
@@ -359,7 +363,7 @@ Returns `200 OK` as soon as the first segment and live manifest are published pe
 - `format` — (backward compat) single string; used as fallback when `output_formats` is empty or absent. If both are present, `output_formats` takes precedence.
 - `target_schemes` — array of `"cenc"`, `"cbcs"`, and/or `"none"`. Defaults to `["cenc"]`. Each scheme produces independent init segments, media segments, and manifests with scheme-qualified cache keys.
 - `target_scheme` — (backward compat) single string; treated as `target_schemes: [value]`. If both are present, `target_schemes` takes precedence.
-- `container_format` — `cmaf` (default), `fmp4`, or `iso`.
+- `container_format` — `cmaf` (default), `fmp4`, `iso`, or `ts` (requires `ts` feature, HLS only — DASH+TS rejected).
 - `enable_iframe_playlist` — `true` to generate I-frame playlists for trick play (default: `false`). When enabled, HLS output includes an I-frame-only playlist at `/iframes` and `#EXT-X-I-FRAME-STREAM-INF` in the master playlist. DASH output includes a trick play `<AdaptationSet>`.
 - `cache_control` — (optional) per-request Cache-Control header overrides. All fields are optional; omitted fields use system defaults (env vars). Available fields:
   - `segment_max_age` — max-age for segments (default: `CACHE_MAX_AGE_SEGMENTS` or 31536000)
@@ -502,8 +506,9 @@ The output container format is configurable per request via the `container_forma
 | CMAF | Common Media Application Format (ISO 23000-19) | `.cmfv` (video), `.cmfa` (audio) | `.mp4` | `isom`, `iso6`, `cmfc` | includes `urn:mpeg:dash:profile:cmaf:2019` |
 | fMP4 | Fragmented MP4 (ISO 14496-12) | `.m4s` | `.mp4` | `isom`, `iso6` | `urn:mpeg:dash:profile:isoff-live:2011` only |
 | ISO BMFF | ISO Base Media File Format (ISO 14496-12) | `.mp4` | `.mp4` | `isom`, `iso6` | `urn:mpeg:dash:profile:isoff-live:2011` only |
+| TS | MPEG Transport Stream (`ts` feature) | `.ts` | N/A (no init) | N/A | HLS only (DASH unsupported) |
 
-The init segment's `ftyp` box is rewritten to match the target container format. All three formats are structurally identical fragmented MP4, differing in ftyp brands, segment extensions, and DASH profile signaling.
+The init segment's `ftyp` box is rewritten to match the target container format (CMAF/fMP4/ISO). TS output has no init segment — PAT/PMT tables are embedded in each TS segment. TS uses AES-128-CBC whole-segment encryption (`#EXT-X-KEY:METHOD=AES-128`) instead of per-sample CENC/CBCS.
 
 ### Supported Segment Extensions
 
@@ -518,6 +523,7 @@ The route handler accepts all standard CMAF and ISOBMFF segment extensions. The 
 | `.m4s` | ISO 14496-12 (ISOBMFF) | Media segment | fMP4 output default |
 | `.mp4` | ISO 14496-12 (ISOBMFF) | Generic container | ISO BMFF output default; also used for all init segments |
 | `.m4a` | ISO 14496-12 (ISOBMFF) | Audio container | ISOBMFF audio-only |
+| `.ts` | ISO 13818-1 (MPEG-TS) | Transport stream | TS output (`ts` feature) |
 
 Input parsing is extension-agnostic — the parsers fetch whatever URL the source manifest specifies.
 
@@ -583,7 +589,7 @@ sandbox/output/{content_id}/{format}_{scheme}/
 ├── manifest.m3u8   (or manifest.mpd)
 ├── iframes.m3u8    (HLS only, when enable_iframe_playlist=true)
 ├── init.mp4
-├── segment_0.cmfv  (or .m4s or .mp4)
+├── segment_0.cmfv  (or .m4s or .mp4 or .ts)
 ├── segment_1.cmfv
 └── ...
 ```
@@ -601,11 +607,11 @@ For dual-scheme output, each scheme gets its own directory (e.g., `hls_cenc/` an
 
 ## Project Status
 
-The runtime is fully implemented and compiles to a ~692 KB WASM component that instantiates in under 1 ms — production-ready for JIT packaging at the edge. All P0 and P1 phases are complete. All nine encryption scheme combinations, three container formats, dual-format output (simultaneous HLS + DASH sharing format-agnostic segments), dual-scheme output, multi-key DRM with per-track keying, subtitle/text track pass-through, SCTE-35 ad marker pass-through, codec/scheme compatibility validation, advanced DRM (ClearKey, raw key mode, key rotation, clear lead), low-latency streaming (LL-HLS partial segments, LL-DASH), trick play (HLS I-frame playlists, DASH trick play AdaptationSets), MPEG-TS input (feature-gated TS demux + CMAF transmux), and configurable cache-control headers (env var defaults, per-request overrides, safety invariants) are supported. The WASI component handles HTTP routing, source manifest parsing (HLS/DASH/HLS-TS), JIT on-demand packaging with request coalescing, DRM key acquisition (SPEKE 2.0 with multi-KID CPIX, ClearKey, or raw keys), codec string extraction, per-track init segment rewriting, segment re-encryption, I-frame detection and trick play manifest generation, SCTE-35 ad break signaling (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `EventStream`), subtitle pass-through with manifest signaling (HLS rendition groups, DASH AdaptationSets, CEA-608/708 captions), and progressive manifest output with codec signaling. Split execution via self-invocation chaining processes segments within WASI memory limits. Portable across any CDN supporting WASI Preview 2 — multiple cache backends are supported (Redis HTTP, Cloudflare Workers KV, generic HTTP KV).
+The runtime is fully implemented and compiles to a ~692 KB WASM component that instantiates in under 1 ms — production-ready for JIT packaging at the edge. All P0 and P1 phases are complete. All nine encryption scheme combinations, four container formats (CMAF, fMP4, ISO BMFF, MPEG-TS), dual-format output (simultaneous HLS + DASH sharing format-agnostic segments), dual-scheme output, multi-key DRM with per-track keying, subtitle/text track pass-through, SCTE-35 ad marker pass-through, codec/scheme compatibility validation, advanced DRM (ClearKey, raw key mode, key rotation, clear lead), low-latency streaming (LL-HLS partial segments, LL-DASH), trick play (HLS I-frame playlists, DASH trick play AdaptationSets), MPEG-TS input (feature-gated TS demux + CMAF transmux), MPEG-TS output (feature-gated CMAF→TS muxer with AES-128-CBC encryption, HLS-TS manifests), and configurable cache-control headers (env var defaults, per-request overrides, safety invariants) are supported. The WASI component handles HTTP routing, source manifest parsing (HLS/DASH/HLS-TS), JIT on-demand packaging with request coalescing, DRM key acquisition (SPEKE 2.0 with multi-KID CPIX, ClearKey, or raw keys), codec string extraction, per-track init segment rewriting, segment re-encryption, I-frame detection and trick play manifest generation, SCTE-35 ad break signaling (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `EventStream`), subtitle pass-through with manifest signaling (HLS rendition groups, DASH AdaptationSets, CEA-608/708 captions), and progressive manifest output with codec signaling. Split execution via self-invocation chaining processes segments within WASI memory limits. Portable across any CDN supporting WASI Preview 2 — multiple cache backends are supported (Redis HTTP, Cloudflare Workers KV, generic HTTP KV).
 
 ## Roadmap
 
-Phases 1–14, 16, 17, 19, and 21 are complete. All P0 and P1 items are done. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. See [`docs/roadmap.md`](docs/roadmap.md) for detailed phase descriptions.
+Phases 1–14, 16, 17, 19, 21, and 22 are complete. All P0 and P1 items are done. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. See [`docs/roadmap.md`](docs/roadmap.md) for detailed phase descriptions.
 
 ## License
 

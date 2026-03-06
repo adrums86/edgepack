@@ -126,7 +126,7 @@ graph TD
     end
 
     subgraph Core["Core Modules"]
-        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>codec + language extraction<br/>chunk boundary detection<br/>TS demux + transmux (ts feature)<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
+        Media["media/<br/>ISOBMFF parser<br/>ContainerFormat<br/>codec + language extraction<br/>chunk boundary detection<br/>TS demux + transmux (ts feature)<br/>TS mux (ts feature)<br/>init rewrite (ftyp+sinf)<br/>segment rewrite"]
         DRMMod["drm/<br/>EncryptionScheme<br/>SampleDecryptor/Encryptor<br/>SPEKE client + CPIX XML<br/>CBCS decrypt+encrypt<br/>CENC encrypt+decrypt<br/>ClearKey PSSH builder"]
         Manifest["manifest/<br/>HLS renderer (incl. LL-HLS)<br/>DASH renderer (incl. LL-DASH)<br/>HLS input parser<br/>DASH input parser<br/>Subtitle/CEA signaling"]
         CacheMod2["cache/<br/>CacheBackend trait<br/>EncryptedCacheBackend<br/>Redis HTTP / TCP<br/>Cloudflare KV / HTTP KV<br/>In-memory (sandbox)"]
@@ -453,7 +453,7 @@ flowchart TD
 | Feature | Description |
 |---------|-------------|
 | **Configurable Encryption** | Transforms between CBCS ↔ CENC in any direction; target scheme configurable per request |
-| **Configurable Container Format** | Output as CMAF (`.cmfv`, `cmfc` brand) or fMP4 (`.m4s`); ftyp rewriting, dynamic DASH profiles |
+| **Configurable Container Format** | Output as CMAF (`.cmfv`, `cmfc` brand), fMP4 (`.m4s`), or TS (`.ts`, HLS-only); ftyp rewriting, dynamic DASH profiles |
 | **Source Scheme Auto-Detection** | Detects source encryption from init segment `schm` box or manifest DRM signaling |
 | **Trait-Based Crypto Dispatch** | `SampleDecryptor`/`SampleEncryptor` traits with factory functions for scheme-agnostic pipeline |
 | **Progressive Output** | Clients can begin playback as soon as the first segment is ready |
@@ -474,10 +474,11 @@ flowchart TD
 | **LL-HLS** | Low-Latency HLS with partial segments (`#EXT-X-PART`), server control (`#EXT-X-SERVER-CONTROL`), CMAF chunk boundary detection, HLS version 9 |
 | **LL-DASH** | Low-Latency DASH with `availabilityTimeOffset` and `availabilityTimeComplete` on `<SegmentTemplate>` |
 | **MPEG-TS Input** | TS demuxer (PAT/PMT/PES, H.264/AAC), TS-to-CMAF transmuxer (Annex B→AVCC, init synthesis), AES-128 segment decryption. Feature-gated (`ts` feature) |
+| **MPEG-TS Output** | CMAF-to-TS muxer (AVCC→Annex B, raw AAC→ADTS, PAT/PMT/PES packetization), AES-128-CBC whole-segment encryption, HLS-TS manifests (`METHOD=AES-128`, no `#EXT-X-MAP`), key delivery endpoint. Feature-gated (`ts` feature) |
 | **Trick Play** | HLS `#EXT-X-I-FRAMES-ONLY` playlists with `#EXT-X-BYTERANGE` into existing segments, `#EXT-X-I-FRAME-STREAM-INF` in master. DASH trick play `<AdaptationSet>` with `<EssentialProperty>` trickmode. I-frame detection from CMAF chunk boundaries — no duplicate storage |
 | **Dual-Format Output** | Simultaneous HLS + DASH from a single request sharing format-agnostic segments. `output_formats: ["hls", "dash"]` produces both manifest types referencing the same cached segments — no duplicate encryption or storage |
 | **Per-Feature Binary Size Guards** | 5 tests enforce size limits per build variant (base ≤720 KB, JIT ≤750 KB, full ≤750 KB, ts ≤800 KB, full+ts ≤850 KB). Binary size is the primary cold start proxy — every KB matters for JIT latency |
-| **Zero External Test Dependencies** | All 1,410 tests (1,331 without `ts` feature) use synthetic CMAF fixtures — no network or media files needed |
+| **Zero External Test Dependencies** | All 1,603 tests (1,437 without `ts` feature) use synthetic CMAF fixtures — no network or media files needed |
 | **CDN-Portable WASM** | Entire runtime compiles to `wasm32-wasip2` — runs on any CDN with WASI P2 support (Cloudflare Workers, Fastly Compute, wasmtime on Lambda, Akamai EdgeCompute). No CDN-specific APIs, no vendor lock-in |
 
 ## Inputs and Outputs
@@ -492,7 +493,7 @@ flowchart TD
 | **Input** | DRM content keys | CPIX XML (SPEKE 2.0) | HTTP POST to license server |
 | **Output** | Repackaged manifest | HLS `.m3u8` or DASH `.mpd` (target-scheme DRM signaling, format-aware profiles) | HTTP GET via CDN |
 | **Output** | Repackaged init segment | CMAF or fMP4 (target-scheme schm/tenc/pssh, target-format ftyp brands, DRM systems per scheme) | HTTP GET via CDN |
-| **Output** | Repackaged media segments | CMAF `.cmfv` or fMP4 `.m4s` (target-scheme encrypted mdat) | HTTP GET via CDN |
+| **Output** | Repackaged media segments | CMAF `.cmfv`, fMP4 `.m4s`, or TS `.ts` (target-scheme encrypted) | HTTP GET via CDN |
 | **Output** | Job status | JSON | HTTP GET via CDN |
 
 ---
@@ -601,6 +602,16 @@ flowchart TD
 - Request handlers try format-agnostic keys first, fall back to legacy format-qualified keys
 - Combinatorial output: `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs
 
+### ~~Phase 22: MPEG-TS Output~~ ✅ Complete
+- Feature-gated: behind existing `#[cfg(feature = "ts")]` gate (same as TS input)
+- `ContainerFormat::Ts` variant — `.ts` extension, `is_isobmff()` returns false, no init segment, HLS-only (DASH+TS rejected)
+- TS muxer (`src/media/ts_mux.rs`): CMAF moof/mdat → 188-byte TS packets (AVCC→Annex B, raw AAC→ADTS, PAT/PMT/PES)
+- AES-128-CBC whole-segment encryption (`encrypt_ts_segment()` — reverse of Phase 10's `decrypt_ts_segment()`)
+- HLS manifest: no `#EXT-X-MAP`, `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"`, `#EXT-X-VERSION:3`, `.ts` segment URIs
+- Key delivery endpoint: `GET /repackage/{id}/{format}/key` serves raw 16-byte AES key
+- Pipeline: `TsMuxConfig` extracted from init segment, cached in `ContinuationParams`, segments muxed via `mux_to_ts()`
+- Validation: TS+DASH rejected, webhook accepts `"ts"` as container_format
+
 ## Planned Architecture Extensions
 
 All P0 and P1 items are complete. Remaining phases are P2. See [`roadmap.md`](roadmap.md) for details.
@@ -616,6 +627,7 @@ graph TB
     subgraph ContainerFormat["ContainerFormat Enum"]
         CMAF["CMAF<br/>(Common Media Application Format)"]
         FMP4["fMP4<br/>(Fragmented MP4)"]
+        TS["TS<br/>(MPEG Transport Stream)<br/>(ts feature)"]
     end
 
     subgraph CMAF_Props["CMAF Properties"]
@@ -647,8 +659,17 @@ graph TB
         Cont["ContinuationParams<br/>.container_format<br/>(serialized to Redis)"]
     end
 
+    subgraph TS_Props["TS Properties"]
+        style TS_Props fill:#5B21B6,stroke:#8B5CF6,color:#F9FAFB
+        TS_Brands["Compatible Brands:<br/>N/A (not ISOBMFF)"]
+        TS_SegExt["Segment Extension:<br/>.ts"]
+        TS_Profile["DASH Profile:<br/>N/A (HLS only)"]
+        TS_Enc["Encryption:<br/>AES-128-CBC whole-segment<br/>#EXT-X-KEY:METHOD=AES-128"]
+    end
+
     CMAF --> CMAF_Props
     FMP4 --> FMP4_Props
+    TS --> TS_Props
 
     Req --> Init
     Req --> Cont
@@ -656,5 +677,5 @@ graph TB
     Prog --> Dash
 
     classDef enum fill:#1F2937,stroke:#F59E0B,color:#F9FAFB
-    class CMAF,FMP4 enum
+    class CMAF,FMP4,TS enum
 ```

@@ -12,7 +12,7 @@ These two priorities govern all development decisions:
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~692 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, webhook override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~692 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, webhook override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
 
 ## Build Commands
 
@@ -71,11 +71,12 @@ src/
 │   ├── chunk.rs        CMAF chunk boundary detection for LL-HLS parts
 │   ├── codec.rs        Codec string extraction, track metadata parsing, TrackKeyMapping
 │   ├── compat.rs       Codec/scheme compatibility validation, HDR detection, init/segment structure checks
-│   ├── container.rs    ContainerFormat enum (Cmaf/Fmp4) — brands, extensions, profiles
+│   ├── container.rs    ContainerFormat enum (Cmaf/Fmp4/Ts) — brands, extensions, profiles
 │   ├── init.rs         Init segment rewriting (sinf/schm/tenc/pssh + ftyp brand rewriting, per-track keying)
 │   ├── scte35.rs       SCTE-35 splice_info_section parser (splice_insert, time_signal)
 │   ├── segment.rs      Media segment rewriting (senc/mdat decrypt+re-encrypt)
 │   ├── ts.rs           MPEG-TS demuxer — PAT/PMT/PES parsing, AES-128 decryption (ts feature)
+│   ├── ts_mux.rs       CMAF-to-TS muxer — AVCC→Annex B, ADTS, PAT/PMT/PES, AES-128 encryption (ts feature)
 │   └── transmux.rs     TS-to-CMAF transmuxer — Annex B→AVCC, init synthesis (ts feature)
 ├── manifest/           Manifest parsing (input) and rendering (output)
 │   ├── mod.rs          render_manifest() + render_iframe_manifest() dispatchers
@@ -128,16 +129,17 @@ Init segments have a corresponding four-way dispatch:
 
 ### Container Format
 
-The output container format is configurable via `ContainerFormat` enum (`Cmaf`, `Fmp4`, or `Iso`):
+The output container format is configurable via `ContainerFormat` enum (`Cmaf`, `Fmp4`, `Iso`, or `Ts`):
 - **CMAF** (default): Compatible brands include `cmfc`, segment extensions are `.cmfv`/`.cmfa`, DASH profile includes `cmaf:2019`
 - **fMP4**: No `cmfc` brand, segment extension is `.m4s`, DASH profile is `isoff-live:2011` only
 - **ISO BMFF**: No `cmfc` brand, segment extension is `.mp4`, DASH profile is `isoff-live:2011` only (same brands/profiles as fMP4, different extension)
-- All formats use `.mp4` for init segments and `video/mp4`/`audio/mp4` MIME types
-- The `ftyp` box in init segments is rewritten to match the target format's brands
+- **TS** (`ts` feature): MPEG-TS output (`.ts` extension), HLS-only (DASH+TS rejected at validation), no init segment (PAT/PMT embedded in each segment), AES-128-CBC whole-segment encryption via `#EXT-X-KEY:METHOD=AES-128`, `is_isobmff()` returns false
+- CMAF/fMP4/ISO formats use `.mp4` for init segments and `video/mp4`/`audio/mp4` MIME types
+- The `ftyp` box in init segments is rewritten to match the target format's brands (not applicable for TS)
 - `ContainerFormat` flows through `RepackageRequest` → `ContinuationParams` → `ManifestState` → `ProgressiveOutput`
 - Segment URIs are built dynamically using `container_format.video_segment_extension()`
-- DASH renderer uses `container_format.dash_profiles()` for MPD `@profiles` attribute
-- Route handler accepts all 7 CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions: `.cmfv`, `.cmfa`, `.cmft`, `.cmfm`, `.m4s`, `.mp4`, `.m4a`
+- DASH renderer uses `container_format.dash_profiles()` for MPD `@profiles` attribute (panics for TS — DASH not supported)
+- Route handler accepts all 7 CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions plus `.ts`: `.cmfv`, `.cmfa`, `.cmft`, `.cmfm`, `.m4s`, `.mp4`, `.m4a`, `.ts`
 - Extensions not in scope: `.aac` (raw ADTS, not ISOBMFF), `.m4v`/`.3gp`/`.mov` (progressive-only)
 
 ### Progressive Manifest Output
@@ -261,6 +263,24 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **HLS-TS detection:** The HLS input parser detects TS sources by `.ts` segment extension, parses `#EXT-X-KEY:METHOD=AES-128` with URI and IV, and relaxes the `#EXT-X-MAP` requirement (TS sources don't have init segments — they're synthesized by the transmuxer).
 
+### MPEG-TS Output (Phase 22)
+
+**Feature-gated:** Behind existing `#[cfg(feature = "ts")]` — same gate as TS input. Zero impact on non-TS builds.
+
+**TS muxer** (`media/ts_mux.rs`): Converts CMAF moof/mdat segments to 188-byte MPEG-TS packets. Extracts samples from trun/mdat, converts video AVCC→Annex B (prepends SPS/PPS before IDR frames), converts raw AAC→ADTS (7-byte headers), builds PAT/PMT tables, wraps in PES packets with PTS/DTS timestamps, and packetizes into TS packets with continuity counters and stuffing.
+
+**TsMuxConfig:** Extracted from the source init segment via `extract_mux_config()` — contains SPS/PPS, AAC config (profile, sample rate index, channel count), and timescales. Cached in `ContinuationParams` for split execution persistence.
+
+**AES-128 encryption:** `encrypt_ts_segment()` performs whole-segment AES-128-CBC encryption with PKCS7 padding — the reverse of `decrypt_ts_segment()` in ts.rs. IV is derived from segment number as a 128-bit big-endian integer.
+
+**HLS manifest changes for TS:** No `#EXT-X-MAP` tag (TS segments are self-contained), `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` instead of SAMPLE-AES/SAMPLE-AES-CTR, `#EXT-X-VERSION:3` (lower compat than CMAF's v7), `.ts` segment extensions.
+
+**Key delivery:** `GET /repackage/{id}/{format}/key` endpoint serves raw 16-byte AES key for HLS-TS `#EXT-X-KEY` URI. Only valid when container format is TS and content is encrypted.
+
+**Pipeline integration:** After decrypting source segments to clear CMAF, the pipeline calls `mux_to_ts()` instead of re-encrypting as CMAF. `TsMuxConfig` is extracted once from the init segment and reused for all segments. No init segment is produced for TS output.
+
+**Validation:** `ContainerFormat::Ts` + `OutputFormat::Dash` is rejected at webhook validation — DASH does not support TS segments.
+
 ### Dual-Format Output (Phase 21)
 
 **Core insight:** CMAF/fMP4 segments are format-agnostic — the same encrypted bytes serve both HLS and DASH. Only manifests differ between formats.
@@ -308,7 +328,7 @@ The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses
 [features]
 jit = []                  # Phase 8: JIT on-demand packaging
 cloudflare = []           # Phase 17: Cloudflare Workers KV cache backend
-ts = []                   # Phase 10: MPEG-TS input demuxer + transmuxer
+ts = []                   # Phases 10+22: MPEG-TS input (demux + transmux) and output (CMAF→TS mux)
 sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
 ```
 
@@ -353,7 +373,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,436 tests** total (with `--features jit,cloudflare`): 924 unit tests and 512 integration tests. With `--features jit,cloudflare,ts`: **1,515 tests** (971 unit + 544 integration). Without optional features: **1,379 tests**. All run on the native host target.
+The project has **1,437 tests** total (with `--features jit,cloudflare`): 924 unit tests and 513 integration tests. With `--features jit,cloudflare,ts`: **1,603 tests** (971 unit + 632 integration). Without optional features: **1,379 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -373,7 +393,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 - **Serde roundtrips** for all serializable types (config, manifest state, job status, DRM keys, webhook payloads, encryption schemes, container formats, continuation params)
 - **Encryption scheme abstraction**: `EncryptionScheme` enum (serde roundtrips, scheme_type_bytes, from_scheme_type, HLS method strings, default IV sizes, default patterns, FairPlay support flags, `is_encrypted()` for None variant), `SampleDecryptor`/`SampleEncryptor` trait dispatch via factory functions
-- **Container format abstraction**: `ContainerFormat` enum with three variants (Cmaf, Fmp4, Iso) — extensions, brands, ftyp box building, DASH profile strings, serde roundtrips, display, from_str_value parsing
+- **Container format abstraction**: `ContainerFormat` enum with four variants (Cmaf, Fmp4, Iso, Ts) — extensions, brands, ftyp box building, DASH profile strings, `is_isobmff()`, serde roundtrips, display, from_str_value parsing
 - **Encryption correctness**: CBCS decrypt + encrypt, CENC encrypt + decrypt, scheme-agnostic roundtrips through factory functions
 - **ISOBMFF box parsing**: Building binary boxes, parsing them back, verifying headers, payloads, and child iteration
 - **Init segment rewriting**: Scheme-parameterized `schm`/`tenc`/`pssh` rewriting (CBCS and CENC targets, tenc pattern encoding, PSSH filtering per scheme, per-track KID assignment via TrackKeyMapping, multi-KID PSSH v1 generation), ftyp brand rewriting per container format (CMAF includes `cmfc`, fMP4 does not), clear→encrypted sinf injection (`create_protection_info`), encrypted→clear sinf stripping (`strip_protection_info`), clear→clear ftyp-only rewrite (`rewrite_ftyp_only`)
@@ -386,13 +406,13 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through ContinuationParams, TrackKeyMapping construction and serialization, variant building from track metadata
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
-- **HTTP routing**: Path parsing, format validation, segment number extraction (all 7 CMAF/ISOBMFF extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a), all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme/target_schemes parsing (cenc/cbcs/none, backward compat, duplicate rejection), output_formats parsing (hls/dash, backward compat, duplicate rejection), container_format parsing (cmaf/fmp4/iso), enable_iframe_playlist parsing, invalid scheme/format rejection, serde roundtrips
+- **HTTP routing**: Path parsing, format validation, segment number extraction (all 8 extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a, .ts), all route dispatching
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme/target_schemes parsing (cenc/cbcs/none, backward compat, duplicate rejection), output_formats parsing (hls/dash, backward compat, duplicate rejection), container_format parsing (cmaf/fmp4/iso/ts), enable_iframe_playlist parsing, invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgepackError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (544 with all features incl. ts)
+### Integration Tests (632 with all features incl. ts)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -408,7 +428,7 @@ tests/
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
 ├── jit_packaging.rs           27 tests: JIT source config, on-demand setup, lock contention, backward compat (jit feature)
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
-├── handler_integration.rs    32 tests: HTTP routing (all 7 CMAF/ISOBMFF segment extensions), webhook validation, response helpers
+├── handler_integration.rs    32 tests: HTTP routing (all 8 segment extensions incl. .ts), webhook validation, response helpers
 ├── multi_key.rs              12 tests: per-track tenc, multi-KID PSSH, single-key backward compat, codec extraction, TrackKeyMapping serde, create→strip roundtrip
 ├── conformance.rs            23 tests: init/media segment structure validation, roundtrip conformance, manifest conformance
 ├── scte35_integration.rs     13 tests: emsg extraction, SCTE-35 parsing, HLS/DASH ad rendering, source manifest roundtrip, serde
@@ -420,7 +440,8 @@ tests/
 ├── cache_control.rs          43 tests: system defaults (HLS/DASH, all phases), per-request overrides (live/final/segment max-age, s-maxage split, immutable toggle), safety invariants, progressive output integration (HLS + DASH), backward compat, DVR + cache control, container format + cache control, system CacheConfig overrides, DASH per-request overrides, segment handler design documentation, JIT cache_control:None documentation
 ├── e2e.rs                   105 tests: full pipeline E2E — encryption transforms ×2 formats (18), container×format×encryption matrix (18), feature combinations incl. DVR+iframes+DRM+steering+dual-format (30), lifecycle phase transitions (18), edge cases & boundary conditions (21)
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
-├── output_integrity.rs       21 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants
+├── ts_output.rs              46 tests: ContainerFormat::Ts (serde, extension, validation), HLS-TS manifest (no EXT-X-MAP, VERSION:3, AES-128 KEY, .ts URIs), TS muxer (PAT/PMT/PES roundtrip, AVCC↔AnnexB, ADTS, encryption), webhook TS acceptance/rejection, key endpoint routing, handler routing (ts feature)
+├── output_integrity.rs       25 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants, TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip
 └── wasm_binary_size.rs        5 tests: per-feature WASM binary size guards (base, jit, full, ts, full+ts)
 ```
 
@@ -496,7 +517,8 @@ Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mo
 | GET | `/repackage/{id}/{format}/manifest` | `request::handle_manifest_request` | Serve repackaged manifest |
 | GET | `/repackage/{id}/{format}/init.mp4` | `request::handle_init_segment_request` | Serve repackaged init segment |
 | GET | `/repackage/{id}/{format}/iframes` | `request::handle_iframe_manifest_request` | Serve HLS I-frame playlist (DASH returns 404 — trick play embedded in MPD) |
-| GET | `/repackage/{id}/{format}/segment_{n}.{ext}` | `request::handle_media_segment_request` | Serve repackaged media segment (accepts all 7 CMAF/ISOBMFF extensions) |
+| GET | `/repackage/{id}/{format}/key` | `request::handle_key_request` | Serve raw AES-128 key for HLS-TS `#EXT-X-KEY` (TS container only) |
+| GET | `/repackage/{id}/{format}/segment_{n}.{ext}` | `request::handle_media_segment_request` | Serve repackaged media segment (accepts all 8 extensions incl. `.ts`) |
 | POST | `/webhook/repackage` | `webhook::handle_repackage_webhook` | Trigger proactive repackaging (returns 200 after first manifest) |
 | POST | `/webhook/repackage/continue` | `webhook::handle_continue` | Internal self-invocation to process remaining segments |
 | GET | `/status/{id}/{format}` | `request::handle_status_request` | Query job progress |
@@ -637,4 +659,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Refactoring Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, and 21 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 20 (Multi-Source Manifest Merging). P3: 22 (TS Segment Output), 23 (MoQ Ingest — feature-gated, requires research).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, and 22 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 20 (Multi-Source Manifest Merging). P3: 23 (MoQ Ingest — feature-gated, requires research).

@@ -20,10 +20,11 @@
 | 17 | CDN Provider Adapters & Binary Optimization | ✅ |
 | 19 | Configurable Cache-Control Headers | ✅ |
 | 21 | Generic HLS/DASH Pipeline (Dual-Format) | ✅ |
+| 22 | TS Segment Output (feature-gated) | ✅ |
 
 # Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, 19, and 21 are complete. All P0 and P1 items are done. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, 19, 21, and 22 are complete. All P0 and P1 items are done. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -266,9 +267,18 @@ cargo build --release --features jit,cloudflare # All features (excl. TS)
 cargo build --release --features jit,cloudflare,ts # All features (incl. TS input)
 ```
 
-### Phase 22: TS Segment Output — P3
-- CMAF-to-TS muxer, HLS-TS manifests, AES-128 segment encryption
-- New: `src/media/ts_mux.rs`
+### ~~Phase 22: TS Segment Output~~ ✅ Complete
+- CMAF-to-TS muxer (`src/media/ts_mux.rs`): extract samples from CMAF moof/mdat, convert AVCC→Annex B (H.264), raw AAC→ADTS, build PAT/PMT/PES, packetize into 188-byte TS packets
+- `ContainerFormat::Ts` variant behind `#[cfg(feature = "ts")]` — `.ts` extension, no init segment (PAT/PMT embedded in each segment), HLS-only (DASH+TS rejected at validation)
+- AES-128-CBC whole-segment encryption (`encrypt_ts_segment()`) — reverse of Phase 10's `decrypt_ts_segment()`
+- HLS manifest rendering: no `#EXT-X-MAP` tag, `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` instead of SAMPLE-AES/SAMPLE-AES-CTR, `#EXT-X-VERSION:3`, `.ts` segment URIs
+- Key delivery endpoint: `GET /repackage/{id}/{format}/key` serves raw 16-byte AES key for HLS-TS `#EXT-X-KEY` URI
+- Pipeline integration: `TsMuxConfig` extracted from init segment and cached in `ContinuationParams`, segments muxed via `mux_to_ts()` then optionally encrypted
+- Webhook validation: accepts `"ts"` as `container_format`, rejects TS+DASH combination
+- Sandbox UI: TS container format option, `.ts` output files, no `init.mp4` for TS
+- All code behind existing `#[cfg(feature = "ts")]` gate — zero impact on non-TS builds
+- New: `src/media/ts_mux.rs`, `tests/ts_output.rs` (46 integration tests), 4 new output integrity tests
+- Result: 1,603 tests total with `--features jit,cloudflare,ts` (88 new TS output tests)
 
 ### Phase 23: MoQ Ingest — P3 (feature-gated, requires research)
 
@@ -385,6 +395,6 @@ This phase requires significant research and prototyping before implementation b
 - [ ] **E2E encryption interop:** Understand how MoQ Secure Objects (SFrame) interacts with edgepack's DRM encryption — potential double-encryption or key management complexity
 - [ ] **Live-to-VOD with MoQ:** Design how MoQ's group-based delivery maps to edgepack's `ManifestPhase` state machine (AwaitingFirstSegment → Live → Complete)
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18, 20) are P2, Phases 22–23 are P3.
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18, 20) are P2, Phase 23 is P3.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`
