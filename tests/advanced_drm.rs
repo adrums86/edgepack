@@ -72,7 +72,7 @@ fn repackage_request_with_all_advanced_drm_fields() {
     let req = RepackageRequest {
         content_id: "adv-drm-1".into(),
         source_url: "https://example.com/src.m3u8".into(),
-        output_format: OutputFormat::Hls,
+        output_formats: vec![OutputFormat::Hls],
         target_schemes: vec![EncryptionScheme::Cenc],
         container_format: ContainerFormat::Cmaf,
         key_ids: vec![],
@@ -256,7 +256,7 @@ fn manifest_state_backward_compat_no_rotation_fields() {
 
 #[test]
 fn repackage_request_backward_compat_no_advanced_fields() {
-    let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
+    let json = r#"{"content_id":"test","source_url":"https://example.com","output_formats":["Hls"],"key_ids":[]}"#;
     let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
     assert!(parsed.raw_keys.is_empty());
     assert!(parsed.key_rotation.is_none());
@@ -279,7 +279,7 @@ fn clearkey_combined_with_widevine() {
     let req = RepackageRequest {
         content_id: "combo".into(),
         source_url: "https://example.com/src.m3u8".into(),
-        output_format: OutputFormat::Hls,
+        output_formats: vec![OutputFormat::Hls],
         target_schemes: vec![EncryptionScheme::Cenc],
         container_format: ContainerFormat::Cmaf,
         key_ids: vec![],

@@ -287,7 +287,7 @@ fn repackage_request_cache_control_serde_roundtrip() {
     let req = RepackageRequest {
         content_id: "cc-test".into(),
         source_url: "https://example.com/src.m3u8".into(),
-        output_format: OutputFormat::Hls,
+        output_formats: vec![OutputFormat::Hls],
         target_schemes: vec![EncryptionScheme::Cenc],
         container_format: ContainerFormat::default(),
         key_ids: vec![],
@@ -318,7 +318,7 @@ fn repackage_request_cache_control_serde_roundtrip() {
 
 #[test]
 fn repackage_request_no_cache_control_backward_compat() {
-    let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
+    let json = r#"{"content_id":"test","source_url":"https://example.com","output_formats":["Hls"],"key_ids":[]}"#;
     let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
     assert!(parsed.cache_control.is_none());
 }

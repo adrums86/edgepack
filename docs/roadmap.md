@@ -19,10 +19,11 @@
 | 16 | Compatibility Validation & Hardening | ✅ |
 | 17 | CDN Provider Adapters & Binary Optimization | ✅ |
 | 19 | Configurable Cache-Control Headers | ✅ |
+| 21 | Generic HLS/DASH Pipeline (Dual-Format) | ✅ |
 
 # Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, and 19 are complete. All P0 and P1 items are done. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, 19, and 21 are complete. All P0 and P1 items are done. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -165,7 +166,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Criterion benchmarks (`benches/jit_latency.rs`): segment rewrite latency (CBCS→CENC, clear→CENC, passthrough at 4/32/128 samples), init rewrite latency, manifest render/parse latency (HLS/DASH at varying segment counts)
 
 ### Phase 18: Binary Size Monitoring & Selective Feature Gating — P2
-The current binary (~648 KB base, ~685 KB full) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
+The current binary (~692 KB base, ~730 KB full) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
 
 **Policy:** Monitor binary size as new features land. Feature-gate only when a phase introduces a **heavy new dependency or parser** that meaningfully increases the binary (50+ KB). Existing examples of this approach:
 - `ts` feature (Phase 10): MPEG-TS demuxer + transmuxer adds a substantial new parser — feature-gated to keep it out of builds that don't need TS input
@@ -212,14 +213,17 @@ The current binary (~648 KB base, ~685 KB full) is well within cold start budget
 - Sandbox UI: multi-URL input field for testing merged output
 - New: `src/manifest/merge.rs` for manifest merging logic
 
-### Phase 21: Generic HLS/DASH Pipeline — P2
-- Ensure the HLS and DASH pipelines (input and output) are generic, meaning the manifests may differ fundamentally but the segments they reference are the same
-- Currently each output format (HLS, DASH) has separate manifest rendering, but both formats can reference the same underlying CMAF/fMP4 segments
-- Goal: a single source can produce both HLS and DASH output simultaneously without re-fetching or re-encrypting segments — only the manifest layer differs
-- Segment cache keys should be format-agnostic where possible (init segments and media segments are identical across HLS and DASH for CMAF content)
-- Manifest state should cleanly separate format-specific fields (HLS playlist type, DASH MPD attributes) from shared state (segments, DRM info, content steering)
-- Dual-format output: a single webhook request with `output_formats: ["hls", "dash"]` produces both manifest types referencing the same cached segments
-- Reduces storage, processing time, and cache pressure for multi-format deployments
+### ~~Phase 21: Generic HLS/DASH Pipeline (Dual-Format)~~ ✅ Complete
+- Changed `RepackageRequest.output_format` to `output_formats: Vec<OutputFormat>` with backward-compatible webhook API (`format` singular still accepted, `output_formats` array takes precedence)
+- Format-agnostic segment cache keys: `ep:{id}:{scheme}:init` and `ep:{id}:{scheme}:seg:{n}` (no format prefix — segments are identical for HLS and DASH)
+- Per-format manifest state: `ep:{id}:{format}_{scheme}:manifest_state` stays format-qualified (manifests differ between HLS and DASH)
+- `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair
+- `execute_first()`/`execute_remaining()` encrypt segments once per scheme and store with format-agnostic keys, then build per-(format, scheme) manifest states
+- Request handlers try format-agnostic keys first, then fall back to legacy format-qualified keys for backward compatibility
+- Webhook API: `output_formats: ["hls", "dash"]` for dual-format, `format` (singular) for backward compat; `resolved_output_formats()` mirrors `resolved_target_schemes()` pattern
+- `target_formats` cached alongside `target_schemes` for continuation; cleaned up in `cleanup_sensitive_data()`
+- Dual-format + dual-scheme: `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs (HLS+CENC, HLS+CBCS, DASH+CENC, DASH+CBCS)
+- Result: 1,331 tests total (924 unit + 407 integration), including 25 new dual_format integration tests
 
 ### ~~Phase 16: Compatibility Validation & Hardening~~ ✅ Complete
 - Codec/scheme compatibility validation (`src/media/compat.rs`): VP9+CBCS error, HEVC+CENC subsample warning, AV1+CBCS warning, DV RPU warning, text track encryption error
@@ -381,6 +385,6 @@ This phase requires significant research and prototyping before implementation b
 - [ ] **E2E encryption interop:** Understand how MoQ Secure Objects (SFrame) interacts with edgepack's DRM encryption — potential double-encryption or key management complexity
 - [ ] **Live-to-VOD with MoQ:** Design how MoQ's group-based delivery maps to edgepack's `ManifestPhase` state machine (AwaitingFirstSegment → Live → Complete)
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18, 20, 21) are P2, Phases 22–23 are P3.
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18, 20) are P2, Phases 22–23 are P3.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

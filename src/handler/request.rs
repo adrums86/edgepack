@@ -59,13 +59,16 @@ pub fn handle_init_segment_request(
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
     let fmt = format_str(format);
-    let key = if let Some(s) = scheme {
-        CacheKeys::init_segment_for_scheme(content_id, fmt, s)
+
+    // Try format-agnostic key first (Phase 21+), then legacy format-qualified key
+    let data = if let Some(s) = scheme {
+        ctx.cache.get(&CacheKeys::init_segment_for_scheme_only(content_id, s))?
+            .or(ctx.cache.get(&CacheKeys::init_segment_for_scheme(content_id, fmt, s))?)
     } else {
-        CacheKeys::init_segment(content_id, fmt)
+        ctx.cache.get(&CacheKeys::init_segment(content_id, fmt))?
     };
 
-    match ctx.cache.get(&key)? {
+    match data {
         Some(data) => Ok(HttpResponse::ok_with_cache(
             data,
             "video/mp4",
@@ -104,13 +107,16 @@ pub fn handle_media_segment_request(
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
     let fmt = format_str(format);
-    let key = if let Some(s) = scheme {
-        CacheKeys::media_segment_for_scheme(content_id, fmt, s, segment_number)
+
+    // Try format-agnostic key first (Phase 21+), then legacy format-qualified key
+    let data = if let Some(s) = scheme {
+        ctx.cache.get(&CacheKeys::media_segment_for_scheme_only(content_id, s, segment_number))?
+            .or(ctx.cache.get(&CacheKeys::media_segment_for_scheme(content_id, fmt, s, segment_number))?)
     } else {
-        CacheKeys::media_segment(content_id, fmt, segment_number)
+        ctx.cache.get(&CacheKeys::media_segment(content_id, fmt, segment_number))?
     };
 
-    match ctx.cache.get(&key)? {
+    match data {
         Some(data) => Ok(HttpResponse::ok_with_cache(
             data,
             "video/mp4",

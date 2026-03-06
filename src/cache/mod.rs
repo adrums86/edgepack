@@ -112,6 +112,24 @@ impl CacheKeys {
         format!("ep:{content_id}:{format}:target_schemes")
     }
 
+    // --- Format-agnostic key builders (Phase 21: Generic HLS/DASH Pipeline) ---
+    // Segments are identical for HLS and DASH — only scheme affects bytes.
+
+    /// Rewritten init segment for a specific scheme (format-agnostic, shared across HLS/DASH).
+    pub fn init_segment_for_scheme_only(content_id: &str, scheme: &str) -> String {
+        format!("ep:{content_id}:{scheme}:init")
+    }
+
+    /// Rewritten media segment for a specific scheme (format-agnostic, shared across HLS/DASH).
+    pub fn media_segment_for_scheme_only(content_id: &str, scheme: &str, number: u32) -> String {
+        format!("ep:{content_id}:{scheme}:seg:{number}")
+    }
+
+    /// Target output formats list for continuation chaining (stored during execute_first).
+    pub fn target_formats(content_id: &str) -> String {
+        format!("ep:{content_id}:target_formats")
+    }
+
     // --- Scheme-qualified key builders (Phase 4: Dual-Scheme Output) ---
 
     /// Build a scheme-qualified format string: e.g. "hls_cenc", "dash_cbcs".
@@ -226,6 +244,47 @@ mod tests {
     fn cache_keys_target_schemes() {
         assert_eq!(CacheKeys::target_schemes("abc", "hls"), "ep:abc:hls:target_schemes");
         assert_eq!(CacheKeys::target_schemes("abc", "dash"), "ep:abc:dash:target_schemes");
+    }
+
+    // --- Format-agnostic key tests (Phase 21) ---
+
+    #[test]
+    fn cache_keys_init_segment_for_scheme_only() {
+        assert_eq!(
+            CacheKeys::init_segment_for_scheme_only("abc", "cenc"),
+            "ep:abc:cenc:init"
+        );
+        assert_eq!(
+            CacheKeys::init_segment_for_scheme_only("abc", "cbcs"),
+            "ep:abc:cbcs:init"
+        );
+    }
+
+    #[test]
+    fn cache_keys_media_segment_for_scheme_only() {
+        assert_eq!(
+            CacheKeys::media_segment_for_scheme_only("abc", "cenc", 0),
+            "ep:abc:cenc:seg:0"
+        );
+        assert_eq!(
+            CacheKeys::media_segment_for_scheme_only("abc", "cbcs", 42),
+            "ep:abc:cbcs:seg:42"
+        );
+    }
+
+    #[test]
+    fn cache_keys_target_formats() {
+        assert_eq!(CacheKeys::target_formats("abc"), "ep:abc:target_formats");
+    }
+
+    #[test]
+    fn cache_keys_format_agnostic_differs_from_format_qualified() {
+        // Format-agnostic keys should differ from format-qualified keys
+        let agnostic = CacheKeys::init_segment_for_scheme_only("abc", "cenc");
+        let qualified = CacheKeys::init_segment_for_scheme("abc", "hls", "cenc");
+        assert_ne!(agnostic, qualified);
+        assert_eq!(agnostic, "ep:abc:cenc:init");
+        assert_eq!(qualified, "ep:abc:hls_cenc:init");
     }
 
     // --- Scheme-qualified key tests ---

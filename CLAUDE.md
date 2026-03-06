@@ -12,7 +12,7 @@ These two priorities govern all development decisions:
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~668 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, webhook override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~692 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, webhook override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
 
 ## Build Commands
 
@@ -261,6 +261,20 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **HLS-TS detection:** The HLS input parser detects TS sources by `.ts` segment extension, parses `#EXT-X-KEY:METHOD=AES-128` with URI and IV, and relaxes the `#EXT-X-MAP` requirement (TS sources don't have init segments — they're synthesized by the transmuxer).
 
+### Dual-Format Output (Phase 21)
+
+**Core insight:** CMAF/fMP4 segments are format-agnostic — the same encrypted bytes serve both HLS and DASH. Only manifests differ between formats.
+
+**`RepackageRequest.output_formats: Vec<OutputFormat>`:** Replaces the old `output_format` (singular). Webhook API accepts `output_formats: ["hls", "dash"]` for dual-format output; legacy `format` field still accepted for backward compat. `resolved_output_formats()` mirrors the `resolved_target_schemes()` pattern. `primary_format()` returns the first format (fallback: `Hls`).
+
+**Format-agnostic segment caching:** Init and media segments are cached with scheme-only keys (`ep:{id}:{scheme}:init`, `ep:{id}:{scheme}:seg:{n}`) — no format prefix. Manifest state remains per-(format, scheme) since HLS M3U8 and DASH MPD have entirely different structures.
+
+**Pipeline execution:** `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair. Re-encryption runs once per scheme, then results are distributed to all format outputs. `execute_first()`/`execute_remaining()` store `target_formats` alongside `target_schemes` for continuation chaining.
+
+**Backward compatibility:** Request handlers try format-agnostic cache keys first, then fall back to legacy format-qualified keys (`ep:{id}:{format}_{scheme}:init`) for content cached before Phase 21.
+
+**Combinatorial output:** `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs (HLS+CENC, HLS+CBCS, DASH+CENC, DASH+CBCS).
+
 ## Error Handling
 
 All modules use `crate::error::Result<T>` which aliases `std::result::Result<T, EdgepackError>`. The `EdgepackError` enum has specific variants for each subsystem (Cache, Drm, Speke, Cpix, Encryption, MediaParse, SegmentRewrite, Manifest, Http, Config, InvalidInput, NotFound, Io). Use `thiserror` derive macros. Propagation is via `?` operator throughout.
@@ -273,14 +287,14 @@ All HTTP transport and request handling is fully implemented:
 2. **`wasi_handler.rs`**: WASI incoming handler bridge implementing `wasi:http/incoming-handler::Guest`. Converts WASI types ↔ library types and maps errors to HTTP status codes.
 3. **`cache/redis_http.rs` → `execute_command()`**: Uses `http_client::get()` to make Upstash REST API calls. Parses JSON responses via extracted `parse_upstash_response()`.
 4. **`drm/speke.rs` → `post_cpix()`**: Uses `http_client::post()` to POST CPIX XML to license server with auth headers.
-5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. Two execution modes: `execute()` processes all segments synchronously and returns `(JobStatus, Vec<(EncryptionScheme, ProgressiveOutput)>)` with per-scheme output data in memory (used by sandbox). `execute_first()` + `execute_remaining()` is the split execution model for WASI — caches per-scheme init segments, media segments, and manifest state in Redis for serving via GET handlers, with self-invocation chaining. Both modes decrypt source segments once and re-encrypt for each target scheme.
+5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. Two execution modes: `execute()` processes all segments synchronously and returns `(JobStatus, Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>)` with per-(format, scheme) output data in memory (used by sandbox). `execute_first()` + `execute_remaining()` is the split execution model for WASI — caches format-agnostic init/media segments and per-(format, scheme) manifest state in Redis for serving via GET handlers, with self-invocation chaining. Both modes decrypt source segments once and re-encrypt for each target scheme, then distribute to all output formats.
 6. **`manifest/hls_input.rs` + `dash_input.rs`**: Source manifest input parsers extracting segment URLs, durations, init segment references, and live/VOD detection.
 7. **`handler/request.rs`**: All four GET handlers query Redis for cached segment data and manifest state via `HandlerContext`.
 8. **`handler/webhook.rs`**: Creates pipeline, calls `execute_first()`, fires self-invocation to `/webhook/repackage/continue`, returns 200 after first manifest publishes. Continue handler chains remaining segment processing.
 
 ## Local Sandbox
 
-The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `(JobStatus, Vec<(EncryptionScheme, ProgressiveOutput)>)` — per-scheme output is written to disk directly from each `ProgressiveOutput` object to `sandbox/output/{content_id}/{format}_{scheme}/`, not round-tripped through cache.
+The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `(JobStatus, Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>)` — per-(format, scheme) output is written to disk directly from each `ProgressiveOutput` object to `sandbox/output/{content_id}/{format}_{scheme}/`, not round-tripped through cache.
 
 ### Architecture
 
@@ -339,7 +353,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,291 tests** total (with `--features jit,cloudflare`): 909 unit tests and 382 integration tests. With `--features jit,cloudflare,ts`: **1,370 tests** (956 unit + 414 integration). Without optional features: **1,234 tests**. All run on the native host target.
+The project has **1,331 tests** total (with `--features jit,cloudflare`): 924 unit tests and 407 integration tests. With `--features jit,cloudflare,ts`: **1,410 tests** (971 unit + 439 integration). Without optional features: **1,274 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -347,13 +361,13 @@ Per-feature binary size tests in `tests/wasm_binary_size.rs` prevent dependency 
 
 | Test | Features | Limit | Current Size | Functions |
 |------|----------|-------|-------------|-----------|
-| `wasm_base_binary_size` | none | 720 KB | ~687 KB | ~2,069 |
-| `wasm_jit_binary_size` | `jit` | 750 KB | ~700 KB | ~2,030 |
-| `wasm_full_binary_size` | `jit,cloudflare` | 750 KB | ~704 KB | ~2,033 |
+| `wasm_base_binary_size` | none | 720 KB | ~692 KB | ~2,069 |
+| `wasm_jit_binary_size` | `jit` | 750 KB | ~725 KB | ~2,030 |
+| `wasm_full_binary_size` | `jit,cloudflare` | 750 KB | ~730 KB | ~2,033 |
 
-JIT adds ~33 KB (60 functions) over base. Cloudflare adds only ~4.5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
+JIT adds ~33 KB (60 functions) over base. Cloudflare adds only ~5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
 
-### Unit Tests (956 with all features incl. ts)
+### Unit Tests (971 with all features incl. ts)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -373,12 +387,12 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through ContinuationParams, TrackKeyMapping construction and serialization, variant building from track metadata
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (all 7 CMAF/ISOBMFF extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a), all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme/target_schemes parsing (cenc/cbcs/none, backward compat, duplicate rejection), container_format parsing (cmaf/fmp4/iso), enable_iframe_playlist parsing, invalid scheme/format rejection, serde roundtrips
+- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme/target_schemes parsing (cenc/cbcs/none, backward compat, duplicate rejection), output_formats parsing (hls/dash, backward compat, duplicate rejection), container_format parsing (cmaf/fmp4/iso), enable_iframe_playlist parsing, invalid scheme/format rejection, serde roundtrips
 - **Error variants**: Display output for every EdgepackError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (414 with all features incl. ts)
+### Integration Tests (439 with all features incl. ts)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -388,6 +402,7 @@ tests/
 │   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
 ├── cdn_adapters.rs            18+ tests: backend type selection, config serde, create_backend factory, encryption token derivation
 ├── clear_content.rs           10 tests: clear→CENC/CBCS, encrypted→clear, clear→clear (init + segment), roundtrips
+├── dual_format.rs             25 tests: multi-format output, format-agnostic cache keys, dual-format manifests, webhook output_formats, serde roundtrips
 ├── dual_scheme.rs             22 tests: scheme-qualified routing, cache keys, webhook multi-scheme parsing, backward compat
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
@@ -539,18 +554,21 @@ Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mo
 
 ## Redis Key Schema
 
-Keys marked with † are only written by the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) keeps output in memory via `ProgressiveOutput` and does not cache media data in Redis. Keys marked with ‡ are scheme-qualified (one key per target scheme, using `{format}_{scheme}` e.g. `hls_cenc`).
+Keys marked with † are only written by the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) keeps output in memory via `ProgressiveOutput` and does not cache media data in Redis. Keys marked with ‡ are scheme-qualified (one key per target scheme, using `{format}_{scheme}` e.g. `hls_cenc`). Keys marked with § are format-agnostic (Phase 21 — shared across HLS/DASH).
 
 | Key Pattern | TTL | Content |
 |-------------|-----|---------|
 | `ep:{content_id}:keys` | 24h | Serialized DRM content keys (JSON) |
 | `ep:{content_id}:{format}:state` | 48h | JobStatus JSON (state, progress) |
 | `ep:{content_id}:{format}_{scheme}:manifest_state` †‡ | 48h | ManifestState JSON (segments, phase) |
-| `ep:{content_id}:{format}_{scheme}:init` †‡ | 48h | Rewritten init segment binary data |
-| `ep:{content_id}:{format}_{scheme}:seg:{n}` †‡ | 48h | Rewritten media segment binary data |
+| `ep:{content_id}:{scheme}:init` †§ | 48h | Rewritten init segment binary data (format-agnostic) |
+| `ep:{content_id}:{scheme}:seg:{n}` †§ | 48h | Rewritten media segment binary data (format-agnostic) |
+| `ep:{content_id}:{format}_{scheme}:init` †‡ | 48h | Legacy format-qualified init segment (pre-Phase 21, fallback) |
+| `ep:{content_id}:{format}_{scheme}:seg:{n}` †‡ | 48h | Legacy format-qualified media segment (pre-Phase 21, fallback) |
 | `ep:{content_id}:{format}:source` † | 48h | Source manifest metadata (segment URLs, durations, is_live) |
 | `ep:{content_id}:{format}_{scheme}:rewrite_params` †‡ | 48h | Continuation parameters (encryption keys, IV sizes, pattern) |
 | `ep:{content_id}:{format}:target_schemes` † | 48h | Target schemes list (JSON array of EncryptionScheme) |
+| `ep:{content_id}:target_formats` † | 48h | Target formats list (JSON array of OutputFormat) |
 | `ep:{content_id}:speke` | 24h | Cached SPEKE response (avoids duplicate calls) |
 
 ## Cache Security
@@ -611,4 +629,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Refactoring Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, and 19 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 20 (Multi-Source Manifest Merging), 21 (Generic HLS/DASH Pipeline). P3: 22 (TS Segment Output), 23 (MoQ Ingest — feature-gated, requires research).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, and 21 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 20 (Multi-Source Manifest Merging). P3: 22 (TS Segment Output), 23 (MoQ Ingest — feature-gated, requires research).

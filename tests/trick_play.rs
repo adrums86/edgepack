@@ -269,7 +269,7 @@ fn manifest_state_serde_without_iframe_fields() {
 
 #[test]
 fn repackage_request_serde_without_iframe_field() {
-    let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
+    let json = r#"{"content_id":"test","source_url":"https://example.com","output_formats":["Hls"],"key_ids":[]}"#;
     let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
     assert!(!parsed.enable_iframe_playlist);
 }

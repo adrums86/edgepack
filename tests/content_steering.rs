@@ -269,7 +269,7 @@ fn repackage_request_content_steering_serde_roundtrip() {
     let req = RepackageRequest {
         content_id: "test".into(),
         source_url: "https://example.com/source.mpd".into(),
-        output_format: OutputFormat::Dash,
+        output_formats: vec![OutputFormat::Dash],
         target_schemes: vec![EncryptionScheme::Cenc],
         container_format: ContainerFormat::default(),
         key_ids: vec![],
@@ -296,7 +296,7 @@ fn repackage_request_content_steering_serde_roundtrip() {
 
 #[test]
 fn repackage_request_no_steering_backward_compat() {
-    let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","target_schemes":["Cenc"],"key_ids":[]}"#;
+    let json = r#"{"content_id":"test","source_url":"https://example.com","output_formats":["Hls"],"target_schemes":["Cenc"],"key_ids":[]}"#;
     let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
     assert!(parsed.content_steering.is_none());
 }

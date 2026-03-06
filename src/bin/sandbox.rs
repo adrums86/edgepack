@@ -280,7 +280,7 @@ async fn handle_repackage(
     let request = RepackageRequest {
         content_id: content_id.clone(),
         source_url,
-        output_format,
+        output_formats: vec![output_format],
         target_schemes: target_schemes.clone(),
         container_format,
         key_ids: vec![],
@@ -328,17 +328,21 @@ async fn handle_repackage(
         match pipeline.execute(&request) {
             Ok((status, outputs)) => {
                 eprintln!(
-                    "  Pipeline complete: {}/{} — {} segments, {} scheme(s)",
+                    "  Pipeline complete: {}/{} — {} segments, {} output(s)",
                     status.content_id,
                     fmt_str,
                     status.segments_completed,
                     outputs.len()
                 );
-                // Write output per scheme
-                for (scheme, output) in &outputs {
+                // Write output per (format, scheme) pair
+                for (out_format, scheme, output) in &outputs {
                     let scheme_str = scheme.scheme_type_str();
-                    if let Err(e) = write_output_to_disk(&cid, fmt, scheme_str, output) {
-                        eprintln!("  Warning: failed to write {scheme_str} output to disk: {e}");
+                    if let Err(e) = write_output_to_disk(&cid, *out_format, scheme_str, output) {
+                        let fmt_label = match out_format {
+                            OutputFormat::Hls => "hls",
+                            OutputFormat::Dash => "dash",
+                        };
+                        eprintln!("  Warning: failed to write {fmt_label}_{scheme_str} output to disk: {e}");
                     }
                 }
             }

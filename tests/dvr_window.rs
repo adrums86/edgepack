@@ -305,7 +305,7 @@ fn dvr_window_repackage_request_serde_roundtrip() {
     let req = RepackageRequest {
         content_id: "dvr-test".into(),
         source_url: "https://example.com/src.m3u8".into(),
-        output_format: OutputFormat::Hls,
+        output_formats: vec![OutputFormat::Hls],
         target_schemes: vec![EncryptionScheme::Cenc],
         container_format: ContainerFormat::default(),
         key_ids: vec![],
@@ -325,7 +325,7 @@ fn dvr_window_repackage_request_serde_roundtrip() {
 
 #[test]
 fn dvr_window_repackage_request_backward_compat() {
-    let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
+    let json = r#"{"content_id":"test","source_url":"https://example.com","output_formats":["Hls"],"key_ids":[]}"#;
     let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
     assert!(parsed.dvr_window_duration.is_none());
 }

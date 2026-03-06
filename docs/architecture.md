@@ -325,9 +325,10 @@ graph LR
     subgraph NonSensitive["NON-SENSITIVE (plaintext, TTL expiry only)"]
         style NonSensitive fill:#14532D,stroke:#22C55E,color:#BBF7D0
         K5["ep:{id}:{fmt}:state<br/>job progress<br/>TTL: 48h"]
-        K6["ep:{id}:{fmt}:manifest_state<br/>progressive manifest<br/>TTL: 48h"]
-        K7["ep:{id}:{fmt}:init<br/>rewritten init segment<br/>TTL: 48h"]
-        K8["ep:{id}:{fmt}:seg:{n}<br/>rewritten media segments<br/>TTL: 48h"]
+        K6["ep:{id}:{fmt}_{scheme}:manifest_state<br/>progressive manifest (per format)<br/>TTL: 48h"]
+        K7["ep:{id}:{scheme}:init<br/>rewritten init segment<br/>(format-agnostic)<br/>TTL: 48h"]
+        K8["ep:{id}:{scheme}:seg:{n}<br/>rewritten media segments<br/>(format-agnostic)<br/>TTL: 48h"]
+        K9["ep:{id}:target_formats<br/>output format list<br/>TTL: 48h"]
     end
 ```
 
@@ -465,7 +466,7 @@ flowchart TD
 | **Codec Awareness** | RFC 6381 codec string extraction from init segments for manifest signaling |
 | **Subtitle Pass-Through** | WebVTT/TTML in fMP4, HLS subtitle rendition groups, DASH text AdaptationSets, CEA-608/708 caption signaling |
 | **JIT Packaging** | On-demand GET packaging (manifest/init/segment-on-GET) with <1 ms cold start — package content on first viewer request instead of pre-processing at origin. Request coalescing via distributed locking prevents duplicate work |
-| **Sub-Millisecond Cold Start** | ~648 KB WASM binary instantiates in <1 ms, 50–500x faster than Lambda/Cloud Functions. Enables JIT packaging without adding perceptible latency to viewer requests |
+| **Sub-Millisecond Cold Start** | ~692 KB WASM binary instantiates in <1 ms, 50–500x faster than Lambda/Cloud Functions. Enables JIT packaging without adding perceptible latency to viewer requests |
 | **Multi-Backend Caching** | Redis HTTP, Cloudflare Workers KV, generic HTTP KV for AWS/Akamai/custom stores |
 | **SCTE-35 Ad Break Signaling** | emsg box extraction, splice event parsing, HLS `#EXT-X-DATERANGE` and DASH `EventStream` output, source manifest ad marker roundtrip |
 | **Compatibility Validation** | Pre-flight codec/scheme checks, HDR format detection, init/segment structure validation, conformance test suite |
@@ -474,8 +475,9 @@ flowchart TD
 | **LL-DASH** | Low-Latency DASH with `availabilityTimeOffset` and `availabilityTimeComplete` on `<SegmentTemplate>` |
 | **MPEG-TS Input** | TS demuxer (PAT/PMT/PES, H.264/AAC), TS-to-CMAF transmuxer (Annex B→AVCC, init synthesis), AES-128 segment decryption. Feature-gated (`ts` feature) |
 | **Trick Play** | HLS `#EXT-X-I-FRAMES-ONLY` playlists with `#EXT-X-BYTERANGE` into existing segments, `#EXT-X-I-FRAME-STREAM-INF` in master. DASH trick play `<AdaptationSet>` with `<EssentialProperty>` trickmode. I-frame detection from CMAF chunk boundaries — no duplicate storage |
-| **Per-Feature Binary Size Guards** | 5 tests enforce size limits per build variant (base ≤700 KB, JIT ≤750 KB, full ≤750 KB, ts ≤800 KB, full+ts ≤850 KB). Binary size is the primary cold start proxy — every KB matters for JIT latency |
-| **Zero External Test Dependencies** | All 1,151 tests (1,072 without `ts` feature) use synthetic CMAF fixtures — no network or media files needed |
+| **Dual-Format Output** | Simultaneous HLS + DASH from a single request sharing format-agnostic segments. `output_formats: ["hls", "dash"]` produces both manifest types referencing the same cached segments — no duplicate encryption or storage |
+| **Per-Feature Binary Size Guards** | 5 tests enforce size limits per build variant (base ≤720 KB, JIT ≤750 KB, full ≤750 KB, ts ≤800 KB, full+ts ≤850 KB). Binary size is the primary cold start proxy — every KB matters for JIT latency |
+| **Zero External Test Dependencies** | All 1,410 tests (1,331 without `ts` feature) use synthetic CMAF fixtures — no network or media files needed |
 | **CDN-Portable WASM** | Entire runtime compiles to `wasm32-wasip2` — runs on any CDN with WASI P2 support (Cloudflare Workers, Fastly Compute, wasmtime on Lambda, Akamai EdgeCompute). No CDN-specific APIs, no vendor lock-in |
 
 ## Inputs and Outputs
@@ -589,6 +591,15 @@ flowchart TD
 - DASH trick play: separate `<AdaptationSet>` with `<EssentialProperty schemeIdUri="http://dashif.org/guidelines/trickmode" value="1"/>` referencing main video by `id="1"`
 - Dedicated route: `GET /repackage/{id}/{fmt}/iframes` (HLS only, DASH returns 404)
 - Sandbox writes `iframes.m3u8` alongside regular HLS output
+
+### ~~Phase 21: Generic HLS/DASH Pipeline (Dual-Format)~~ ✅ Complete
+- `RepackageRequest.output_formats: Vec<OutputFormat>` replaces singular `output_format` — backward-compatible webhook API
+- Format-agnostic segment cache keys: `ep:{id}:{scheme}:init` and `ep:{id}:{scheme}:seg:{n}` (no format prefix — segments are identical for HLS and DASH)
+- Per-format manifest state: `ep:{id}:{format}_{scheme}:manifest_state` stays format-qualified (manifests differ per format)
+- `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair
+- Re-encryption runs once per scheme, then distributed to all output formats
+- Request handlers try format-agnostic keys first, fall back to legacy format-qualified keys
+- Combinatorial output: `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs
 
 ## Planned Architecture Extensions
 

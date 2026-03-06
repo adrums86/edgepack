@@ -33,8 +33,10 @@ pub struct RepackageRequest {
     pub content_id: String,
     /// URL of the source manifest (HLS or DASH).
     pub source_url: String,
-    /// Desired output format.
-    pub output_format: OutputFormat,
+    /// Desired output formats. Multiple formats produce separate manifests sharing the same
+    /// underlying segments. Default: single format for backward compatibility.
+    #[serde(default)]
+    pub output_formats: Vec<OutputFormat>,
     /// Target encryption schemes. Multiple schemes produce separate output per scheme.
     /// Default: `[Cenc]` for backward compatibility.
     #[serde(default = "default_target_schemes")]
@@ -74,6 +76,14 @@ pub struct RepackageRequest {
     /// Per-request cache-control header overrides. When None, system defaults are used.
     #[serde(default)]
     pub cache_control: Option<crate::config::CacheControlConfig>,
+}
+
+impl RepackageRequest {
+    /// Returns the primary output format (first in the list).
+    /// Used for job status and backward compatibility with single-format code paths.
+    pub fn primary_format(&self) -> OutputFormat {
+        self.output_formats.first().copied().unwrap_or(OutputFormat::Hls)
+    }
 }
 
 fn default_target_schemes() -> Vec<EncryptionScheme> {
@@ -131,7 +141,7 @@ mod tests {
         let req = RepackageRequest {
             content_id: "movie-123".to_string(),
             source_url: "https://cdn.example.com/manifest.m3u8".to_string(),
-            output_format: OutputFormat::Hls,
+            output_formats: vec![OutputFormat::Hls],
             target_schemes: vec![EncryptionScheme::Cenc],
             container_format: ContainerFormat::default(),
             key_ids: vec!["aabbccdd".to_string()],
@@ -145,7 +155,7 @@ mod tests {
             cache_control: None,
         };
         assert_eq!(req.content_id, "movie-123");
-        assert_eq!(req.output_format, OutputFormat::Hls);
+        assert_eq!(req.output_formats, vec![OutputFormat::Hls]);
         assert_eq!(req.target_schemes, vec![EncryptionScheme::Cenc]);
         assert_eq!(req.container_format, ContainerFormat::Cmaf);
         assert_eq!(req.key_ids.len(), 1);
@@ -160,7 +170,7 @@ mod tests {
         let req = RepackageRequest {
             content_id: "test".into(),
             source_url: "https://example.com/source.mpd".into(),
-            output_format: OutputFormat::Dash,
+            output_formats: vec![OutputFormat::Dash],
             target_schemes: vec![EncryptionScheme::Cbcs],
             container_format: ContainerFormat::Fmp4,
             key_ids: vec![],
@@ -176,7 +186,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, "test");
-        assert_eq!(parsed.output_format, OutputFormat::Dash);
+        assert_eq!(parsed.output_formats, vec![OutputFormat::Dash]);
         assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cbcs]);
         assert_eq!(parsed.container_format, ContainerFormat::Fmp4);
         assert!(parsed.key_ids.is_empty());
@@ -187,7 +197,7 @@ mod tests {
     #[test]
     fn repackage_request_default_target_schemes() {
         // When target_schemes is missing from JSON, it should default to [Cenc]
-        let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
+        let json = r#"{"content_id":"test","source_url":"https://example.com","output_formats":["Hls"],"key_ids":[]}"#;
         let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cenc]);
         assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
@@ -202,7 +212,7 @@ mod tests {
         let req = RepackageRequest {
             content_id: "dual".into(),
             source_url: "https://example.com/source.m3u8".into(),
-            output_format: OutputFormat::Hls,
+            output_formats: vec![OutputFormat::Hls],
             target_schemes: vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs],
             container_format: ContainerFormat::default(),
             key_ids: vec![],
@@ -280,7 +290,7 @@ mod tests {
         let req = RepackageRequest {
             content_id: "empty".into(),
             source_url: "https://example.com/source".into(),
-            output_format: OutputFormat::Hls,
+            output_formats: vec![OutputFormat::Hls],
             target_schemes: vec![EncryptionScheme::Cenc],
             container_format: ContainerFormat::default(),
             key_ids: vec![],
@@ -405,7 +415,7 @@ mod tests {
         let req = RepackageRequest {
             content_id: "raw-test".into(),
             source_url: "https://example.com/source.m3u8".into(),
-            output_format: OutputFormat::Hls,
+            output_formats: vec![OutputFormat::Hls],
             target_schemes: vec![EncryptionScheme::Cenc],
             container_format: ContainerFormat::default(),
             key_ids: vec![],
@@ -434,7 +444,7 @@ mod tests {
     #[test]
     fn repackage_request_new_fields_default_from_json() {
         // Old JSON without new fields should still parse (backward compat)
-        let json = r#"{"content_id":"test","source_url":"https://example.com","output_format":"Hls","key_ids":[]}"#;
+        let json = r#"{"content_id":"test","source_url":"https://example.com","output_formats":["Hls"],"key_ids":[]}"#;
         let parsed: RepackageRequest = serde_json::from_str(json).unwrap();
         assert!(parsed.raw_keys.is_empty());
         assert!(parsed.key_rotation.is_none());
@@ -443,5 +453,74 @@ mod tests {
         assert!(!parsed.enable_iframe_playlist);
         assert!(parsed.dvr_window_duration.is_none());
         assert!(parsed.cache_control.is_none());
+    }
+
+    #[test]
+    fn repackage_request_multi_format() {
+        let req = RepackageRequest {
+            content_id: "dual-fmt".into(),
+            source_url: "https://example.com/source.m3u8".into(),
+            output_formats: vec![OutputFormat::Hls, OutputFormat::Dash],
+            target_schemes: vec![EncryptionScheme::Cenc],
+            container_format: ContainerFormat::default(),
+            key_ids: vec![],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
+            enable_iframe_playlist: false,
+            dvr_window_duration: None,
+            content_steering: None,
+            cache_control: None,
+        };
+        assert_eq!(req.output_formats.len(), 2);
+        assert_eq!(req.primary_format(), OutputFormat::Hls);
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.output_formats, vec![OutputFormat::Hls, OutputFormat::Dash]);
+    }
+
+    #[test]
+    fn repackage_request_primary_format() {
+        let req = RepackageRequest {
+            content_id: "fmt".into(),
+            source_url: "https://example.com/source.m3u8".into(),
+            output_formats: vec![OutputFormat::Dash],
+            target_schemes: vec![EncryptionScheme::Cenc],
+            container_format: ContainerFormat::default(),
+            key_ids: vec![],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
+            enable_iframe_playlist: false,
+            dvr_window_duration: None,
+            content_steering: None,
+            cache_control: None,
+        };
+        assert_eq!(req.primary_format(), OutputFormat::Dash);
+    }
+
+    #[test]
+    fn repackage_request_multi_format_multi_scheme() {
+        let req = RepackageRequest {
+            content_id: "both".into(),
+            source_url: "https://example.com/source.m3u8".into(),
+            output_formats: vec![OutputFormat::Hls, OutputFormat::Dash],
+            target_schemes: vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs],
+            container_format: ContainerFormat::default(),
+            key_ids: vec![],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
+            enable_iframe_playlist: false,
+            dvr_window_duration: None,
+            content_steering: None,
+            cache_control: None,
+        };
+        // 2 formats x 2 schemes = 4 output combinations
+        assert_eq!(req.output_formats.len(), 2);
+        assert_eq!(req.target_schemes.len(), 2);
     }
 }

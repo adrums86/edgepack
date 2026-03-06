@@ -11,14 +11,22 @@ use serde::{Deserialize, Serialize};
 ///
 /// Accepts either `target_schemes` (array) or `target_scheme` (single string, backward compat).
 /// If both are provided, `target_schemes` takes precedence. If neither, defaults to `["cenc"]`.
+///
+/// Accepts either `output_formats` (array) or `format` (single string, backward compat).
+/// If both are provided, `output_formats` takes precedence. This mirrors the `target_schemes`
+/// pattern for dual-format output (Phase 21).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WebhookPayload {
     /// Unique content identifier.
     pub content_id: String,
     /// Source manifest URL (HLS or DASH).
     pub source_url: String,
-    /// Output format: "hls" or "dash".
+    /// Output format: "hls" or "dash" (single, backward compat). Used when `output_formats` is empty.
     pub format: String,
+    /// Output formats (array). Takes precedence over `format`.
+    /// Example: `["hls", "dash"]` for dual-format output.
+    #[serde(default)]
+    pub output_formats: Vec<String>,
     /// Target encryption schemes (array). Takes precedence over `target_scheme`.
     #[serde(default)]
     pub target_schemes: Vec<String>,
@@ -119,6 +127,17 @@ impl WebhookPayload {
             vec!["cenc".to_string()]
         }
     }
+
+    /// Resolve the effective list of output format strings.
+    ///
+    /// Priority: `output_formats` (if non-empty) > `format` (single, backward compat).
+    pub fn resolved_output_formats(&self) -> Vec<String> {
+        if !self.output_formats.is_empty() {
+            self.output_formats.clone()
+        } else {
+            vec![self.format.clone()]
+        }
+    }
 }
 
 fn default_container_format_str() -> String {
@@ -185,16 +204,31 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     let payload: WebhookPayload = serde_json::from_slice(body)
         .map_err(|e| EdgepackError::InvalidInput(format!("invalid JSON: {e}")))?;
 
-    // Validate format
-    let output_format = match payload.format.as_str() {
-        "hls" => OutputFormat::Hls,
-        "dash" => OutputFormat::Dash,
-        other => {
+    // Parse output formats (mirrors target_schemes pattern)
+    let format_strings = payload.resolved_output_formats();
+    if format_strings.is_empty() {
+        return Err(EdgepackError::InvalidInput(
+            "at least one output format is required".into(),
+        ));
+    }
+    let mut output_formats = Vec::with_capacity(format_strings.len());
+    for f in &format_strings {
+        let fmt = match f.as_str() {
+            "hls" => OutputFormat::Hls,
+            "dash" => OutputFormat::Dash,
+            other => {
+                return Err(EdgepackError::InvalidInput(format!(
+                    "invalid format: {other} (expected 'hls' or 'dash')"
+                )));
+            }
+        };
+        if output_formats.contains(&fmt) {
             return Err(EdgepackError::InvalidInput(format!(
-                "invalid format: {other} (expected 'hls' or 'dash')"
+                "duplicate output_format: {f}"
             )));
         }
-    };
+        output_formats.push(fmt);
+    }
 
     // Validate source URL
     if payload.source_url.is_empty() {
@@ -300,7 +334,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     let request = RepackageRequest {
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
-        output_format,
+        output_formats: output_formats.clone(),
         target_schemes: target_schemes.clone(),
         container_format,
         key_ids: payload.key_ids,
@@ -319,16 +353,20 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     // duplicate work when both JIT and webhook target the same content.
     #[cfg(feature = "jit")]
     {
-        let fmt = format_str(output_format);
-        if ctx.cache.exists(&CacheKeys::jit_setup(&payload.content_id, fmt))? {
+        let primary_fmt = format_str(output_formats[0]);
+        if ctx.cache.exists(&CacheKeys::jit_setup(&payload.content_id, primary_fmt))? {
             let mut manifest_urls = std::collections::HashMap::new();
-            for scheme in &target_schemes {
-                let scheme_str = scheme.scheme_type_str();
-                let manifest_path = format!(
-                    "/repackage/{}/{}_{}/manifest",
-                    payload.content_id, payload.format, scheme_str
-                );
-                manifest_urls.insert(scheme_str.to_string(), manifest_path);
+            for fmt in &output_formats {
+                let fmt_str = format_str(*fmt);
+                for scheme in &target_schemes {
+                    let scheme_str = scheme.scheme_type_str();
+                    let manifest_path = format!(
+                        "/repackage/{}/{}_{}/manifest",
+                        payload.content_id, fmt_str, scheme_str
+                    );
+                    let key = format!("{}_{}", fmt_str, scheme_str);
+                    manifest_urls.insert(key, manifest_path);
+                }
             }
             let response = WebhookResponse {
                 status: "complete".to_string(),
@@ -379,13 +417,17 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     }
 
     let mut manifest_urls = std::collections::HashMap::new();
-    for scheme in &target_schemes {
-        let scheme_str = scheme.scheme_type_str();
-        let manifest_path = format!(
-            "/repackage/{}/{}_{}/manifest",
-            payload.content_id, payload.format, scheme_str
-        );
-        manifest_urls.insert(scheme_str.to_string(), manifest_path);
+    for fmt in &output_formats {
+        let fmt_str = format_str(*fmt);
+        for scheme in &target_schemes {
+            let scheme_str = scheme.scheme_type_str();
+            let manifest_path = format!(
+                "/repackage/{}/{}_{}/manifest",
+                payload.content_id, fmt_str, scheme_str
+            );
+            let key = format!("{}_{}", fmt_str, scheme_str);
+            manifest_urls.insert(key, manifest_path);
+        }
     }
 
     let response = WebhookResponse {
@@ -727,6 +769,7 @@ mod tests {
             content_id: "c1".into(),
             source_url: "https://example.com".into(),
             format: "hls".into(),
+            output_formats: vec![],
             target_schemes: vec!["cenc".into()],
             target_scheme: None,
             container_format: "cmaf".into(),
@@ -744,6 +787,7 @@ mod tests {
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content_id, "c1");
         assert_eq!(parsed.resolved_target_schemes(), vec!["cenc"]);
+        assert_eq!(parsed.resolved_output_formats(), vec!["hls"]);
         assert_eq!(parsed.container_format, "cmaf");
         assert_eq!(parsed.key_ids.len(), 1);
         assert!(parsed.enable_iframe_playlist.is_none());
@@ -1227,6 +1271,9 @@ mod tests {
         assert!(parsed.key_rotation.is_none());
         assert!(parsed.clear_lead_segments.is_none());
         assert!(parsed.drm_systems.is_empty());
+        assert!(parsed.output_formats.is_empty());
+        // Backward compat: format (singular) is used when output_formats is empty
+        assert_eq!(parsed.resolved_output_formats(), vec!["hls"]);
     }
 
     #[test]
@@ -1338,5 +1385,115 @@ mod tests {
         let result = handle_repackage_webhook(&req, &ctx);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("server_uri must not be empty"));
+    }
+
+    // --- Multi-format (Phase 21) tests ---
+
+    #[test]
+    fn webhook_payload_output_formats_multi() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","output_formats":["hls","dash"]}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.resolved_output_formats(), vec!["hls", "dash"]);
+    }
+
+    #[test]
+    fn webhook_payload_output_formats_single() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","output_formats":["dash"]}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.resolved_output_formats(), vec!["dash"]);
+    }
+
+    #[test]
+    fn webhook_payload_output_formats_takes_precedence() {
+        // If both format and output_formats are set, output_formats wins
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","output_formats":["dash"]}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.resolved_output_formats(), vec!["dash"]);
+    }
+
+    #[test]
+    fn webhook_payload_output_formats_backward_compat() {
+        // Old API: format (singular) still works when output_formats is absent
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"dash"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.resolved_output_formats(), vec!["dash"]);
+    }
+
+    #[test]
+    fn webhook_duplicate_output_format_rejected() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "output_formats": ["hls", "hls"]
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("duplicate output_format"));
+    }
+
+    #[test]
+    fn webhook_invalid_output_format() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "output_formats": ["hls", "mp4"]
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let result = handle_repackage_webhook(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid format: mp4"));
+    }
+
+    #[test]
+    fn webhook_multi_format_serde_roundtrip() {
+        let payload = WebhookPayload {
+            content_id: "dual-fmt".into(),
+            source_url: "https://example.com".into(),
+            format: "hls".into(),
+            output_formats: vec!["hls".into(), "dash".into()],
+            target_schemes: vec!["cenc".into()],
+            target_scheme: None,
+            container_format: "cmaf".into(),
+            key_ids: vec![],
+            raw_keys: vec![],
+            key_rotation: None,
+            clear_lead_segments: None,
+            drm_systems: vec![],
+            enable_iframe_playlist: None,
+            dvr_window_duration: None,
+            content_steering: None,
+            cache_control: None,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.resolved_output_formats(), vec!["hls", "dash"]);
+        assert_eq!(parsed.output_formats.len(), 2);
+    }
+
+    #[test]
+    fn webhook_multi_format_accepted() {
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "dual-fmt-test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "output_formats": ["hls", "dash"]
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        let resp = handle_repackage_webhook(&req, &ctx);
+        // On native targets, pipeline fails (no HTTP client), so webhook returns 500 or Ok.
+        // The key assertion is that it does NOT fail with "invalid format".
+        match resp {
+            Ok(r) => assert!(r.status == 200 || r.status == 500),
+            Err(e) => assert!(
+                !e.to_string().contains("invalid format"),
+                "dual-format should be accepted, got: {e}"
+            ),
+        }
     }
 }

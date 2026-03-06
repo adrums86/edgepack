@@ -48,11 +48,11 @@ impl RepackagePipeline {
 
     /// Execute the full repackaging pipeline (processes all segments in one invocation).
     ///
-    /// Produces one `ProgressiveOutput` per target scheme. For WASI environments with
+    /// Produces one `ProgressiveOutput` per (format, scheme) combination. For WASI environments with
     /// request timeouts, prefer `execute_first()` + `execute_remaining()` for chunked processing.
-    pub fn execute(&self, request: &RepackageRequest) -> Result<(JobStatus, Vec<(EncryptionScheme, ProgressiveOutput)>)> {
+    pub fn execute(&self, request: &RepackageRequest) -> Result<(JobStatus, Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>)> {
         let content_id = &request.content_id;
-        let format = request.output_format;
+        let format = request.primary_format();
         let target_schemes = &request.target_schemes;
         let container_format = request.container_format;
 
@@ -155,10 +155,10 @@ impl RepackagePipeline {
             (None, None, None)
         };
 
-        // Step 5: Per-scheme init rewriting and progressive output setup
-        let fmt = format_str(format);
+        // Step 5: Per-scheme init rewriting, then per-(format, scheme) progressive output setup
 
-        let mut outputs: Vec<(EncryptionScheme, ProgressiveOutput)> = Vec::with_capacity(target_schemes.len());
+        // Rewrite init segments once per scheme (format-agnostic)
+        let mut scheme_inits: Vec<(EncryptionScheme, Vec<u8>)> = Vec::with_capacity(target_schemes.len());
         for &target_scheme in target_schemes {
             let target_iv_size = target_scheme.default_iv_size();
             let target_pattern = target_scheme.default_video_pattern();
@@ -179,54 +179,63 @@ impl RepackagePipeline {
                     init::rewrite_ftyp_only(&init_data, container_format)?
                 }
             };
+            scheme_inits.push((target_scheme, new_init));
+        }
 
-            let scheme_str = target_scheme.scheme_type_str();
-            let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
-            let drm_info = if target_scheme.is_encrypted() {
-                let ks = key_set.as_ref().unwrap();
-                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme, &request.drm_systems))
-            } else {
-                None
-            };
-            let mut progressive =
-                ProgressiveOutput::new(content_id.clone(), format, base_url, drm_info, container_format);
-            progressive.set_variants(build_variants_from_tracks(&tracks));
-            progressive.set_init_segment(new_init);
+        // Build one ProgressiveOutput per (format, scheme) pair
+        let mut outputs: Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)> =
+            Vec::with_capacity(request.output_formats.len() * target_schemes.len());
+        for &out_format in &request.output_formats {
+            let out_fmt = format_str(out_format);
+            for &(target_scheme, ref new_init) in &scheme_inits {
+                let scheme_str = target_scheme.scheme_type_str();
+                let base_url = format!("/repackage/{content_id}/{out_fmt}_{scheme_str}/");
+                let drm_info = if target_scheme.is_encrypted() {
+                    let ks = key_set.as_ref().unwrap();
+                    Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme, &request.drm_systems))
+                } else {
+                    None
+                };
+                let mut progressive =
+                    ProgressiveOutput::new(content_id.clone(), out_format, base_url, drm_info, container_format);
+                progressive.set_variants(build_variants_from_tracks(&tracks));
+                progressive.set_init_segment(new_init.clone());
 
-            // Thread LL-HLS/LL-DASH parameters from source manifest
-            if let Some(ptd) = source.part_target_duration {
-                progressive.set_part_target_duration(ptd);
-            }
-            if let Some(ref sc) = source.server_control {
-                progressive.set_server_control(sc.clone());
-            }
-            if let Some(ref ll) = source.ll_dash_info {
-                progressive.set_ll_dash_info(ll.clone());
-            }
+                // Thread LL-HLS/LL-DASH parameters from source manifest
+                if let Some(ptd) = source.part_target_duration {
+                    progressive.set_part_target_duration(ptd);
+                }
+                if let Some(ref sc) = source.server_control {
+                    progressive.set_server_control(sc.clone());
+                }
+                if let Some(ref ll) = source.ll_dash_info {
+                    progressive.set_ll_dash_info(ll.clone());
+                }
 
-            // Thread I-frame playlist flag
-            if request.enable_iframe_playlist {
-                progressive.set_enable_iframe_playlist(true);
-            }
+                // Thread I-frame playlist flag
+                if request.enable_iframe_playlist {
+                    progressive.set_enable_iframe_playlist(true);
+                }
 
-            // Thread DVR window duration
-            if let Some(dvr_window) = request.dvr_window_duration {
-                progressive.set_dvr_window_duration(dvr_window);
-            }
+                // Thread DVR window duration
+                if let Some(dvr_window) = request.dvr_window_duration {
+                    progressive.set_dvr_window_duration(dvr_window);
+                }
 
-            // Thread content steering (webhook override > source)
-            let effective_steering = request.content_steering.clone()
-                .or_else(|| source.content_steering.clone());
-            if let Some(cs) = effective_steering {
-                progressive.set_content_steering(cs);
-            }
+                // Thread content steering (webhook override > source)
+                let effective_steering = request.content_steering.clone()
+                    .or_else(|| source.content_steering.clone());
+                if let Some(cs) = effective_steering {
+                    progressive.set_content_steering(cs);
+                }
 
-            // Thread cache control overrides
-            if let Some(ref cc) = request.cache_control {
-                progressive.set_cache_control(cc.clone());
-            }
+                // Thread cache control overrides
+                if let Some(ref cc) = request.cache_control {
+                    progressive.set_cache_control(cc.clone());
+                }
 
-            outputs.push((target_scheme, progressive));
+                outputs.push((out_format, target_scheme, progressive));
+            }
         }
 
         // Step 6: Process each media segment
@@ -278,8 +287,9 @@ impl RepackagePipeline {
             let ad_breaks = extract_ad_breaks_from_segment(&seg_data, i as u32, elapsed_time);
             elapsed_time += duration;
 
-            // Re-encrypt for each target scheme
-            for (target_scheme, progressive) in outputs.iter_mut() {
+            // Re-encrypt once per scheme (format-agnostic), then distribute to all outputs
+            let mut rewritten_segments: Vec<(EncryptionScheme, Vec<u8>, Vec<crate::media::chunk::ChunkBoundary>)> = Vec::new();
+            for &target_scheme in target_schemes {
                 let target_iv_size = target_scheme.default_iv_size();
                 let target_pattern = target_scheme.default_video_pattern();
                 let target_key = if target_scheme.is_encrypted() { content_key.clone() } else { None };
@@ -288,7 +298,7 @@ impl RepackagePipeline {
                     source_key: source_key.clone(),
                     target_key,
                     source_scheme,
-                    target_scheme: *target_scheme,
+                    target_scheme,
                     source_iv_size,
                     target_iv_size,
                     source_pattern,
@@ -307,11 +317,20 @@ impl RepackagePipeline {
                     Vec::new()
                 };
 
+                rewritten_segments.push((target_scheme, new_segment, boundaries));
+            }
+
+            // Distribute rewritten segments to all (format, scheme) outputs
+            for (_, ref target_scheme, ref mut progressive) in outputs.iter_mut() {
+                let (_, ref new_segment, ref boundaries) = rewritten_segments.iter()
+                    .find(|(s, _, _)| s == target_scheme)
+                    .expect("scheme must exist in rewritten_segments");
+
                 // LL-HLS: extract parts from multi-chunk segments
                 if !source.parts.is_empty() && boundaries.len() > 1 {
                     let part_duration = duration / boundaries.len() as f64;
                     for (pi, boundary) in boundaries.iter().enumerate() {
-                        if let Some(chunk_data) = crate::media::chunk::extract_chunk(&new_segment, boundary) {
+                        if let Some(chunk_data) = crate::media::chunk::extract_chunk(new_segment, boundary) {
                             progressive.add_part(
                                 i as u32,
                                 pi as u32,
@@ -338,9 +357,9 @@ impl RepackagePipeline {
                     }
                 }
 
-                progressive.add_segment(i as u32, new_segment, duration);
+                progressive.add_segment(i as u32, new_segment.clone(), duration);
 
-                // Add ad breaks to this scheme's progressive output
+                // Add ad breaks to this output
                 for ab in &ad_breaks {
                     progressive.add_ad_break(ab.clone());
                 }
@@ -381,7 +400,7 @@ impl RepackagePipeline {
     /// should chain `execute_remaining()` via self-invocation for the rest.
     pub fn execute_first(&self, request: &RepackageRequest) -> Result<JobStatus> {
         let content_id = &request.content_id;
-        let format = request.output_format;
+        let format = request.primary_format();
         let target_schemes = &request.target_schemes;
         let container_format = request.container_format;
         let fmt = format_str(format);
@@ -403,6 +422,12 @@ impl RepackagePipeline {
             .map_err(|e| EdgepackError::Cache(format!("serialize target schemes: {e}")))?;
         self.cache
             .set(&CacheKeys::target_schemes(content_id, &fmt), &schemes_json, ttl)?;
+
+        // Store target formats list for continuation (Phase 21: multi-format)
+        let formats_json = serde_json::to_vec(&request.output_formats)
+            .map_err(|e| EdgepackError::Cache(format!("serialize target formats: {e}")))?;
+        self.cache
+            .set(&CacheKeys::target_formats(content_id), &formats_json, ttl)?;
 
         // TS source: reject if feature not enabled
         #[cfg(not(feature = "ts"))]
@@ -526,7 +551,9 @@ impl RepackagePipeline {
         // Extract SCTE-35 ad breaks from first segment's emsg boxes
         let ad_breaks = extract_ad_breaks_from_segment(&seg_data, 0, 0.0);
 
-        // Step 6: Per-scheme — continuation params, init rewrite, first segment, manifest state
+        // Step 6: Per-scheme — continuation params, init rewrite, first segment (format-agnostic)
+        // Then per-(format, scheme) — manifest state
+        let mut scheme_segments: Vec<(EncryptionScheme, Vec<u8>)> = Vec::new();
         for &target_scheme in target_schemes {
             let target_iv_size = target_scheme.default_iv_size();
             let target_pattern = target_scheme.default_video_pattern();
@@ -585,52 +612,12 @@ impl RepackagePipeline {
                 }
             };
 
-            // Store init segment
+            // Store init segment with format-agnostic key (shared across HLS/DASH)
             self.cache.set(
-                &CacheKeys::init_segment_for_scheme(content_id, &fmt, scheme_str),
+                &CacheKeys::init_segment_for_scheme_only(content_id, scheme_str),
                 &new_init,
                 ttl,
             )?;
-
-            // Set up progressive output
-            let base_url = format!("/repackage/{content_id}/{fmt}_{scheme_str}/");
-            let drm_info = if target_scheme.is_encrypted() {
-                let ks = key_set.as_ref().unwrap();
-                Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme, &request.drm_systems))
-            } else {
-                None
-            };
-            let mut progressive = ProgressiveOutput::new(
-                content_id.clone(),
-                format,
-                base_url,
-                drm_info,
-                container_format,
-            );
-            progressive.set_variants(build_variants_from_tracks(&tracks));
-            progressive.set_init_segment(new_init);
-
-            // Thread I-frame playlist flag
-            if request.enable_iframe_playlist {
-                progressive.set_enable_iframe_playlist(true);
-            }
-
-            // Thread DVR window duration
-            if let Some(dvr_window) = request.dvr_window_duration {
-                progressive.set_dvr_window_duration(dvr_window);
-            }
-
-            // Thread content steering (webhook override > source)
-            let effective_steering = request.content_steering.clone()
-                .or_else(|| source.content_steering.clone());
-            if let Some(cs) = effective_steering {
-                progressive.set_content_steering(cs);
-            }
-
-            // Thread cache control overrides
-            if let Some(ref cc) = request.cache_control {
-                progressive.set_cache_control(cc.clone());
-            }
 
             // Process first segment for this scheme
             let params = SegmentRewriteParams {
@@ -647,46 +634,99 @@ impl RepackagePipeline {
             };
             let new_segment = segment::rewrite_segment(&seg_data, &params)?;
 
-            // I-frame playlist: record byte range of first IDR chunk
-            if request.enable_iframe_playlist {
-                let boundaries = crate::media::chunk::detect_chunk_boundaries(&new_segment);
-                if let Some(idr) = boundaries.iter().find(|b| b.independent) {
-                    let ext = container_format.video_segment_extension();
-                    let seg_uri = format!("/repackage/{content_id}/{fmt}_{scheme_str}/segment_0{ext}");
-                    progressive.add_iframe_info(IFrameSegmentInfo {
-                        segment_number: 0,
-                        byte_offset: idr.offset as u64,
-                        byte_length: idr.size as u64,
-                        duration: first_duration,
-                        segment_uri: seg_uri,
-                    });
-                }
-            }
-
-            // Store segment
+            // Store segment with format-agnostic key (shared across HLS/DASH)
             self.cache.set(
-                &CacheKeys::media_segment_for_scheme(content_id, &fmt, scheme_str, 0),
+                &CacheKeys::media_segment_for_scheme_only(content_id, scheme_str, 0),
                 &new_segment,
                 ttl,
             )?;
 
-            progressive.add_segment(0, new_segment, first_duration);
-            for ab in &ad_breaks {
-                progressive.add_ad_break(ab.clone());
-            }
-            if is_last {
-                progressive.finalize();
-            }
+            scheme_segments.push((target_scheme, new_segment));
+        }
 
-            // Save manifest state
-            let manifest_state = progressive.manifest_state();
-            let state_json = serde_json::to_vec(manifest_state)
-                .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
-            self.cache.set(
-                &CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str),
-                &state_json,
-                ttl,
-            )?;
+        // Build per-(format, scheme) manifest states
+        for &out_format in &request.output_formats {
+            let out_fmt = format_str(out_format);
+            for &(target_scheme, ref new_segment) in &scheme_segments {
+                let scheme_str = target_scheme.scheme_type_str();
+
+                let base_url = format!("/repackage/{content_id}/{out_fmt}_{scheme_str}/");
+                let drm_info = if target_scheme.is_encrypted() {
+                    let ks = key_set.as_ref().unwrap();
+                    Some(build_manifest_drm_info(ks, &primary_kid, &key_mapping, target_scheme, &request.drm_systems))
+                } else {
+                    None
+                };
+                let mut progressive = ProgressiveOutput::new(
+                    content_id.clone(),
+                    out_format,
+                    base_url.clone(),
+                    drm_info,
+                    container_format,
+                );
+                progressive.set_variants(build_variants_from_tracks(&tracks));
+                // Note: init segment is stored separately, progressive only needs to track metadata
+                progressive.set_init_segment(
+                    // Use a zero-length placeholder — the actual init bytes are in the format-agnostic cache key
+                    Vec::new(),
+                );
+
+                // Thread I-frame playlist flag
+                if request.enable_iframe_playlist {
+                    progressive.set_enable_iframe_playlist(true);
+                }
+
+                // Thread DVR window duration
+                if let Some(dvr_window) = request.dvr_window_duration {
+                    progressive.set_dvr_window_duration(dvr_window);
+                }
+
+                // Thread content steering (webhook override > source)
+                let effective_steering = request.content_steering.clone()
+                    .or_else(|| source.content_steering.clone());
+                if let Some(cs) = effective_steering {
+                    progressive.set_content_steering(cs);
+                }
+
+                // Thread cache control overrides
+                if let Some(ref cc) = request.cache_control {
+                    progressive.set_cache_control(cc.clone());
+                }
+
+                // I-frame playlist: record byte range of first IDR chunk
+                if request.enable_iframe_playlist {
+                    let boundaries = crate::media::chunk::detect_chunk_boundaries(new_segment);
+                    if let Some(idr) = boundaries.iter().find(|b| b.independent) {
+                        let ext = container_format.video_segment_extension();
+                        let seg_uri = format!("{base_url}segment_0{ext}");
+                        progressive.add_iframe_info(IFrameSegmentInfo {
+                            segment_number: 0,
+                            byte_offset: idr.offset as u64,
+                            byte_length: idr.size as u64,
+                            duration: first_duration,
+                            segment_uri: seg_uri,
+                        });
+                    }
+                }
+
+                progressive.add_segment(0, new_segment.clone(), first_duration);
+                for ab in &ad_breaks {
+                    progressive.add_ad_break(ab.clone());
+                }
+                if is_last {
+                    progressive.finalize();
+                }
+
+                // Save manifest state (per format+scheme)
+                let manifest_state = progressive.manifest_state();
+                let state_json = serde_json::to_vec(manifest_state)
+                    .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
+                self.cache.set(
+                    &CacheKeys::manifest_state_for_scheme(content_id, &out_fmt, scheme_str),
+                    &state_json,
+                    ttl,
+                )?;
+            }
         }
 
         let state = if is_last {
@@ -739,6 +779,13 @@ impl RepackagePipeline {
             })?;
         let target_schemes: Vec<EncryptionScheme> = serde_json::from_slice(&schemes_data)
             .map_err(|e| EdgepackError::Cache(format!("deserialize target schemes: {e}")))?;
+
+        // Load target formats list (Phase 21: multi-format)
+        let target_formats: Vec<OutputFormat> = self
+            .cache
+            .get(&CacheKeys::target_formats(content_id))?
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_else(|| vec![format]); // backward compat: default to current format
 
         // Use first scheme's manifest state to determine progress (all schemes are in sync)
         let first_scheme_str = target_schemes[0].scheme_type_str();
@@ -795,8 +842,9 @@ impl RepackagePipeline {
         // Extract SCTE-35 ad breaks from emsg boxes
         let ad_breaks = extract_ad_breaks_from_segment(&seg_data, i as u32, elapsed_time);
 
-        // Process for each target scheme
+        // Rewrite segment once per scheme (format-agnostic)
         let mut needs_keys = false;
+        let mut scheme_segments: Vec<(EncryptionScheme, Vec<u8>, ContainerFormat)> = Vec::new();
         for target_scheme in &target_schemes {
             let scheme_str = target_scheme.scheme_type_str();
 
@@ -834,72 +882,82 @@ impl RepackagePipeline {
 
             let new_segment = segment::rewrite_segment(&seg_data, &params)?;
 
-            // Store segment
+            // Store segment with format-agnostic key (shared across HLS/DASH)
             self.cache.set(
-                &CacheKeys::media_segment_for_scheme(content_id, &fmt, scheme_str, i as u32),
+                &CacheKeys::media_segment_for_scheme_only(content_id, scheme_str, i as u32),
                 &new_segment,
                 ttl,
             )?;
 
-            // Load and update manifest state for this scheme
-            let state_data = self
-                .cache
-                .get(&CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str))?
-                .ok_or_else(|| {
-                    EdgepackError::Cache(format!(
-                        "manifest state not found in cache for {content_id}/{fmt}_{scheme_str}"
-                    ))
-                })?;
-            let mut manifest_state: ManifestState = serde_json::from_slice(&state_data)
-                .map_err(|e| EdgepackError::Cache(format!("deserialize manifest state: {e}")))?;
+            scheme_segments.push((*target_scheme, new_segment, continuation.container_format));
+        }
 
-            // I-frame playlist: record byte range of first IDR chunk
-            if manifest_state.enable_iframe_playlist {
-                let boundaries = crate::media::chunk::detect_chunk_boundaries(&new_segment);
-                if let Some(idr) = boundaries.iter().find(|b| b.independent) {
-                    let ext = continuation.container_format.video_segment_extension();
-                    let seg_uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
-                    manifest_state.iframe_segments.push(IFrameSegmentInfo {
-                        segment_number: i as u32,
-                        byte_offset: idr.offset as u64,
-                        byte_length: idr.size as u64,
-                        duration,
-                        segment_uri: seg_uri,
-                    });
+        // Update per-(format, scheme) manifest states
+        for &out_format in &target_formats {
+            let out_fmt = format_str(out_format);
+            for &(ref target_scheme, ref new_segment, container_format) in &scheme_segments {
+                let scheme_str = target_scheme.scheme_type_str();
+
+                // Load and update manifest state for this format+scheme
+                let state_data = self
+                    .cache
+                    .get(&CacheKeys::manifest_state_for_scheme(content_id, &out_fmt, scheme_str))?
+                    .ok_or_else(|| {
+                        EdgepackError::Cache(format!(
+                            "manifest state not found in cache for {content_id}/{out_fmt}_{scheme_str}"
+                        ))
+                    })?;
+                let mut manifest_state: ManifestState = serde_json::from_slice(&state_data)
+                    .map_err(|e| EdgepackError::Cache(format!("deserialize manifest state: {e}")))?;
+
+                // I-frame playlist: record byte range of first IDR chunk
+                if manifest_state.enable_iframe_playlist {
+                    let boundaries = crate::media::chunk::detect_chunk_boundaries(new_segment);
+                    if let Some(idr) = boundaries.iter().find(|b| b.independent) {
+                        let ext = container_format.video_segment_extension();
+                        let seg_uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
+                        manifest_state.iframe_segments.push(IFrameSegmentInfo {
+                            segment_number: i as u32,
+                            byte_offset: idr.offset as u64,
+                            byte_length: idr.size as u64,
+                            duration,
+                            segment_uri: seg_uri,
+                        });
+                    }
                 }
+
+                let ext = container_format.video_segment_extension();
+                let uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
+
+                manifest_state.segments.push(SegmentInfo {
+                    number: i as u32,
+                    duration,
+                    uri,
+                    byte_size: new_segment.len() as u64,
+                    key_period: None,
+                });
+                if duration > manifest_state.target_duration {
+                    manifest_state.target_duration = duration;
+                }
+
+                // Add ad breaks from this segment
+                for ab in &ad_breaks {
+                    manifest_state.ad_breaks.push(ab.clone());
+                }
+
+                if is_last {
+                    manifest_state.phase = ManifestPhase::Complete;
+                }
+
+                // Save updated manifest state
+                let state_json = serde_json::to_vec(&manifest_state)
+                    .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
+                self.cache.set(
+                    &CacheKeys::manifest_state_for_scheme(content_id, &out_fmt, scheme_str),
+                    &state_json,
+                    ttl,
+                )?;
             }
-
-            let ext = continuation.container_format.video_segment_extension();
-            let uri = format!("{}segment_{i}{ext}", manifest_state.base_url);
-
-            manifest_state.segments.push(SegmentInfo {
-                number: i as u32,
-                duration,
-                uri,
-                byte_size: new_segment.len() as u64,
-                key_period: None,
-            });
-            if duration > manifest_state.target_duration {
-                manifest_state.target_duration = duration;
-            }
-
-            // Add ad breaks from this segment
-            for ab in &ad_breaks {
-                manifest_state.ad_breaks.push(ab.clone());
-            }
-
-            if is_last {
-                manifest_state.phase = ManifestPhase::Complete;
-            }
-
-            // Save updated manifest state
-            let state_json = serde_json::to_vec(&manifest_state)
-                .map_err(|e| EdgepackError::Cache(format!("serialize manifest state: {e}")))?;
-            self.cache.set(
-                &CacheKeys::manifest_state_for_scheme(content_id, &fmt, scheme_str),
-                &state_json,
-                ttl,
-            )?;
         }
 
         let completed = (i + 1) as u32;
@@ -1345,6 +1403,7 @@ impl RepackagePipeline {
         let _ = self.cache.delete(&CacheKeys::speke_response(content_id));
         let _ = self.cache.delete(&CacheKeys::source_manifest(content_id, &fmt));
         let _ = self.cache.delete(&CacheKeys::target_schemes(content_id, &fmt));
+        let _ = self.cache.delete(&CacheKeys::target_formats(content_id));
         // Delete per-scheme rewrite params
         for scheme in target_schemes {
             let scheme_str = scheme.scheme_type_str();
@@ -2510,11 +2569,12 @@ mod tests {
         pipeline.cleanup_sensitive_data("my-content", OutputFormat::Hls, &[EncryptionScheme::Cenc]);
 
         let keys = deleted.lock().unwrap();
-        assert_eq!(keys.len(), 5);
+        assert_eq!(keys.len(), 6);
         assert!(keys.contains(&"ep:my-content:keys".to_string()));
         assert!(keys.contains(&"ep:my-content:speke".to_string()));
         assert!(keys.contains(&"ep:my-content:hls:source".to_string()));
         assert!(keys.contains(&"ep:my-content:hls:target_schemes".to_string()));
+        assert!(keys.contains(&"ep:my-content:target_formats".to_string()));
         assert!(keys.contains(&"ep:my-content:hls_cenc:rewrite_params".to_string()));
     }
 
@@ -2526,11 +2586,12 @@ mod tests {
         pipeline.cleanup_sensitive_data("content-42", OutputFormat::Dash, &[EncryptionScheme::Cbcs]);
 
         let keys = deleted.lock().unwrap();
-        assert_eq!(keys.len(), 5);
+        assert_eq!(keys.len(), 6);
         assert!(keys.contains(&"ep:content-42:keys".to_string()));
         assert!(keys.contains(&"ep:content-42:speke".to_string()));
         assert!(keys.contains(&"ep:content-42:dash:source".to_string()));
         assert!(keys.contains(&"ep:content-42:dash:target_schemes".to_string()));
+        assert!(keys.contains(&"ep:content-42:target_formats".to_string()));
         assert!(keys.contains(&"ep:content-42:dash_cbcs:rewrite_params".to_string()));
     }
 
@@ -2546,9 +2607,10 @@ mod tests {
         );
 
         let keys = deleted.lock().unwrap();
-        assert_eq!(keys.len(), 6);
+        assert_eq!(keys.len(), 7);
         assert!(keys.contains(&"ep:dual-content:hls_cenc:rewrite_params".to_string()));
         assert!(keys.contains(&"ep:dual-content:hls_cbcs:rewrite_params".to_string()));
+        assert!(keys.contains(&"ep:dual-content:target_formats".to_string()));
     }
 
     #[test]
