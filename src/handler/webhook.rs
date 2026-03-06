@@ -53,6 +53,9 @@ pub struct WebhookPayload {
     /// Content steering configuration. When set, output manifests include steering directives.
     #[serde(default)]
     pub content_steering: Option<ContentSteeringInput>,
+    /// Per-request cache-control header overrides.
+    #[serde(default)]
+    pub cache_control: Option<CacheControlInput>,
 }
 
 /// Raw key input from webhook (hex-encoded strings).
@@ -81,6 +84,26 @@ pub struct ContentSteeringInput {
     /// Whether to query the steering server before playback starts (DASH only).
     #[serde(default)]
     pub query_before_start: Option<bool>,
+}
+
+/// Cache-control header overrides from webhook.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CacheControlInput {
+    /// Max-age for segments and init segments (seconds).
+    #[serde(default)]
+    pub segment_max_age: Option<u64>,
+    /// Max-age for finalized/VOD manifests (seconds).
+    #[serde(default)]
+    pub final_manifest_max_age: Option<u64>,
+    /// Max-age (browser cache) for live manifests (seconds).
+    #[serde(default)]
+    pub live_manifest_max_age: Option<u64>,
+    /// s-maxage (CDN/shared cache) for live manifests (seconds).
+    #[serde(default)]
+    pub live_manifest_s_maxage: Option<u64>,
+    /// Whether to include `immutable` on segments and finalized manifests.
+    #[serde(default)]
+    pub immutable: Option<bool>,
 }
 
 impl WebhookPayload {
@@ -263,6 +286,17 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         None => None,
     };
 
+    // Parse cache control overrides
+    let cache_control = payload.cache_control.map(|cc| {
+        crate::config::CacheControlConfig {
+            segment_max_age: cc.segment_max_age,
+            final_manifest_max_age: cc.final_manifest_max_age,
+            live_manifest_max_age: cc.live_manifest_max_age,
+            live_manifest_s_maxage: cc.live_manifest_s_maxage,
+            immutable: cc.immutable,
+        }
+    });
+
     let request = RepackageRequest {
         content_id: payload.content_id.clone(),
         source_url: payload.source_url,
@@ -277,6 +311,7 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
         enable_iframe_playlist: payload.enable_iframe_playlist.unwrap_or(false),
         dvr_window_duration: payload.dvr_window_duration,
         content_steering,
+        cache_control,
     };
 
     // Hybrid mode (JIT feature): if JIT has already set up this content,
@@ -703,6 +738,7 @@ mod tests {
             enable_iframe_playlist: None,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let parsed: WebhookPayload = serde_json::from_str(&json).unwrap();
@@ -713,6 +749,96 @@ mod tests {
         assert!(parsed.enable_iframe_playlist.is_none());
         assert!(parsed.dvr_window_duration.is_none());
         assert!(parsed.content_steering.is_none());
+        assert!(parsed.cache_control.is_none());
+    }
+
+    #[test]
+    fn webhook_payload_cache_control_full() {
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","cache_control":{"segment_max_age":86400,"final_manifest_max_age":3600,"live_manifest_max_age":5,"live_manifest_s_maxage":10,"immutable":false}}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        let cc = parsed.cache_control.unwrap();
+        assert_eq!(cc.segment_max_age, Some(86400));
+        assert_eq!(cc.final_manifest_max_age, Some(3600));
+        assert_eq!(cc.live_manifest_max_age, Some(5));
+        assert_eq!(cc.live_manifest_s_maxage, Some(10));
+        assert_eq!(cc.immutable, Some(false));
+    }
+
+    #[test]
+    fn webhook_payload_cache_control_minimal() {
+        // Only one field set — rest should be None
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","cache_control":{"segment_max_age":300}}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        let cc = parsed.cache_control.unwrap();
+        assert_eq!(cc.segment_max_age, Some(300));
+        assert!(cc.final_manifest_max_age.is_none());
+        assert!(cc.live_manifest_max_age.is_none());
+        assert!(cc.live_manifest_s_maxage.is_none());
+        assert!(cc.immutable.is_none());
+    }
+
+    #[test]
+    fn webhook_payload_cache_control_empty_object() {
+        // Empty cache_control object — all fields None but struct is Some
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","cache_control":{}}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        let cc = parsed.cache_control.unwrap();
+        assert!(cc.segment_max_age.is_none());
+        assert!(cc.final_manifest_max_age.is_none());
+        assert!(cc.immutable.is_none());
+    }
+
+    #[test]
+    fn webhook_payload_cache_control_absent() {
+        // Old JSON without cache_control → None
+        let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls"}"#;
+        let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
+        assert!(parsed.cache_control.is_none());
+    }
+
+    #[test]
+    fn cache_control_input_serde_roundtrip() {
+        let input = CacheControlInput {
+            segment_max_age: Some(3600),
+            final_manifest_max_age: Some(86400),
+            live_manifest_max_age: Some(2),
+            live_manifest_s_maxage: Some(5),
+            immutable: Some(false),
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let parsed: CacheControlInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.segment_max_age, Some(3600));
+        assert_eq!(parsed.final_manifest_max_age, Some(86400));
+        assert_eq!(parsed.live_manifest_max_age, Some(2));
+        assert_eq!(parsed.live_manifest_s_maxage, Some(5));
+        assert_eq!(parsed.immutable, Some(false));
+    }
+
+    #[test]
+    fn webhook_cache_control_threads_to_request() {
+        // Verify that cache_control in the webhook payload maps to RepackageRequest
+        let ctx = test_context();
+        let payload = serde_json::json!({
+            "content_id": "cc-test",
+            "source_url": "https://example.com/source.m3u8",
+            "format": "hls",
+            "cache_control": {
+                "live_manifest_max_age": 10,
+                "immutable": false
+            }
+        });
+        let req = make_webhook_request(Some(serde_json::to_vec(&payload).unwrap()));
+        // The webhook handler will construct a RepackageRequest internally.
+        // On native targets, the pipeline fails (HTTP client stub), returning 500.
+        // The key assertion: it does NOT fail on cache_control parsing/validation.
+        let resp = handle_repackage_webhook(&req, &ctx);
+        match resp {
+            Ok(r) => assert!(r.status == 200 || r.status == 500),
+            Err(e) => assert!(
+                !e.to_string().contains("cache_control"),
+                "cache_control should be accepted, got: {e}"
+            ),
+        }
     }
 
     #[test]

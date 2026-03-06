@@ -64,6 +64,22 @@ struct RepackagePayload {
     target_scheme: Option<String>,
     #[serde(default = "default_container_format")]
     container_format: String,
+    #[serde(default)]
+    cache_control: Option<CacheControlPayload>,
+}
+
+#[derive(Deserialize)]
+struct CacheControlPayload {
+    #[serde(default)]
+    segment_max_age: Option<u64>,
+    #[serde(default)]
+    final_manifest_max_age: Option<u64>,
+    #[serde(default)]
+    live_manifest_max_age: Option<u64>,
+    #[serde(default)]
+    live_manifest_s_maxage: Option<u64>,
+    #[serde(default)]
+    immutable: Option<bool>,
 }
 
 fn default_speke_auth_type() -> String {
@@ -275,6 +291,13 @@ async fn handle_repackage(
         enable_iframe_playlist: false,
         dvr_window_duration: None,
         content_steering: None,
+        cache_control: payload.cache_control.map(|cc| edgepack::config::CacheControlConfig {
+            segment_max_age: cc.segment_max_age,
+            final_manifest_max_age: cc.final_manifest_max_age,
+            live_manifest_max_age: cc.live_manifest_max_age,
+            live_manifest_s_maxage: cc.live_manifest_s_maxage,
+            immutable: cc.immutable,
+        }),
     };
 
     // Track the job
@@ -961,6 +984,27 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
       <label><input type="radio" name="container-format" value="iso"> ISO BMFF (.mp4)</label>
     </div>
 
+    <details style="margin-bottom:1rem;">
+      <summary style="cursor:pointer;font-size:0.8rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Cache-Control Overrides</summary>
+      <div style="margin-top:0.75rem;">
+        <label for="cc-seg-max-age">Segment max-age (seconds)</label>
+        <input type="text" id="cc-seg-max-age" placeholder="31536000 (default)">
+
+        <label for="cc-final-max-age">Final Manifest max-age (seconds)</label>
+        <input type="text" id="cc-final-max-age" placeholder="31536000 (default)">
+
+        <label for="cc-live-max-age">Live Manifest max-age (seconds)</label>
+        <input type="text" id="cc-live-max-age" placeholder="1 (default)">
+
+        <label for="cc-live-s-maxage">Live Manifest s-maxage (seconds)</label>
+        <input type="text" id="cc-live-s-maxage" placeholder="same as max-age (default)">
+
+        <label style="display:flex;align-items:center;gap:0.5rem;text-transform:none;letter-spacing:0;font-size:0.875rem;color:var(--text);cursor:pointer;">
+          <input type="checkbox" id="cc-immutable" checked style="accent-color:var(--accent);"> Include immutable directive
+        </label>
+      </div>
+    </details>
+
     <button id="submit-btn" onclick="startRepackage()">Repackage</button>
   </div>
 
@@ -1058,6 +1102,22 @@ async function startRepackage() {
 
   const targetSchemes = targetSchemeValue === 'both' ? ['cenc', 'cbcs'] : [targetSchemeValue];
 
+  // Build cache_control overrides (only include non-empty fields)
+  const ccSegMaxAge = document.getElementById('cc-seg-max-age').value;
+  const ccFinalMaxAge = document.getElementById('cc-final-max-age').value;
+  const ccLiveMaxAge = document.getElementById('cc-live-max-age').value;
+  const ccLiveSMaxAge = document.getElementById('cc-live-s-maxage').value;
+  const ccImmutable = document.getElementById('cc-immutable').checked;
+  let cacheControl = null;
+  if (ccSegMaxAge || ccFinalMaxAge || ccLiveMaxAge || ccLiveSMaxAge || !ccImmutable) {
+    cacheControl = {};
+    if (ccSegMaxAge) cacheControl.segment_max_age = parseInt(ccSegMaxAge, 10);
+    if (ccFinalMaxAge) cacheControl.final_manifest_max_age = parseInt(ccFinalMaxAge, 10);
+    if (ccLiveMaxAge) cacheControl.live_manifest_max_age = parseInt(ccLiveMaxAge, 10);
+    if (ccLiveSMaxAge) cacheControl.live_manifest_s_maxage = parseInt(ccLiveSMaxAge, 10);
+    if (!ccImmutable) cacheControl.immutable = false;
+  }
+
   const body = {
     source_url: sourceInput.value,
     speke_url: document.getElementById('speke-url').value,
@@ -1067,6 +1127,7 @@ async function startRepackage() {
     output_format: outputFormat,
     target_schemes: targetSchemes,
     container_format: containerFormat,
+    cache_control: cacheControl,
   };
 
   try {

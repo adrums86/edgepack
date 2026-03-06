@@ -102,7 +102,7 @@ Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md).
 
 ### Two-Tier Caching
 
-- **CDN cache** (primary): HTTP `Cache-Control` headers on responses. Segments and finalised manifests use `max-age=31536000, immutable`. Live manifests use `max-age=1, s-maxage=1`.
+- **CDN cache** (primary): HTTP `Cache-Control` headers on responses. Default TTLs: segments and finalised manifests use `max-age=31536000, immutable`; live manifests use `max-age=1, s-maxage=1`. TTLs are configurable at three levels: env var system defaults (`CACHE_MAX_AGE_SEGMENTS`, `CACHE_MAX_AGE_MANIFEST_LIVE`, `CACHE_MAX_AGE_MANIFEST_FINAL`), per-request overrides via `CacheControlConfig` on `RepackageRequest`/`WebhookPayload`, and hardcoded safety invariants (`AwaitingFirstSegment` → always `no-cache`, status endpoint → always `no-cache`, `public` prefix → always present). Per-request overrides apply to manifests only — segments use system defaults to avoid extra Redis GET per segment request.
 - **Cache backend** (application state): Stores DRM keys, job state, SPEKE response cache, progressive manifest state, and rewritten media data (init segments, media segments) for the split execution path (`execute_first()`/`execute_remaining()`). The `execute()` path (sandbox) does not cache media data — it returns output directly via `ProgressiveOutput`. Backend is configurable: Redis HTTP (default), Redis TCP, Cloudflare Workers KV (`cloudflare` feature), or generic HTTP KV (for AWS DynamoDB, Akamai EdgeKV, custom stores).
 
 ### Encryption Transform
@@ -339,7 +339,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,211 tests** total (with `--features jit,cloudflare`): 875 unit tests and 336 integration tests. With `--features jit,cloudflare,ts`: **1,290 tests** (922 unit + 368 integration). Without optional features: **1,154 tests**. All run on the native host target.
+The project has **1,291 tests** total (with `--features jit,cloudflare`): 909 unit tests and 382 integration tests. With `--features jit,cloudflare,ts`: **1,370 tests** (956 unit + 414 integration). Without optional features: **1,234 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -347,13 +347,13 @@ Per-feature binary size tests in `tests/wasm_binary_size.rs` prevent dependency 
 
 | Test | Features | Limit | Current Size | Functions |
 |------|----------|-------|-------------|-----------|
-| `wasm_base_binary_size` | none | 700 KB | ~668 KB | ~1,973 |
+| `wasm_base_binary_size` | none | 720 KB | ~687 KB | ~2,069 |
 | `wasm_jit_binary_size` | `jit` | 750 KB | ~700 KB | ~2,030 |
 | `wasm_full_binary_size` | `jit,cloudflare` | 750 KB | ~704 KB | ~2,033 |
 
 JIT adds ~33 KB (60 functions) over base. Cloudflare adds only ~4.5 KB (11 functions). Binary size is the primary cold start proxy — WASM instantiation time is proportional to module size and function count. Function counts are reported via `wasm-tools objdump` if installed (informational, not enforced).
 
-### Unit Tests (922 with all features incl. ts)
+### Unit Tests (956 with all features incl. ts)
 
 Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
@@ -378,7 +378,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
 
-### Integration Tests (368 with all features incl. ts)
+### Integration Tests (414 with all features incl. ts)
 
 Located in the `tests/` directory. These exercise cross-module workflows using synthetic CMAF fixtures with no external dependencies:
 
@@ -402,8 +402,9 @@ tests/
 ├── trick_play.rs             27 tests: HLS I-frame playlist (BYTERANGE, DRM, endlist, disabled), master I-frame stream, DASH trick play, serde compat, container formats, route handling
 ├── dvr_window.rs             25 tests: HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats
 ├── content_steering.rs       20 tests: HLS master steering tag (full, URI-only, position, backward compat), DASH steering element (full, proxy-only, qbs, position), DASH input parsing (full, minimal, backward compat), serde roundtrips, override priority
+├── cache_control.rs          43 tests: system defaults (HLS/DASH, all phases), per-request overrides (live/final/segment max-age, s-maxage split, immutable toggle), safety invariants, progressive output integration (HLS + DASH), backward compat, DVR + cache control, container format + cache control, system CacheConfig overrides, DASH per-request overrides, segment handler design documentation, JIT cache_control:None documentation
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
-├── output_integrity.rs       18 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame)
+├── output_integrity.rs       21 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants
 └── wasm_binary_size.rs        5 tests: per-feature WASM binary size guards (base, jit, full, ts, full+ts)
 ```
 
@@ -489,6 +490,9 @@ Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mo
 | `STORE_TOKEN` | Yes* | — | Cache store auth token |
 | `CACHE_BACKEND` | No | `redis_http` | Backend type: `redis_http`, `redis_tcp`, `cloudflare_kv`, `http_kv` |
 | `CACHE_ENCRYPTION_TOKEN` | No | `STORE_TOKEN` | Token for cache encryption key derivation |
+| `CACHE_MAX_AGE_SEGMENTS` | No | `31536000` | Default max-age for segments and init segments (1 year) |
+| `CACHE_MAX_AGE_MANIFEST_LIVE` | No | `1` | Default max-age for live manifests |
+| `CACHE_MAX_AGE_MANIFEST_FINAL` | No | `31536000` | Default max-age for finalized/VOD manifests |
 | `REDIS_URL` | Yes* | — | Redis endpoint (backward compat alias for `STORE_URL`) |
 | `REDIS_TOKEN` | Yes* | — | Redis auth token (backward compat alias for `STORE_TOKEN`) |
 | `REDIS_BACKEND` | No | `http` | Legacy backend type: `http` or `tcp` (overridden by `CACHE_BACKEND`) |
@@ -607,4 +611,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Refactoring Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, and 17 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 19 (Configurable Cache-Control Headers), 20 (Multi-Source Manifest Merging), 21 (Generic HLS/DASH Pipeline). P3: 22 (TS Segment Output), 23 (MoQ Ingest — feature-gated, requires research).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, and 19 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 20 (Multi-Source Manifest Merging), 21 (Generic HLS/DASH Pipeline). P3: 22 (TS Segment Output), 23 (MoQ Ingest — feature-gated, requires research).

@@ -71,6 +71,9 @@ pub struct RepackageRequest {
     /// steering directives (HLS `#EXT-X-CONTENT-STEERING`, DASH `<ContentSteering>`).
     #[serde(default)]
     pub content_steering: Option<crate::manifest::types::ContentSteeringConfig>,
+    /// Per-request cache-control header overrides. When None, system defaults are used.
+    #[serde(default)]
+    pub cache_control: Option<crate::config::CacheControlConfig>,
 }
 
 fn default_target_schemes() -> Vec<EncryptionScheme> {
@@ -139,6 +142,7 @@ mod tests {
             enable_iframe_playlist: false,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         };
         assert_eq!(req.content_id, "movie-123");
         assert_eq!(req.output_format, OutputFormat::Hls);
@@ -167,6 +171,7 @@ mod tests {
             enable_iframe_playlist: false,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -208,6 +213,7 @@ mod tests {
             enable_iframe_playlist: false,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -285,6 +291,7 @@ mod tests {
             enable_iframe_playlist: false,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -413,6 +420,7 @@ mod tests {
             enable_iframe_playlist: false,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();
@@ -434,5 +442,6 @@ mod tests {
         assert!(parsed.drm_systems.is_empty());
         assert!(!parsed.enable_iframe_playlist);
         assert!(parsed.dvr_window_duration.is_none());
+        assert!(parsed.cache_control.is_none());
     }
 }

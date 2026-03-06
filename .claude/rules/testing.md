@@ -13,6 +13,7 @@ paths:
 - To run with all features (excl. TS): add `--features jit,cloudflare`.
 - To run with all features (incl. TS): add `--features jit,cloudflare,ts`.
 - TS-specific tests are gated behind `#[cfg(feature = "ts")]` — they only run with `--features ts`.
-- Output integrity tests (`tests/output_integrity.rs`) validate structural correctness across all input/output lanes: segment ISOBMFF structure, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips.
+- Output integrity tests (`tests/output_integrity.rs`) validate structural correctness across all input/output lanes: segment ISOBMFF structure, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips, cache-control body invariants (manifest body unchanged with cache_control overrides, AwaitingFirstSegment always no-cache).
+- Cache control tests (`tests/cache_control.rs`) validate configurable cache-control headers: system defaults, per-request overrides, safety invariants, progressive output integration, backward compat, DVR/container format interactions.
 - Criterion benchmarks (`benches/jit_latency.rs`) measure JIT-critical latencies: `cargo bench --target $(rustc -vV | grep host | awk '{print $2}') --bench jit_latency`.
 - When calling `parse_trun`/`parse_senc`/`parse_pssh`, pass the box **payload** (after header), not the full box including header.

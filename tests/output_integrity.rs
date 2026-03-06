@@ -852,3 +852,75 @@ fn find_senc_recursive(data: &[u8], iv_size: u8) -> Option<cmaf::SampleEncryptio
     }
     None
 }
+
+// ─── Cache-Control Integrity Tests ──────────────────────────────────
+
+/// Manifest body is unaffected by cache_control settings.
+/// Cache-control only changes HTTP headers, not manifest content.
+#[test]
+fn manifest_body_unchanged_with_cache_control() {
+    use edgepack::config::CacheControlConfig;
+
+    let state_without = make_hls_manifest_state(3, ManifestPhase::Complete);
+    let rendered_without = manifest::render_manifest(&state_without).unwrap();
+
+    let mut state_with = make_hls_manifest_state(3, ManifestPhase::Complete);
+    state_with.cache_control = Some(CacheControlConfig {
+        segment_max_age: Some(600),
+        final_manifest_max_age: Some(3600),
+        live_manifest_max_age: Some(10),
+        live_manifest_s_maxage: Some(30),
+        immutable: Some(false),
+    });
+    let rendered_with = manifest::render_manifest(&state_with).unwrap();
+
+    assert_eq!(
+        rendered_without, rendered_with,
+        "cache_control must not affect manifest body content"
+    );
+}
+
+/// Safety invariant: AwaitingFirstSegment always produces no-cache,
+/// regardless of per-request overrides.
+#[test]
+fn awaiting_first_segment_always_no_cache_integrity() {
+    use edgepack::config::{CacheConfig, CacheControlConfig};
+
+    let mut state = make_hls_manifest_state(0, ManifestPhase::AwaitingFirstSegment);
+    state.cache_control = Some(CacheControlConfig {
+        segment_max_age: Some(999999),
+        final_manifest_max_age: Some(999999),
+        live_manifest_max_age: Some(999999),
+        live_manifest_s_maxage: Some(999999),
+        immutable: Some(true),
+    });
+    let system = CacheConfig::default();
+    assert_eq!(
+        state.manifest_cache_header(&system),
+        "no-cache",
+        "AwaitingFirstSegment must always produce no-cache regardless of overrides"
+    );
+}
+
+/// DASH manifest body is also unaffected by cache_control.
+#[test]
+fn dash_manifest_body_unchanged_with_cache_control() {
+    use edgepack::config::CacheControlConfig;
+
+    let state_without = make_dash_manifest_state(3, ManifestPhase::Complete);
+    let rendered_without = manifest::render_manifest(&state_without).unwrap();
+
+    let mut state_with = make_dash_manifest_state(3, ManifestPhase::Complete);
+    state_with.cache_control = Some(CacheControlConfig {
+        segment_max_age: Some(86400),
+        final_manifest_max_age: Some(7200),
+        immutable: Some(false),
+        ..Default::default()
+    });
+    let rendered_with = manifest::render_manifest(&state_with).unwrap();
+
+    assert_eq!(
+        rendered_without, rendered_with,
+        "cache_control must not affect DASH manifest body content"
+    );
+}

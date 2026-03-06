@@ -221,6 +221,11 @@ impl RepackagePipeline {
                 progressive.set_content_steering(cs);
             }
 
+            // Thread cache control overrides
+            if let Some(ref cc) = request.cache_control {
+                progressive.set_cache_control(cc.clone());
+            }
+
             outputs.push((target_scheme, progressive));
         }
 
@@ -620,6 +625,11 @@ impl RepackagePipeline {
                 .or_else(|| source.content_steering.clone());
             if let Some(cs) = effective_steering {
                 progressive.set_content_steering(cs);
+            }
+
+            // Thread cache control overrides
+            if let Some(ref cc) = request.cache_control {
+                progressive.set_cache_control(cc.clone());
             }
 
             // Process first segment for this scheme
@@ -1226,6 +1236,7 @@ impl RepackagePipeline {
             enable_iframe_playlist: false,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         };
 
         let state_json = serde_json::to_vec(&manifest_state)

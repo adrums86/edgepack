@@ -284,6 +284,7 @@ fn repackage_request_content_steering_serde_roundtrip() {
             default_pathway_id: Some("cdn-a".into()),
             query_before_start: Some(true),
         }),
+        cache_control: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();

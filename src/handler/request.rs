@@ -2,7 +2,7 @@ use crate::cache::CacheKeys;
 use crate::error::Result;
 use crate::handler::{format_str, HandlerContext, HttpResponse};
 use crate::manifest;
-use crate::manifest::types::{ManifestPhase, ManifestState, OutputFormat};
+use crate::manifest::types::{ManifestState, OutputFormat};
 use crate::repackager::JobStatus;
 
 /// Handle a request for a manifest.
@@ -174,17 +174,7 @@ pub fn handle_iframe_manifest_request(
 
     match manifest::render_iframe_manifest(&state)? {
         Some(playlist) => {
-            let cache_control = match state.phase {
-                ManifestPhase::Complete => format!(
-                    "public, max-age={}, immutable",
-                    ctx.config.cache.vod_max_age
-                ),
-                ManifestPhase::Live => format!(
-                    "public, max-age={m}, s-maxage={m}",
-                    m = ctx.config.cache.live_manifest_max_age
-                ),
-                ManifestPhase::AwaitingFirstSegment => "no-cache".to_string(),
-            };
+            let cache_control = state.manifest_cache_header(&ctx.config.cache);
             Ok(HttpResponse::ok_with_cache(
                 playlist.into_bytes(),
                 format.content_type(),
@@ -237,17 +227,7 @@ fn render_manifest_response(
 
     let manifest_body = manifest::render_manifest(&state)?;
 
-    let cache_control = match state.phase {
-        ManifestPhase::Complete => format!(
-            "public, max-age={}, immutable",
-            ctx.config.cache.vod_max_age
-        ),
-        ManifestPhase::Live => format!(
-            "public, max-age={m}, s-maxage={m}",
-            m = ctx.config.cache.live_manifest_max_age
-        ),
-        ManifestPhase::AwaitingFirstSegment => "no-cache".to_string(),
-    };
+    let cache_control = state.manifest_cache_header(&ctx.config.cache);
 
     Ok(HttpResponse::ok_with_cache(
         manifest_body.into_bytes(),

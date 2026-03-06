@@ -134,24 +134,71 @@ impl Default for DrmSystemIds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// Max-age in seconds for finalized (VOD) content. Default: 1 year.
+    /// Max-age in seconds for segments and init segments. Default: 1 year.
     pub vod_max_age: u64,
     /// Max-age in seconds for live/in-progress manifests. Default: 1 second.
     pub live_manifest_max_age: u64,
+    /// Max-age in seconds for finalized (VOD) manifests. Default: 1 year.
+    /// When not present in JSON, defaults to vod_max_age.
+    #[serde(default = "default_vod_max_age")]
+    pub final_manifest_max_age: u64,
     /// TTL in seconds for DRM keys stored in Redis. Default: 24 hours.
     pub drm_key_ttl: u64,
     /// TTL in seconds for job state stored in Redis. Default: 48 hours.
     pub job_state_ttl: u64,
 }
 
+fn default_vod_max_age() -> u64 {
+    31_536_000
+}
+
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            vod_max_age: 31_536_000, // 1 year
+            vod_max_age: 31_536_000,          // 1 year
             live_manifest_max_age: 1,
-            drm_key_ttl: 86_400,      // 24 hours
-            job_state_ttl: 172_800,    // 48 hours
+            final_manifest_max_age: 31_536_000, // 1 year
+            drm_key_ttl: 86_400,               // 24 hours
+            job_state_ttl: 172_800,             // 48 hours
         }
+    }
+}
+
+/// Per-request cache-control header configuration.
+///
+/// Controls the `Cache-Control` headers on HTTP responses for manifests.
+/// All fields are optional; when absent, the system-wide defaults from
+/// `CacheConfig` (env vars) are used.
+///
+/// Safety invariants (not overridable):
+/// - `AwaitingFirstSegment` manifests always use `no-cache`
+/// - Status endpoint always uses `no-cache`
+/// - All cacheable responses include `public`
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CacheControlConfig {
+    /// Max-age for segments and init segments (seconds). Default: 31536000 (1 year).
+    #[serde(default)]
+    pub segment_max_age: Option<u64>,
+    /// Max-age for finalized/VOD manifests (seconds). Default: 31536000 (1 year).
+    #[serde(default)]
+    pub final_manifest_max_age: Option<u64>,
+    /// Max-age (browser cache) for live manifests (seconds). Default: 1.
+    #[serde(default)]
+    pub live_manifest_max_age: Option<u64>,
+    /// s-maxage (CDN/shared cache) for live manifests (seconds).
+    /// When None, uses `live_manifest_max_age` value. Default: None (same as max-age).
+    #[serde(default)]
+    pub live_manifest_s_maxage: Option<u64>,
+    /// Whether to include `immutable` on segments and finalized manifests.
+    /// Default: true.
+    #[serde(default)]
+    pub immutable: Option<bool>,
+}
+
+impl CacheControlConfig {
+    /// Whether to include the `immutable` directive. Defaults to true.
+    pub fn is_immutable(&self) -> bool {
+        self.immutable.unwrap_or(true)
     }
 }
 
@@ -288,7 +335,19 @@ impl AppConfig {
                 speke_auth,
                 system_ids: DrmSystemIds::default(),
             },
-            cache: CacheConfig::default(),
+            cache: CacheConfig {
+                vod_max_age: env_var_or("CACHE_MAX_AGE_SEGMENTS", "31536000")
+                    .parse()
+                    .unwrap_or(31_536_000),
+                live_manifest_max_age: env_var_or("CACHE_MAX_AGE_MANIFEST_LIVE", "1")
+                    .parse()
+                    .unwrap_or(1),
+                final_manifest_max_age: env_var_or("CACHE_MAX_AGE_MANIFEST_FINAL", "31536000")
+                    .parse()
+                    .unwrap_or(31_536_000),
+                drm_key_ttl: 86_400,
+                job_state_ttl: 172_800,
+            },
             jit: JitConfig {
                 enabled: jit_enabled,
                 source_url_pattern: jit_source_url_pattern,
@@ -329,6 +388,7 @@ mod tests {
         let c = CacheConfig::default();
         assert_eq!(c.vod_max_age, 31_536_000);
         assert_eq!(c.live_manifest_max_age, 1);
+        assert_eq!(c.final_manifest_max_age, 31_536_000);
         assert_eq!(c.drm_key_ttl, 86_400);
         assert_eq!(c.job_state_ttl, 172_800);
     }
@@ -354,6 +414,15 @@ mod tests {
         let c2: CacheConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(c2.vod_max_age, c.vod_max_age);
         assert_eq!(c2.live_manifest_max_age, c.live_manifest_max_age);
+        assert_eq!(c2.final_manifest_max_age, c.final_manifest_max_age);
+    }
+
+    #[test]
+    fn cache_config_backward_compat_without_final_manifest() {
+        // Old JSON without final_manifest_max_age should deserialize with default
+        let json = r#"{"vod_max_age":31536000,"live_manifest_max_age":1,"drm_key_ttl":86400,"job_state_ttl":172800}"#;
+        let c: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.final_manifest_max_age, 31_536_000);
     }
 
     #[test]
@@ -515,5 +584,74 @@ mod tests {
         std::env::remove_var("REDIS_URL");
         let result = AppConfig::from_env();
         assert!(result.is_err());
+    }
+
+    // --- CacheControlConfig tests ---
+
+    #[test]
+    fn cache_control_config_default_is_all_none() {
+        let cc = CacheControlConfig::default();
+        assert_eq!(cc.segment_max_age, None);
+        assert_eq!(cc.final_manifest_max_age, None);
+        assert_eq!(cc.live_manifest_max_age, None);
+        assert_eq!(cc.live_manifest_s_maxage, None);
+        assert_eq!(cc.immutable, None);
+    }
+
+    #[test]
+    fn cache_control_config_is_immutable_defaults_true() {
+        let cc = CacheControlConfig::default();
+        assert!(cc.is_immutable());
+    }
+
+    #[test]
+    fn cache_control_config_is_immutable_explicit_false() {
+        let cc = CacheControlConfig {
+            immutable: Some(false),
+            ..Default::default()
+        };
+        assert!(!cc.is_immutable());
+    }
+
+    #[test]
+    fn cache_control_config_is_immutable_explicit_true() {
+        let cc = CacheControlConfig {
+            immutable: Some(true),
+            ..Default::default()
+        };
+        assert!(cc.is_immutable());
+    }
+
+    #[test]
+    fn cache_control_config_serde_roundtrip_full() {
+        let cc = CacheControlConfig {
+            segment_max_age: Some(86400),
+            final_manifest_max_age: Some(3600),
+            live_manifest_max_age: Some(2),
+            live_manifest_s_maxage: Some(1),
+            immutable: Some(false),
+        };
+        let json = serde_json::to_string(&cc).unwrap();
+        let parsed: CacheControlConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cc);
+    }
+
+    #[test]
+    fn cache_control_config_serde_roundtrip_partial() {
+        let cc = CacheControlConfig {
+            segment_max_age: Some(86400),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cc).unwrap();
+        let parsed: CacheControlConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.segment_max_age, Some(86400));
+        assert_eq!(parsed.final_manifest_max_age, None);
+        assert_eq!(parsed.immutable, None);
+    }
+
+    #[test]
+    fn cache_control_config_serde_empty_json() {
+        let cc: CacheControlConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cc, CacheControlConfig::default());
     }
 }

@@ -10,6 +10,7 @@
 
 mod common;
 
+use edgepack::config::CacheConfig;
 use edgepack::manifest::types::{
     ManifestDrmInfo, ManifestPhase, ManifestState, OutputFormat,
 };
@@ -46,7 +47,7 @@ fn progressive_output_hls_full_lifecycle() {
     );
     assert!(po.current_manifest().is_none());
     assert_eq!(
-        po.manifest_cache_control(31536000, 1),
+        po.manifest_cache_control(&CacheConfig::default()),
         "no-cache"
     );
 
@@ -69,7 +70,7 @@ fn progressive_output_hls_full_lifecycle() {
 
     // Verify Live cache control
     assert_eq!(
-        po.manifest_cache_control(31536000, 1),
+        po.manifest_cache_control(&CacheConfig::default()),
         "public, max-age=1, s-maxage=1"
     );
 
@@ -99,7 +100,7 @@ fn progressive_output_hls_full_lifecycle() {
 
     // Verify Complete cache control
     assert_eq!(
-        po.manifest_cache_control(31536000, 1),
+        po.manifest_cache_control(&CacheConfig::default()),
         "public, max-age=31536000, immutable"
     );
 }
@@ -390,13 +391,29 @@ fn manifest_state_serialization_roundtrip() {
 
 #[test]
 fn segment_cache_control_is_immutable() {
-    let cc = ProgressiveOutput::segment_cache_control(31536000);
+    let po = ProgressiveOutput::new(
+        "seg-cc-test".into(),
+        OutputFormat::Hls,
+        "/repackage/seg-cc-test/hls/".into(),
+        None,
+        ContainerFormat::default(),
+    );
+    let cc = po.segment_cache_control(&CacheConfig::default());
     assert_eq!(cc, "public, max-age=31536000, immutable");
 }
 
 #[test]
 fn segment_cache_control_custom_max_age() {
-    let cc = ProgressiveOutput::segment_cache_control(86400);
+    let po = ProgressiveOutput::new(
+        "seg-cc-test2".into(),
+        OutputFormat::Hls,
+        "/repackage/seg-cc-test2/hls/".into(),
+        None,
+        ContainerFormat::default(),
+    );
+    let mut system = CacheConfig::default();
+    system.vod_max_age = 86400;
+    let cc = po.segment_cache_control(&system);
     assert_eq!(cc, "public, max-age=86400, immutable");
 }
 

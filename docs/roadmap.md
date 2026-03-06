@@ -18,10 +18,11 @@
 | 14 | Content Steering & CDN Optimization | ✅ |
 | 16 | Compatibility Validation & Hardening | ✅ |
 | 17 | CDN Provider Adapters & Binary Optimization | ✅ |
+| 19 | Configurable Cache-Control Headers | ✅ |
 
 # Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, and 17 are complete. All P0 and P1 items are done. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, and 19 are complete. All P0 and P1 items are done. Remaining phases:
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -176,14 +177,21 @@ The current binary (~648 KB base, ~685 KB full) is well within cold start budget
 - Per-feature binary size tests in `tests/wasm_binary_size.rs` enforce limits per build variant — a failing test triggers the conversation about what to gate
 - Prefer lightweight built-in implementations over crate dependencies (as with `url.rs`) when the crate adds disproportionate WASM size
 
-### Phase 19: Configurable Cache-Control Headers — P2
-- Allow per-request configuration of `Cache-Control` max-age for segments and manifests
-- Currently hardcoded: segments and finalised manifests use `max-age=31536000, immutable`; live manifests use `max-age=1, s-maxage=1`
-- Add `cache_control` config to `RepackageRequest` / webhook payload with separate overrides for segments, live manifests, and finalised manifests
-- Support both `max-age` and `s-maxage` (shared/CDN cache vs private/browser cache) independently
-- Thread cache TTL config through `ContinuationParams` → `ProgressiveOutput` → HTTP response headers
-- Env var defaults (`CACHE_MAX_AGE_SEGMENTS`, `CACHE_MAX_AGE_MANIFEST_LIVE`, `CACHE_MAX_AGE_MANIFEST_FINAL`) with per-request override via webhook/JIT query params
-- Sandbox UI controls for cache header tuning
+### ~~Phase 19: Configurable Cache-Control Headers~~ ✅ Complete
+- Three-tier cache-control configuration: env var system defaults → per-request webhook overrides → hardcoded safety invariants
+- `CacheControlConfig` struct: `segment_max_age`, `final_manifest_max_age`, `live_manifest_max_age`, `live_manifest_s_maxage`, `immutable` (all `Option`)
+- `CacheConfig` extended with `final_manifest_max_age` field + env var loading (`CACHE_MAX_AGE_SEGMENTS`, `CACHE_MAX_AGE_MANIFEST_LIVE`, `CACHE_MAX_AGE_MANIFEST_FINAL`)
+- `ManifestState.manifest_cache_header()` and `segment_cache_header()` methods — phase-based with per-request override → system default fallback
+- Per-request overrides apply to manifests only (segments use system defaults to avoid extra Redis GET per segment request)
+- Safety invariants: `AwaitingFirstSegment` → always `no-cache`, `public` prefix → always present
+- Separate immutable flag control (default: true)
+- Separate `max-age` and `s-maxage` for live manifests (CDN vs browser caching)
+- `CacheControlInput` webhook type (separate from internal `CacheControlConfig`)
+- Pipeline threading: `RepackageRequest` → `execute()`/`execute_first()` → `ProgressiveOutput.set_cache_control()` → `ManifestState`
+- Request handlers simplified: inline phase-matching replaced with `state.manifest_cache_header(&ctx.config.cache)`
+- Sandbox UI: collapsible "Cache-Control Overrides" section with all 5 config fields
+- New: `tests/cache_control.rs` (43 integration tests), 3 new output integrity tests, 12 new unit tests (webhook + progressive)
+- Result: 1,291 tests total with `--features jit,cloudflare` (80 new tests)
 
 ### Phase 20: Multi-Source Manifest Merging — P2
 - Combine multiple source manifests (HLS/DASH) into a single unified output manifest
@@ -373,6 +381,6 @@ This phase requires significant research and prototyping before implementation b
 - [ ] **E2E encryption interop:** Understand how MoQ Secure Objects (SFrame) interacts with edgepack's DRM encryption — potential double-encryption or key management complexity
 - [ ] **Live-to-VOD with MoQ:** Design how MoQ's group-based delivery maps to edgepack's `ManifestPhase` state machine (AwaitingFirstSegment → Live → Complete)
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18–21) are P2, Phases 22–23 are P3.
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18, 20, 21) are P2, Phases 22–23 are P3.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

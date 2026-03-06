@@ -1,3 +1,4 @@
+use crate::config::{CacheConfig, CacheControlConfig};
 use crate::drm::scheme::EncryptionScheme;
 use crate::media::container::ContainerFormat;
 use serde::{Deserialize, Serialize};
@@ -289,6 +290,9 @@ pub struct ManifestState {
     /// When set, manifests include content steering directives.
     #[serde(default)]
     pub content_steering: Option<ContentSteeringConfig>,
+    /// Per-request cache-control header overrides. When None, system defaults are used.
+    #[serde(default)]
+    pub cache_control: Option<CacheControlConfig>,
 }
 
 /// Lifecycle phase of the manifest.
@@ -333,11 +337,77 @@ impl ManifestState {
             enable_iframe_playlist: false,
             dvr_window_duration: None,
             content_steering: None,
+            cache_control: None,
         }
     }
 
     pub fn is_complete(&self) -> bool {
         self.phase == ManifestPhase::Complete
+    }
+
+    /// Build a `Cache-Control` header for manifest responses based on phase.
+    ///
+    /// Uses per-request overrides from `cache_control` when set, falling back
+    /// to system-wide defaults from `CacheConfig`.
+    ///
+    /// Safety invariants (never overridable):
+    /// - `AwaitingFirstSegment` always returns `no-cache`
+    /// - All cacheable responses include `public`
+    pub fn manifest_cache_header(&self, system: &CacheConfig) -> String {
+        match self.phase {
+            ManifestPhase::AwaitingFirstSegment => "no-cache".to_string(),
+            ManifestPhase::Complete => {
+                let max_age = self
+                    .cache_control
+                    .as_ref()
+                    .and_then(|c| c.final_manifest_max_age)
+                    .unwrap_or(system.final_manifest_max_age);
+                let immutable = self
+                    .cache_control
+                    .as_ref()
+                    .map(|c| c.is_immutable())
+                    .unwrap_or(true);
+                if immutable {
+                    format!("public, max-age={max_age}, immutable")
+                } else {
+                    format!("public, max-age={max_age}")
+                }
+            }
+            ManifestPhase::Live => {
+                let max_age = self
+                    .cache_control
+                    .as_ref()
+                    .and_then(|c| c.live_manifest_max_age)
+                    .unwrap_or(system.live_manifest_max_age);
+                let s_maxage = self
+                    .cache_control
+                    .as_ref()
+                    .and_then(|c| c.live_manifest_s_maxage)
+                    .unwrap_or(max_age);
+                format!("public, max-age={max_age}, s-maxage={s_maxage}")
+            }
+        }
+    }
+
+    /// Build a `Cache-Control` header for segment and init segment responses.
+    ///
+    /// Uses per-request overrides when set, falling back to system defaults.
+    pub fn segment_cache_header(&self, system: &CacheConfig) -> String {
+        let max_age = self
+            .cache_control
+            .as_ref()
+            .and_then(|c| c.segment_max_age)
+            .unwrap_or(system.vod_max_age);
+        let immutable = self
+            .cache_control
+            .as_ref()
+            .map(|c| c.is_immutable())
+            .unwrap_or(true);
+        if immutable {
+            format!("public, max-age={max_age}, immutable")
+        } else {
+            format!("public, max-age={max_age}")
+        }
     }
 
     /// Return the slice of segments visible within the DVR window.
@@ -1349,5 +1419,176 @@ mod tests {
         let cs = parsed.content_steering.unwrap();
         assert_eq!(cs.server_uri, "https://dash-steer.example.com");
         assert_eq!(cs.query_before_start, Some(false));
+    }
+
+    // ── Cache-Control Headers ────────────────────────────────────────
+
+    #[test]
+    fn manifest_cache_header_awaiting_always_no_cache() {
+        let state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        let system = CacheConfig::default();
+        assert_eq!(state.manifest_cache_header(&system), "no-cache");
+    }
+
+    #[test]
+    fn manifest_cache_header_awaiting_ignores_overrides() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.cache_control = Some(CacheControlConfig {
+            live_manifest_max_age: Some(60),
+            final_manifest_max_age: Some(3600),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        // Safety invariant: AwaitingFirstSegment always returns no-cache
+        assert_eq!(state.manifest_cache_header(&system), "no-cache");
+    }
+
+    #[test]
+    fn manifest_cache_header_complete_default() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Complete;
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.manifest_cache_header(&system),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_header_complete_override() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Complete;
+        state.cache_control = Some(CacheControlConfig {
+            final_manifest_max_age: Some(3600),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.manifest_cache_header(&system),
+            "public, max-age=3600, immutable"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_header_complete_no_immutable() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Complete;
+        state.cache_control = Some(CacheControlConfig {
+            immutable: Some(false),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.manifest_cache_header(&system),
+            "public, max-age=31536000"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_header_live_default() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.manifest_cache_header(&system),
+            "public, max-age=1, s-maxage=1"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_header_live_override_max_age() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.cache_control = Some(CacheControlConfig {
+            live_manifest_max_age: Some(5),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        // s-maxage defaults to max_age when not set
+        assert_eq!(
+            state.manifest_cache_header(&system),
+            "public, max-age=5, s-maxage=5"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_header_live_separate_s_maxage() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.phase = ManifestPhase::Live;
+        state.cache_control = Some(CacheControlConfig {
+            live_manifest_max_age: Some(3),
+            live_manifest_s_maxage: Some(1),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.manifest_cache_header(&system),
+            "public, max-age=3, s-maxage=1"
+        );
+    }
+
+    #[test]
+    fn segment_cache_header_default() {
+        let state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.segment_cache_header(&system),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn segment_cache_header_override() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.cache_control = Some(CacheControlConfig {
+            segment_max_age: Some(86400),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.segment_cache_header(&system),
+            "public, max-age=86400, immutable"
+        );
+    }
+
+    #[test]
+    fn segment_cache_header_no_immutable() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.cache_control = Some(CacheControlConfig {
+            immutable: Some(false),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            state.segment_cache_header(&system),
+            "public, max-age=31536000"
+        );
+    }
+
+    #[test]
+    fn manifest_state_cache_control_serde_backward_compat() {
+        let json = r#"{"content_id":"c","format":"Hls","phase":"Live","init_segment":null,"segments":[],"target_duration":6.0,"variants":[],"drm_info":null,"media_sequence":0,"base_url":"/"}"#;
+        let parsed: ManifestState = serde_json::from_str(json).unwrap();
+        assert!(parsed.cache_control.is_none());
+    }
+
+    #[test]
+    fn manifest_state_cache_control_serde_roundtrip() {
+        let mut state = ManifestState::new("c".into(), OutputFormat::Hls, "/".into(), ContainerFormat::default());
+        state.cache_control = Some(CacheControlConfig {
+            segment_max_age: Some(86400),
+            final_manifest_max_age: Some(3600),
+            live_manifest_max_age: Some(5),
+            live_manifest_s_maxage: Some(2),
+            immutable: Some(false),
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: ManifestState = serde_json::from_str(&json).unwrap();
+        let cc = parsed.cache_control.unwrap();
+        assert_eq!(cc.segment_max_age, Some(86400));
+        assert_eq!(cc.final_manifest_max_age, Some(3600));
+        assert_eq!(cc.live_manifest_max_age, Some(5));
+        assert_eq!(cc.live_manifest_s_maxage, Some(2));
+        assert_eq!(cc.immutable, Some(false));
     }
 }

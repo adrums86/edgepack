@@ -316,6 +316,7 @@ fn dvr_window_repackage_request_serde_roundtrip() {
         enable_iframe_playlist: false,
         dvr_window_duration: Some(1800.0),
         content_steering: None,
+        cache_control: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     let parsed: RepackageRequest = serde_json::from_str(&json).unwrap();

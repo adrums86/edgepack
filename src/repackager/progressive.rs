@@ -1,3 +1,4 @@
+use crate::config::{CacheConfig, CacheControlConfig};
 use crate::manifest;
 use crate::manifest::types::{
     AdBreakInfo, ContentSteeringConfig, IFrameSegmentInfo, InitSegmentInfo, LowLatencyDashInfo,
@@ -175,6 +176,11 @@ impl ProgressiveOutput {
         self.state.content_steering = Some(config);
     }
 
+    /// Set per-request cache-control header overrides.
+    pub fn set_cache_control(&mut self, config: CacheControlConfig) {
+        self.state.cache_control = Some(config);
+    }
+
     /// Get part data by segment number and part index.
     pub fn part_data(&self, segment_number: u32, part_index: u32) -> Option<&[u8]> {
         self.part_data
@@ -219,23 +225,19 @@ impl ProgressiveOutput {
     }
 
     /// Determine the appropriate Cache-Control header value for a manifest response.
-    pub fn manifest_cache_control(&self, vod_max_age: u64, live_max_age: u64) -> String {
-        match self.state.phase {
-            ManifestPhase::Complete => {
-                format!("public, max-age={vod_max_age}, immutable")
-            }
-            ManifestPhase::Live => {
-                format!("public, max-age={live_max_age}, s-maxage={live_max_age}")
-            }
-            ManifestPhase::AwaitingFirstSegment => {
-                "no-cache".to_string()
-            }
-        }
+    ///
+    /// Delegates to `ManifestState::manifest_cache_header()`, which applies per-request
+    /// overrides from `cache_control` and falls back to system defaults.
+    pub fn manifest_cache_control(&self, system: &CacheConfig) -> String {
+        self.state.manifest_cache_header(system)
     }
 
-    /// Cache-Control for segment responses (always immutable — segments don't change).
-    pub fn segment_cache_control(vod_max_age: u64) -> String {
-        format!("public, max-age={vod_max_age}, immutable")
+    /// Cache-Control for segment responses.
+    ///
+    /// Delegates to `ManifestState::segment_cache_header()`, which applies per-request
+    /// overrides from `cache_control` and falls back to system defaults.
+    pub fn segment_cache_control(&self, system: &CacheConfig) -> String {
+        self.state.segment_cache_header(system)
     }
 }
 
@@ -493,7 +495,8 @@ mod tests {
     #[test]
     fn manifest_cache_control_awaiting() {
         let po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
-        assert_eq!(po.manifest_cache_control(31536000, 1), "no-cache");
+        let system = CacheConfig::default();
+        assert_eq!(po.manifest_cache_control(&system), "no-cache");
     }
 
     #[test]
@@ -501,8 +504,9 @@ mod tests {
         let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
         po.set_init_segment(vec![0x00]);
         po.add_segment(0, vec![0xAA; 50], 6.0);
+        let system = CacheConfig::default();
         assert_eq!(
-            po.manifest_cache_control(31536000, 1),
+            po.manifest_cache_control(&system),
             "public, max-age=1, s-maxage=1"
         );
     }
@@ -513,25 +517,141 @@ mod tests {
         po.set_init_segment(vec![0x00]);
         po.add_segment(0, vec![0xAA; 50], 6.0);
         po.finalize();
+        let system = CacheConfig::default();
         assert_eq!(
-            po.manifest_cache_control(31536000, 1),
+            po.manifest_cache_control(&system),
             "public, max-age=31536000, immutable"
         );
     }
 
     #[test]
     fn segment_cache_control_always_immutable() {
+        let po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
+        let system = CacheConfig::default();
         assert_eq!(
-            ProgressiveOutput::segment_cache_control(31536000),
+            po.segment_cache_control(&system),
             "public, max-age=31536000, immutable"
         );
     }
 
     #[test]
-    fn segment_cache_control_custom_max_age() {
+    fn segment_cache_control_custom_system_max_age() {
+        let po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
+        let mut system = CacheConfig::default();
+        system.vod_max_age = 86400;
         assert_eq!(
-            ProgressiveOutput::segment_cache_control(86400),
+            po.segment_cache_control(&system),
             "public, max-age=86400, immutable"
+        );
+    }
+
+    #[test]
+    fn set_cache_control_updates_state() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), None, ContainerFormat::default());
+        assert!(po.manifest_state().cache_control.is_none());
+        po.set_cache_control(crate::config::CacheControlConfig {
+            segment_max_age: Some(86400),
+            ..Default::default()
+        });
+        assert!(po.manifest_state().cache_control.is_some());
+        assert_eq!(po.manifest_state().cache_control.as_ref().unwrap().segment_max_age, Some(86400));
+    }
+
+    #[test]
+    fn set_cache_control_affects_manifest_cache_control_live() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        // Set per-request override for live manifests
+        po.set_cache_control(CacheControlConfig {
+            live_manifest_max_age: Some(10),
+            live_manifest_s_maxage: Some(30),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            po.manifest_cache_control(&system),
+            "public, max-age=10, s-maxage=30"
+        );
+    }
+
+    #[test]
+    fn set_cache_control_affects_manifest_cache_control_complete() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        po.finalize();
+        // Set per-request override for finalized manifests
+        po.set_cache_control(CacheControlConfig {
+            final_manifest_max_age: Some(3600),
+            immutable: Some(false),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            po.manifest_cache_control(&system),
+            "public, max-age=3600"
+        );
+    }
+
+    #[test]
+    fn set_cache_control_affects_segment_cache_control() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), Some(make_drm_info()), ContainerFormat::default());
+        po.set_cache_control(CacheControlConfig {
+            segment_max_age: Some(7200),
+            immutable: Some(false),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            po.segment_cache_control(&system),
+            "public, max-age=7200"
+        );
+    }
+
+    #[test]
+    fn set_cache_control_awaiting_still_no_cache() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Hls, "/".into(), None, ContainerFormat::default());
+        // Even with overrides set, AwaitingFirstSegment is always no-cache
+        po.set_cache_control(CacheControlConfig {
+            live_manifest_max_age: Some(60),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(po.manifest_cache_control(&system), "no-cache");
+    }
+
+    #[test]
+    fn manifest_cache_control_dash_live_with_override() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Dash, "/".into(), Some(make_drm_info()), ContainerFormat::default());
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        po.set_cache_control(CacheControlConfig {
+            live_manifest_max_age: Some(5),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            po.manifest_cache_control(&system),
+            "public, max-age=5, s-maxage=5"
+        );
+    }
+
+    #[test]
+    fn manifest_cache_control_dash_complete_with_override() {
+        let mut po = ProgressiveOutput::new("c".into(), OutputFormat::Dash, "/".into(), Some(make_drm_info()), ContainerFormat::default());
+        po.set_init_segment(vec![0x00]);
+        po.add_segment(0, vec![0xAA; 50], 6.0);
+        po.finalize();
+        po.set_cache_control(CacheControlConfig {
+            final_manifest_max_age: Some(600),
+            immutable: Some(false),
+            ..Default::default()
+        });
+        let system = CacheConfig::default();
+        assert_eq!(
+            po.manifest_cache_control(&system),
+            "public, max-age=600"
         );
     }
 
