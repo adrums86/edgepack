@@ -221,6 +221,52 @@ pub fn handle_status_request(
     }
 }
 
+/// Handle a request for the AES-128 content key (TS output only).
+///
+/// Returns the raw 16-byte content key for HLS AES-128 decryption.
+/// The key is loaded from the cached DRM key set.
+pub fn handle_key_request(
+    content_id: &str,
+    _format: OutputFormat,
+    scheme: Option<&str>,
+    ctx: &HandlerContext,
+) -> Result<HttpResponse> {
+    // Load the DRM key set from cache
+    let key_data = ctx.cache.get(&CacheKeys::drm_keys(content_id))?;
+    match key_data {
+        Some(data) => {
+            // Parse the cached key set to extract the raw content key
+            let cached: serde_json::Value = serde_json::from_slice(&data).map_err(|e| {
+                crate::error::EdgepackError::Cache(format!("deserialize key set: {e}"))
+            })?;
+
+            // Extract the first key's raw bytes
+            if let Some(keys) = cached.get("keys").and_then(|k| k.as_array()) {
+                if let Some(first_key) = keys.first() {
+                    if let Some(key_b64) = first_key.get("key").and_then(|k| k.as_str()) {
+                        use base64::Engine;
+                        if let Ok(key_bytes) = base64::engine::general_purpose::STANDARD.decode(key_b64) {
+                            let _ = scheme; // scheme is used for key selection in future
+                            return Ok(HttpResponse::ok_with_cache(
+                                key_bytes,
+                                "application/octet-stream",
+                                "no-cache",
+                            ));
+                        }
+                    }
+                }
+            }
+
+            Ok(HttpResponse::not_found(&format!(
+                "key not found in key set for {content_id}"
+            )))
+        }
+        None => Ok(HttpResponse::not_found(&format!(
+            "no keys found for {content_id}"
+        ))),
+    }
+}
+
 /// Render a manifest response from cached ManifestState bytes.
 fn render_manifest_response(
     state_bytes: &[u8],

@@ -924,3 +924,97 @@ fn dash_manifest_body_unchanged_with_cache_control() {
         "cache_control must not affect DASH manifest body content"
     );
 }
+
+// ─── TS Output Integrity ─────────────────────────────────────────────
+
+/// TS manifest must NOT contain EXT-X-MAP (no init segment for TS).
+#[cfg(feature = "ts")]
+#[test]
+fn ts_hls_manifest_integrity_no_ext_x_map() {
+    use edgepack::manifest::types::{ManifestPhase, OutputFormat};
+    use edgepack::media::container::ContainerFormat;
+
+    let state = common::make_manifest_state_with_container(
+        OutputFormat::Hls,
+        ContainerFormat::Ts,
+        5,
+        ManifestPhase::Complete,
+    );
+    let manifest = manifest::render_manifest(&state).unwrap();
+
+    assert!(
+        !manifest.contains("#EXT-X-MAP"),
+        "TS manifest must not contain EXT-X-MAP: {manifest}"
+    );
+    assert!(manifest.contains("#EXTM3U"));
+    assert!(manifest.contains("#EXT-X-ENDLIST"));
+}
+
+/// TS manifest segment URIs must use .ts extension.
+#[cfg(feature = "ts")]
+#[test]
+fn ts_hls_manifest_integrity_segment_extensions() {
+    use edgepack::manifest::types::{ManifestPhase, OutputFormat};
+    use edgepack::media::container::ContainerFormat;
+
+    let state = common::make_manifest_state_with_container(
+        OutputFormat::Hls,
+        ContainerFormat::Ts,
+        5,
+        ManifestPhase::Complete,
+    );
+    let manifest = manifest::render_manifest(&state).unwrap();
+
+    // All segment URIs should use .ts extension
+    for line in manifest.lines() {
+        if line.starts_with("/repackage/") && !line.contains("init") {
+            assert!(
+                line.ends_with(".ts"),
+                "TS segment URI must end with .ts: {line}"
+            );
+        }
+    }
+}
+
+/// TS encryption roundtrip: encrypt then decrypt recovers original.
+#[cfg(feature = "ts")]
+#[test]
+fn ts_encrypt_decrypt_integrity_roundtrip() {
+    use edgepack::media::ts;
+    use edgepack::media::ts_mux;
+
+    let key = common::TEST_SOURCE_KEY;
+    let iv = common::TEST_IV;
+
+    // Test with various payload sizes to exercise padding
+    for size in [1, 15, 16, 17, 100, 188, 376, 1024] {
+        let plaintext: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+        let encrypted = ts_mux::encrypt_ts_segment(&plaintext, &key, &iv).unwrap();
+        let decrypted = ts::decrypt_ts_segment(&encrypted, &key, &iv).unwrap();
+        assert_eq!(
+            decrypted, plaintext,
+            "Encrypt/decrypt roundtrip failed for size {size}"
+        );
+    }
+}
+
+/// TS HLS manifest version conformance: VERSION:3 for TS output.
+#[cfg(feature = "ts")]
+#[test]
+fn ts_hls_manifest_integrity_version_3() {
+    use edgepack::manifest::types::{ManifestPhase, OutputFormat};
+    use edgepack::media::container::ContainerFormat;
+
+    let state = common::make_manifest_state_with_container(
+        OutputFormat::Hls,
+        ContainerFormat::Ts,
+        5,
+        ManifestPhase::Complete,
+    );
+    let manifest = manifest::render_manifest(&state).unwrap();
+
+    assert!(
+        manifest.contains("#EXT-X-VERSION:3"),
+        "TS manifest must use VERSION:3: {manifest}"
+    );
+}

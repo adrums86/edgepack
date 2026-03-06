@@ -157,29 +157,48 @@ impl RepackagePipeline {
 
         // Step 5: Per-scheme init rewriting, then per-(format, scheme) progressive output setup
 
+        // TS output: extract mux config, skip init rewriting
+        #[cfg(feature = "ts")]
+        let ts_mux_config = if !container_format.is_isobmff() {
+            Some(crate::media::ts_mux::extract_mux_config(&init_data)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "ts")]
+        let skip_init = !container_format.is_isobmff();
+        #[cfg(not(feature = "ts"))]
+        let skip_init = false;
+
         // Rewrite init segments once per scheme (format-agnostic)
         let mut scheme_inits: Vec<(EncryptionScheme, Vec<u8>)> = Vec::with_capacity(target_schemes.len());
-        for &target_scheme in target_schemes {
-            let target_iv_size = target_scheme.default_iv_size();
-            let target_pattern = target_scheme.default_video_pattern();
+        if skip_init {
+            // TS output has no init segments (PAT/PMT are embedded in each segment)
+            for &target_scheme in target_schemes {
+                scheme_inits.push((target_scheme, Vec::new()));
+            }
+        } else {
+            for &target_scheme in target_schemes {
+                let target_iv_size = target_scheme.default_iv_size();
+                let target_pattern = target_scheme.default_video_pattern();
 
-            let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
-                (true, true) => {
-                    let ks = key_set.as_ref().unwrap();
-                    init::rewrite_init_segment(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
-                }
-                (false, true) => {
-                    let ks = key_set.as_ref().unwrap();
-                    init::create_protection_info(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
-                }
-                (true, false) => {
-                    init::strip_protection_info(&init_data, container_format)?
-                }
-                (false, false) => {
-                    init::rewrite_ftyp_only(&init_data, container_format)?
-                }
-            };
-            scheme_inits.push((target_scheme, new_init));
+                let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
+                    (true, true) => {
+                        let ks = key_set.as_ref().unwrap();
+                        init::rewrite_init_segment(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
+                    }
+                    (false, true) => {
+                        let ks = key_set.as_ref().unwrap();
+                        init::create_protection_info(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
+                    }
+                    (true, false) => {
+                        init::strip_protection_info(&init_data, container_format)?
+                    }
+                    (false, false) => {
+                        init::rewrite_ftyp_only(&init_data, container_format)?
+                    }
+                };
+                scheme_inits.push((target_scheme, new_init));
+            }
         }
 
         // Build one ProgressiveOutput per (format, scheme) pair
@@ -199,7 +218,9 @@ impl RepackagePipeline {
                 let mut progressive =
                     ProgressiveOutput::new(content_id.clone(), out_format, base_url, drm_info, container_format);
                 progressive.set_variants(build_variants_from_tracks(&tracks));
-                progressive.set_init_segment(new_init.clone());
+                if !skip_init {
+                    progressive.set_init_segment(new_init.clone());
+                }
 
                 // Thread LL-HLS/LL-DASH parameters from source manifest
                 if let Some(ptd) = source.part_target_duration {
@@ -290,6 +311,46 @@ impl RepackagePipeline {
             // Re-encrypt once per scheme (format-agnostic), then distribute to all outputs
             let mut rewritten_segments: Vec<(EncryptionScheme, Vec<u8>, Vec<crate::media::chunk::ChunkBoundary>)> = Vec::new();
             for &target_scheme in target_schemes {
+                #[cfg(feature = "ts")]
+                if !container_format.is_isobmff() {
+                    // TS output path: decrypt to clear CMAF, then mux to TS
+                    let ts_config = ts_mux_config.as_ref().unwrap();
+
+                    let clear_cmaf = if source_scheme.is_encrypted() {
+                        let clear_params = SegmentRewriteParams {
+                            source_key: source_key.clone(),
+                            target_key: None,
+                            source_scheme,
+                            target_scheme: EncryptionScheme::None,
+                            source_iv_size,
+                            target_iv_size: 0,
+                            source_pattern,
+                            target_pattern: (0, 0),
+                            constant_iv: constant_iv.clone(),
+                            segment_number: i as u32,
+                        };
+                        segment::rewrite_segment(&seg_data, &clear_params)?
+                    } else {
+                        seg_data.clone()
+                    };
+
+                    let ts_bytes = crate::media::ts_mux::mux_to_ts(&clear_cmaf, ts_config, i as u32)?;
+
+                    let output = if target_scheme.is_encrypted() {
+                        let key = content_key.as_ref().unwrap();
+                        let key_bytes: &[u8; 16] = key.key.as_slice().try_into()
+                            .map_err(|_| EdgepackError::Encryption("content key must be 16 bytes for TS AES-128".into()))?;
+                        let iv = generate_ts_iv(i as u32);
+                        crate::media::ts_mux::encrypt_ts_segment(&ts_bytes, key_bytes, &iv)?
+                    } else {
+                        ts_bytes
+                    };
+
+                    rewritten_segments.push((target_scheme, output, Vec::new()));
+                    continue;
+                }
+
+                // CMAF/fMP4 output path
                 let target_iv_size = target_scheme.default_iv_size();
                 let target_pattern = target_scheme.default_video_pattern();
                 let target_key = if target_scheme.is_encrypted() { content_key.clone() } else { None };
@@ -551,6 +612,18 @@ impl RepackagePipeline {
         // Extract SCTE-35 ad breaks from first segment's emsg boxes
         let ad_breaks = extract_ad_breaks_from_segment(&seg_data, 0, 0.0);
 
+        // TS output: extract mux config, skip init rewriting
+        #[cfg(feature = "ts")]
+        let ts_mux_config = if !container_format.is_isobmff() {
+            Some(crate::media::ts_mux::extract_mux_config(&init_data)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "ts")]
+        let skip_init = !container_format.is_isobmff();
+        #[cfg(not(feature = "ts"))]
+        let skip_init = false;
+
         // Step 6: Per-scheme — continuation params, init rewrite, first segment (format-agnostic)
         // Then per-(format, scheme) — manifest state
         let mut scheme_segments: Vec<(EncryptionScheme, Vec<u8>)> = Vec::new();
@@ -585,6 +658,8 @@ impl RepackagePipeline {
                 } else {
                     None
                 },
+                #[cfg(feature = "ts")]
+                ts_mux_config: ts_mux_config.clone(),
             };
             let cont_json = serde_json::to_vec(&continuation)
                 .map_err(|e| EdgepackError::Cache(format!("serialize rewrite params: {e}")))?;
@@ -594,54 +669,105 @@ impl RepackagePipeline {
                 ttl,
             )?;
 
-            // Rewrite init segment
-            let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
-                (true, true) => {
-                    let ks = key_set.as_ref().unwrap();
-                    init::rewrite_init_segment(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
-                }
-                (false, true) => {
-                    let ks = key_set.as_ref().unwrap();
-                    init::create_protection_info(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
-                }
-                (true, false) => {
-                    init::strip_protection_info(&init_data, container_format)?
-                }
-                (false, false) => {
-                    init::rewrite_ftyp_only(&init_data, container_format)?
-                }
-            };
+            if skip_init {
+                #[cfg(feature = "ts")]
+                {
+                    // TS output: no init segment, process first segment via TS mux path
+                    let ts_config = ts_mux_config.as_ref().unwrap();
 
-            // Store init segment with format-agnostic key (shared across HLS/DASH)
-            self.cache.set(
-                &CacheKeys::init_segment_for_scheme_only(content_id, scheme_str),
-                &new_init,
-                ttl,
-            )?;
+                    let clear_cmaf = if source_scheme.is_encrypted() {
+                        let clear_params = SegmentRewriteParams {
+                            source_key: source_key.clone(),
+                            target_key: None,
+                            source_scheme,
+                            target_scheme: EncryptionScheme::None,
+                            source_iv_size,
+                            target_iv_size: 0,
+                            source_pattern,
+                            target_pattern: (0, 0),
+                            constant_iv: constant_iv.clone(),
+                            segment_number: 0,
+                        };
+                        segment::rewrite_segment(&seg_data, &clear_params)?
+                    } else {
+                        seg_data.clone()
+                    };
 
-            // Process first segment for this scheme
-            let params = SegmentRewriteParams {
-                source_key: source_key.clone(),
-                target_key,
-                source_scheme,
-                target_scheme,
-                source_iv_size,
-                target_iv_size,
-                source_pattern,
-                target_pattern,
-                constant_iv: constant_iv.clone(),
-                segment_number: 0,
-            };
-            let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+                    let ts_bytes = crate::media::ts_mux::mux_to_ts(&clear_cmaf, ts_config, 0)?;
 
-            // Store segment with format-agnostic key (shared across HLS/DASH)
-            self.cache.set(
-                &CacheKeys::media_segment_for_scheme_only(content_id, scheme_str, 0),
-                &new_segment,
-                ttl,
-            )?;
+                    let new_segment = if target_scheme.is_encrypted() {
+                        let key = content_key.as_ref().unwrap();
+                        let key_bytes: &[u8; 16] = key.key.as_slice().try_into()
+                            .map_err(|_| EdgepackError::Encryption("content key must be 16 bytes for TS AES-128".into()))?;
+                        let iv = generate_ts_iv(0);
+                        crate::media::ts_mux::encrypt_ts_segment(&ts_bytes, key_bytes, &iv)?
+                    } else {
+                        ts_bytes
+                    };
 
-            scheme_segments.push((target_scheme, new_segment));
+                    // Store segment with format-agnostic key
+                    self.cache.set(
+                        &CacheKeys::media_segment_for_scheme_only(content_id, scheme_str, 0),
+                        &new_segment,
+                        ttl,
+                    )?;
+
+                    scheme_segments.push((target_scheme, new_segment));
+                }
+                #[cfg(not(feature = "ts"))]
+                {
+                    return Err(EdgepackError::InvalidInput("TS output requires the 'ts' feature".into()));
+                }
+            } else {
+                // Rewrite init segment
+                let new_init = match (source_scheme.is_encrypted(), target_scheme.is_encrypted()) {
+                    (true, true) => {
+                        let ks = key_set.as_ref().unwrap();
+                        init::rewrite_init_segment(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
+                    }
+                    (false, true) => {
+                        let ks = key_set.as_ref().unwrap();
+                        init::create_protection_info(&init_data, ks, &key_mapping, target_scheme, target_iv_size, target_pattern, container_format)?
+                    }
+                    (true, false) => {
+                        init::strip_protection_info(&init_data, container_format)?
+                    }
+                    (false, false) => {
+                        init::rewrite_ftyp_only(&init_data, container_format)?
+                    }
+                };
+
+                // Store init segment with format-agnostic key (shared across HLS/DASH)
+                self.cache.set(
+                    &CacheKeys::init_segment_for_scheme_only(content_id, scheme_str),
+                    &new_init,
+                    ttl,
+                )?;
+
+                // Process first segment for this scheme
+                let params = SegmentRewriteParams {
+                    source_key: source_key.clone(),
+                    target_key,
+                    source_scheme,
+                    target_scheme,
+                    source_iv_size,
+                    target_iv_size,
+                    source_pattern,
+                    target_pattern,
+                    constant_iv: constant_iv.clone(),
+                    segment_number: 0,
+                };
+                let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+
+                // Store segment with format-agnostic key (shared across HLS/DASH)
+                self.cache.set(
+                    &CacheKeys::media_segment_for_scheme_only(content_id, scheme_str, 0),
+                    &new_segment,
+                    ttl,
+                )?;
+
+                scheme_segments.push((target_scheme, new_segment));
+            }
         }
 
         // Build per-(format, scheme) manifest states
@@ -665,11 +791,13 @@ impl RepackagePipeline {
                     container_format,
                 );
                 progressive.set_variants(build_variants_from_tracks(&tracks));
-                // Note: init segment is stored separately, progressive only needs to track metadata
-                progressive.set_init_segment(
-                    // Use a zero-length placeholder — the actual init bytes are in the format-agnostic cache key
-                    Vec::new(),
-                );
+                if !skip_init {
+                    // Note: init segment is stored separately, progressive only needs to track metadata
+                    progressive.set_init_segment(
+                        // Use a zero-length placeholder — the actual init bytes are in the format-agnostic cache key
+                        Vec::new(),
+                    );
+                }
 
                 // Thread I-frame playlist flag
                 if request.enable_iframe_playlist {
@@ -867,20 +995,69 @@ impl RepackagePipeline {
             let source_key = continuation.source_key.as_ref().map(restore_content_key);
             let target_key = continuation.target_key.as_ref().map(restore_content_key);
 
-            let params = SegmentRewriteParams {
-                source_key,
-                target_key,
-                source_scheme: continuation.source_scheme,
-                target_scheme: continuation.target_scheme,
-                source_iv_size: continuation.source_iv_size,
-                target_iv_size: continuation.target_iv_size,
-                source_pattern: continuation.source_pattern,
-                target_pattern: continuation.target_pattern,
-                constant_iv: continuation.constant_iv.clone(),
-                segment_number: i as u32,
-            };
+            #[cfg(feature = "ts")]
+            let is_ts_output = !continuation.container_format.is_isobmff();
+            #[cfg(not(feature = "ts"))]
+            let is_ts_output = false;
 
-            let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+            let new_segment = if is_ts_output {
+                #[cfg(feature = "ts")]
+                {
+                    let ts_config = continuation.ts_mux_config.as_ref().ok_or_else(|| {
+                        EdgepackError::MediaParse("TS mux config missing in continuation params".into())
+                    })?;
+
+                    let clear_cmaf = if continuation.source_scheme.is_encrypted() {
+                        let clear_params = SegmentRewriteParams {
+                            source_key: source_key.clone(),
+                            target_key: None,
+                            source_scheme: continuation.source_scheme,
+                            target_scheme: EncryptionScheme::None,
+                            source_iv_size: continuation.source_iv_size,
+                            target_iv_size: 0,
+                            source_pattern: continuation.source_pattern,
+                            target_pattern: (0, 0),
+                            constant_iv: continuation.constant_iv.clone(),
+                            segment_number: i as u32,
+                        };
+                        segment::rewrite_segment(&seg_data, &clear_params)?
+                    } else {
+                        seg_data.clone()
+                    };
+
+                    let ts_bytes = crate::media::ts_mux::mux_to_ts(&clear_cmaf, ts_config, i as u32)?;
+
+                    if continuation.target_scheme.is_encrypted() {
+                        let key = target_key.as_ref()
+                            .or(source_key.as_ref())
+                            .ok_or_else(|| EdgepackError::Encryption("key required for TS encryption".into()))?;
+                        let key_bytes: &[u8; 16] = key.key.as_slice().try_into()
+                            .map_err(|_| EdgepackError::Encryption("content key must be 16 bytes for TS AES-128".into()))?;
+                        let iv = generate_ts_iv(i as u32);
+                        crate::media::ts_mux::encrypt_ts_segment(&ts_bytes, key_bytes, &iv)?
+                    } else {
+                        ts_bytes
+                    }
+                }
+                #[cfg(not(feature = "ts"))]
+                {
+                    return Err(EdgepackError::InvalidInput("TS output requires the 'ts' feature".into()));
+                }
+            } else {
+                let params = SegmentRewriteParams {
+                    source_key,
+                    target_key,
+                    source_scheme: continuation.source_scheme,
+                    target_scheme: continuation.target_scheme,
+                    source_iv_size: continuation.source_iv_size,
+                    target_iv_size: continuation.target_iv_size,
+                    source_pattern: continuation.source_pattern,
+                    target_pattern: continuation.target_pattern,
+                    constant_iv: continuation.constant_iv.clone(),
+                    segment_number: i as u32,
+                };
+                segment::rewrite_segment(&seg_data, &params)?
+            };
 
             // Store segment with format-agnostic key (shared across HLS/DASH)
             self.cache.set(
@@ -1226,6 +1403,12 @@ impl RepackagePipeline {
             } else {
                 None
             },
+            #[cfg(feature = "ts")]
+            ts_mux_config: if !container_format.is_isobmff() {
+                Some(crate::media::ts_mux::extract_mux_config(&init_data)?)
+            } else {
+                None
+            },
         };
         let cont_json = serde_json::to_vec(&continuation)
             .map_err(|e| EdgepackError::Cache(format!("serialize rewrite params: {e}")))?;
@@ -1267,14 +1450,26 @@ impl RepackagePipeline {
             .max(6.0);
 
         use crate::manifest::types::InitSegmentInfo;
+        #[cfg(feature = "ts")]
+        let jit_init_segment = if !container_format.is_isobmff() {
+            None // TS output has no init segment
+        } else {
+            Some(InitSegmentInfo {
+                uri: format!("{base_url}init.mp4"),
+                byte_size: new_init.len() as u64,
+            })
+        };
+        #[cfg(not(feature = "ts"))]
+        let jit_init_segment = Some(InitSegmentInfo {
+            uri: format!("{base_url}init.mp4"),
+            byte_size: new_init.len() as u64,
+        });
+
         let manifest_state = ManifestState {
             content_id: content_id.to_string(),
             format: output_format,
             phase: ManifestPhase::Complete,
-            init_segment: Some(InitSegmentInfo {
-                uri: format!("{base_url}init.mp4"),
-                byte_size: new_init.len() as u64,
-            }),
+            init_segment: jit_init_segment,
             segments: manifest_segments,
             target_duration,
             variants: build_variants_from_tracks(&tracks),
@@ -1366,21 +1561,70 @@ impl RepackagePipeline {
         let source_key = continuation.source_key.as_ref().map(restore_content_key);
         let target_key = continuation.target_key.as_ref().map(restore_content_key);
 
-        let params = SegmentRewriteParams {
-            source_key,
-            target_key,
-            source_scheme: continuation.source_scheme,
-            target_scheme: continuation.target_scheme,
-            source_iv_size: continuation.source_iv_size,
-            target_iv_size: continuation.target_iv_size,
-            source_pattern: continuation.source_pattern,
-            target_pattern: continuation.target_pattern,
-            constant_iv: continuation.constant_iv,
-            segment_number,
-        };
+        #[cfg(feature = "ts")]
+        let is_ts_output = !continuation.container_format.is_isobmff();
+        #[cfg(not(feature = "ts"))]
+        let is_ts_output = false;
 
         // Rewrite segment
-        let new_segment = segment::rewrite_segment(&seg_data, &params)?;
+        let new_segment = if is_ts_output {
+            #[cfg(feature = "ts")]
+            {
+                let ts_config = continuation.ts_mux_config.as_ref().ok_or_else(|| {
+                    EdgepackError::MediaParse("TS mux config missing in continuation params".into())
+                })?;
+
+                let clear_cmaf = if continuation.source_scheme.is_encrypted() {
+                    let clear_params = SegmentRewriteParams {
+                        source_key: source_key.clone(),
+                        target_key: None,
+                        source_scheme: continuation.source_scheme,
+                        target_scheme: EncryptionScheme::None,
+                        source_iv_size: continuation.source_iv_size,
+                        target_iv_size: 0,
+                        source_pattern: continuation.source_pattern,
+                        target_pattern: (0, 0),
+                        constant_iv: continuation.constant_iv,
+                        segment_number,
+                    };
+                    segment::rewrite_segment(&seg_data, &clear_params)?
+                } else {
+                    seg_data
+                };
+
+                let ts_bytes = crate::media::ts_mux::mux_to_ts(&clear_cmaf, ts_config, segment_number)?;
+
+                if continuation.target_scheme.is_encrypted() {
+                    let key = target_key.as_ref()
+                        .or(source_key.as_ref())
+                        .ok_or_else(|| EdgepackError::Encryption("key required for TS encryption".into()))?;
+                    let key_bytes: &[u8; 16] = key.key.as_slice().try_into()
+                        .map_err(|_| EdgepackError::Encryption("content key must be 16 bytes for TS AES-128".into()))?;
+                    let iv = generate_ts_iv(segment_number);
+                    crate::media::ts_mux::encrypt_ts_segment(&ts_bytes, key_bytes, &iv)?
+                } else {
+                    ts_bytes
+                }
+            }
+            #[cfg(not(feature = "ts"))]
+            {
+                return Err(EdgepackError::InvalidInput("TS output requires the 'ts' feature".into()));
+            }
+        } else {
+            let params = SegmentRewriteParams {
+                source_key,
+                target_key,
+                source_scheme: continuation.source_scheme,
+                target_scheme: continuation.target_scheme,
+                source_iv_size: continuation.source_iv_size,
+                target_iv_size: continuation.target_iv_size,
+                source_pattern: continuation.source_pattern,
+                target_pattern: continuation.target_pattern,
+                constant_iv: continuation.constant_iv,
+                segment_number,
+            };
+            segment::rewrite_segment(&seg_data, &params)?
+        };
 
         // Cache the result
         let ttl = self.config.cache.job_state_ttl;
@@ -1648,6 +1892,16 @@ fn restore_content_key(cached: &CachedKey) -> ContentKey {
     }
 }
 
+/// Generate a 16-byte IV for TS AES-128-CBC encryption from a segment number.
+///
+/// Per HLS spec, the IV is the segment sequence number as a 128-bit big-endian integer.
+#[cfg(feature = "ts")]
+fn generate_ts_iv(segment_number: u32) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[12..16].copy_from_slice(&segment_number.to_be_bytes());
+    iv
+}
+
 /// Extract SCTE-35 ad breaks from emsg boxes in a source segment.
 fn extract_ad_breaks_from_segment(
     segment_data: &[u8],
@@ -1727,6 +1981,10 @@ struct ContinuationParams {
     /// When `None`, falls back to single source_key/target_key (backward compat).
     #[serde(default)]
     track_key_mapping: Option<TrackKeyMapping>,
+    /// TS mux configuration for CMAF→TS conversion (TS output only).
+    #[cfg(feature = "ts")]
+    #[serde(default)]
+    ts_mux_config: Option<crate::media::ts_mux::TsMuxConfig>,
 }
 
 impl From<&DrmKeySet> for CachedKeySet {
@@ -2225,6 +2483,8 @@ mod tests {
             constant_iv: Some(vec![0xCC; 16]),
             container_format: ContainerFormat::Fmp4,
             track_key_mapping: None,
+            #[cfg(feature = "ts")]
+            ts_mux_config: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -2272,6 +2532,8 @@ mod tests {
             constant_iv: None,
             container_format: ContainerFormat::Cmaf,
             track_key_mapping: Some(mapping),
+            #[cfg(feature = "ts")]
+            ts_mux_config: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();

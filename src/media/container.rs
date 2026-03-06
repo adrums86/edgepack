@@ -21,6 +21,11 @@ pub enum ContainerFormat {
     /// ISO BMFF: ISO Base Media File Format (ISO 14496-12).
     /// Uses `iso6` compatible brands only, `.mp4` segment extensions.
     Iso,
+    /// MPEG-TS: MPEG Transport Stream (ISO/IEC 13818-1).
+    /// HLS-only, `.ts` segment extensions, no init segment (PAT/PMT embedded).
+    /// Uses whole-segment AES-128-CBC encryption instead of per-sample CENC/CBCS.
+    #[cfg(feature = "ts")]
+    Ts,
 }
 
 impl ContainerFormat {
@@ -32,6 +37,8 @@ impl ContainerFormat {
             ContainerFormat::Cmaf => ".cmfv",
             ContainerFormat::Fmp4 => ".m4s",
             ContainerFormat::Iso => ".mp4",
+            #[cfg(feature = "ts")]
+            ContainerFormat::Ts => ".ts",
         }
     }
 
@@ -41,6 +48,8 @@ impl ContainerFormat {
             ContainerFormat::Cmaf => ".cmfa",
             ContainerFormat::Fmp4 => ".m4s",
             ContainerFormat::Iso => ".mp4",
+            #[cfg(feature = "ts")]
+            ContainerFormat::Ts => ".ts",
         }
     }
 
@@ -65,6 +74,8 @@ impl ContainerFormat {
         match self {
             ContainerFormat::Cmaf => &[b"isom", b"iso6", b"cmfc"],
             ContainerFormat::Fmp4 | ContainerFormat::Iso => &[b"isom", b"iso6"],
+            #[cfg(feature = "ts")]
+            ContainerFormat::Ts => &[], // TS has no ftyp box
         }
     }
 
@@ -72,6 +83,10 @@ impl ContainerFormat {
     ///
     /// Structure: box_header(8) + major_brand(4) + minor_version(4) + compatible_brands(4*n)
     pub fn build_ftyp(&self) -> Vec<u8> {
+        #[cfg(feature = "ts")]
+        if matches!(self, ContainerFormat::Ts) {
+            return Vec::new(); // TS segments don't have ftyp boxes
+        }
         let brands = self.compatible_brands();
         let total_size = (8 + 4 + 4 + brands.len() * 4) as u32;
         let mut output = Vec::with_capacity(total_size as usize);
@@ -95,6 +110,10 @@ impl ContainerFormat {
             ContainerFormat::Fmp4 | ContainerFormat::Iso => {
                 "urn:mpeg:dash:profile:isoff-live:2011"
             }
+            #[cfg(feature = "ts")]
+            ContainerFormat::Ts => {
+                panic!("TS container format is not supported with DASH")
+            }
         }
     }
 
@@ -106,6 +125,8 @@ impl ContainerFormat {
             "cmaf" => Some(ContainerFormat::Cmaf),
             "fmp4" => Some(ContainerFormat::Fmp4),
             "iso" => Some(ContainerFormat::Iso),
+            #[cfg(feature = "ts")]
+            "ts" => Some(ContainerFormat::Ts),
             _ => None,
         }
     }
@@ -116,6 +137,18 @@ impl ContainerFormat {
             ContainerFormat::Cmaf => "cmaf",
             ContainerFormat::Fmp4 => "fmp4",
             ContainerFormat::Iso => "iso",
+            #[cfg(feature = "ts")]
+            ContainerFormat::Ts => "ts",
+        }
+    }
+
+    /// Returns true if this container format uses ISOBMFF (ftyp/moov/moof/mdat).
+    /// Returns false for MPEG-TS which uses its own packet structure.
+    pub fn is_isobmff(&self) -> bool {
+        match self {
+            ContainerFormat::Cmaf | ContainerFormat::Fmp4 | ContainerFormat::Iso => true,
+            #[cfg(feature = "ts")]
+            ContainerFormat::Ts => false,
         }
     }
 }
@@ -353,5 +386,94 @@ mod tests {
         set.insert(ContainerFormat::Fmp4);
         set.insert(ContainerFormat::Iso);
         assert_eq!(set.len(), 3);
+    }
+
+    #[test]
+    fn is_isobmff() {
+        assert!(ContainerFormat::Cmaf.is_isobmff());
+        assert!(ContainerFormat::Fmp4.is_isobmff());
+        assert!(ContainerFormat::Iso.is_isobmff());
+    }
+
+    // --- TS container format (feature-gated) ---
+
+    #[cfg(feature = "ts")]
+    mod ts_tests {
+        use super::*;
+
+        #[test]
+        fn video_segment_extension_ts() {
+            assert_eq!(ContainerFormat::Ts.video_segment_extension(), ".ts");
+        }
+
+        #[test]
+        fn audio_segment_extension_ts() {
+            assert_eq!(ContainerFormat::Ts.audio_segment_extension(), ".ts");
+        }
+
+        #[test]
+        fn compatible_brands_ts_empty() {
+            let brands = ContainerFormat::Ts.compatible_brands();
+            assert!(brands.is_empty());
+        }
+
+        #[test]
+        fn build_ftyp_ts_empty() {
+            let ftyp = ContainerFormat::Ts.build_ftyp();
+            assert!(ftyp.is_empty());
+        }
+
+        #[test]
+        #[should_panic(expected = "TS container format is not supported with DASH")]
+        fn dash_profiles_ts_panics() {
+            let _ = ContainerFormat::Ts.dash_profiles();
+        }
+
+        #[test]
+        fn from_str_value_ts() {
+            assert_eq!(ContainerFormat::from_str_value("ts"), Some(ContainerFormat::Ts));
+        }
+
+        #[test]
+        fn as_str_ts() {
+            assert_eq!(ContainerFormat::Ts.as_str(), "ts");
+        }
+
+        #[test]
+        fn display_ts() {
+            assert_eq!(format!("{}", ContainerFormat::Ts), "ts");
+        }
+
+        #[test]
+        fn serde_roundtrip_ts() {
+            let fmt = ContainerFormat::Ts;
+            let json = serde_json::to_string(&fmt).unwrap();
+            let parsed: ContainerFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, fmt);
+        }
+
+        #[test]
+        fn is_isobmff_ts() {
+            assert!(!ContainerFormat::Ts.is_isobmff());
+        }
+
+        #[test]
+        fn equality_ts() {
+            assert_eq!(ContainerFormat::Ts, ContainerFormat::Ts);
+            assert_ne!(ContainerFormat::Ts, ContainerFormat::Cmaf);
+            assert_ne!(ContainerFormat::Ts, ContainerFormat::Fmp4);
+            assert_ne!(ContainerFormat::Ts, ContainerFormat::Iso);
+        }
+
+        #[test]
+        fn hash_includes_ts() {
+            use std::collections::HashSet;
+            let mut set = HashSet::new();
+            set.insert(ContainerFormat::Cmaf);
+            set.insert(ContainerFormat::Fmp4);
+            set.insert(ContainerFormat::Iso);
+            set.insert(ContainerFormat::Ts);
+            assert_eq!(set.len(), 4);
+        }
     }
 }

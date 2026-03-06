@@ -127,9 +127,16 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
             request::handle_iframe_manifest_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
+        // On-demand: GET /repackage/{content_id}/{format}/key
+        // Serves the raw AES-128 content key for TS segment decryption (HLS AES-128 only)
+        (HttpMethod::Get, ["repackage", content_id, format, "key"]) => {
+            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            request::handle_key_request(content_id, output_format, scheme.as_deref(), ctx)
+        }
+
         // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.{ext}
         // Accepts all CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions:
-        // .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a
+        // .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a, .ts
         (HttpMethod::Get, ["repackage", content_id, format, segment_file]) => {
             let (output_format, scheme) = parse_format_with_scheme(format)?;
             if let Some(seg_num) = parse_segment_number(segment_file) {
@@ -213,6 +220,7 @@ fn parse_segment_number(filename: &str) -> Option<u32> {
         ".m4s",  // fMP4 media segment (ISO 14496-12)
         ".mp4",  // ISO BMFF segment (ISO 14496-12)
         ".m4a",  // ISOBMFF audio segment (ISO 14496-12)
+        ".ts",   // MPEG-TS segment (ISO 13818-1)
     ];
     let name = SEGMENT_EXTENSIONS
         .iter()

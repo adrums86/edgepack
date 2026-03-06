@@ -270,10 +270,25 @@ pub fn handle_repackage_webhook(req: &HttpRequest, ctx: &HandlerContext) -> Resu
     )
     .ok_or_else(|| {
         EdgepackError::InvalidInput(format!(
-            "invalid container_format: {} (expected 'cmaf', 'fmp4', or 'iso')",
-            payload.container_format
+            "invalid container_format: {} (expected 'cmaf', 'fmp4', 'iso'{})",
+            payload.container_format,
+            if cfg!(feature = "ts") { ", or 'ts'" } else { "" }
         ))
     })?;
+
+    // Validate TS + DASH compatibility
+    #[cfg(feature = "ts")]
+    {
+        let ts_compat = crate::media::compat::validate_container_output_formats(
+            container_format,
+            &output_formats,
+        );
+        if !ts_compat.valid {
+            return Err(EdgepackError::InvalidInput(
+                ts_compat.errors.join("; "),
+            ));
+        }
+    }
 
     // Validate DRM systems
     let valid_drm_systems = ["widevine", "playready", "fairplay", "clearkey"];

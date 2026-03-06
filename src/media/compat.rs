@@ -156,6 +156,27 @@ pub fn validate_codec_scheme(
     result
 }
 
+/// Validate container format against output formats.
+///
+/// TS container format is only supported with HLS — DASH does not support TS segments.
+#[cfg(feature = "ts")]
+pub fn validate_container_output_formats(
+    container_format: ContainerFormat,
+    output_formats: &[crate::manifest::types::OutputFormat],
+) -> ValidationResult {
+    let mut result = ValidationResult::ok();
+
+    if matches!(container_format, ContainerFormat::Ts) {
+        if output_formats.iter().any(|f| matches!(f, crate::manifest::types::OutputFormat::Dash)) {
+            result = result.with_error(
+                "TS container format is not supported with DASH output".to_string(),
+            );
+        }
+    }
+
+    result
+}
+
 /// Validate a complete repackage request before processing.
 pub fn validate_repackage_request(
     source_scheme: EncryptionScheme,
@@ -682,5 +703,50 @@ mod tests {
         let r = validate_media_segment(&moof, false);
         assert!(!r.valid);
         assert!(r.errors.iter().any(|e| e.contains("mdat")));
+    }
+
+    // --- TS container format validation ---
+
+    #[cfg(feature = "ts")]
+    mod ts_compat_tests {
+        use super::*;
+        use crate::manifest::types::OutputFormat;
+
+        #[test]
+        fn validate_ts_with_dash_error() {
+            let r = validate_container_output_formats(
+                ContainerFormat::Ts,
+                &[OutputFormat::Dash],
+            );
+            assert!(!r.valid);
+            assert!(r.errors[0].contains("TS container format is not supported with DASH"));
+        }
+
+        #[test]
+        fn validate_ts_with_hls_ok() {
+            let r = validate_container_output_formats(
+                ContainerFormat::Ts,
+                &[OutputFormat::Hls],
+            );
+            assert!(r.valid);
+        }
+
+        #[test]
+        fn validate_ts_with_dual_format_error() {
+            let r = validate_container_output_formats(
+                ContainerFormat::Ts,
+                &[OutputFormat::Hls, OutputFormat::Dash],
+            );
+            assert!(!r.valid);
+        }
+
+        #[test]
+        fn validate_cmaf_with_dash_ok() {
+            let r = validate_container_output_formats(
+                ContainerFormat::Cmaf,
+                &[OutputFormat::Dash],
+            );
+            assert!(r.valid);
+        }
     }
 }

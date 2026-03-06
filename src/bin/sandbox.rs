@@ -166,6 +166,8 @@ async fn handle_repackage(
         "cmaf" => edgepack::media::container::ContainerFormat::Cmaf,
         "fmp4" => edgepack::media::container::ContainerFormat::Fmp4,
         "iso" => edgepack::media::container::ContainerFormat::Iso,
+        #[cfg(feature = "ts")]
+        "ts" => edgepack::media::container::ContainerFormat::Ts,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -534,6 +536,8 @@ async fn handle_source_config(
         "cmaf" => edgepack::media::container::ContainerFormat::Cmaf,
         "fmp4" => edgepack::media::container::ContainerFormat::Fmp4,
         "iso" => edgepack::media::container::ContainerFormat::Iso,
+        #[cfg(feature = "ts")]
+        "ts" => edgepack::media::container::ContainerFormat::Ts,
         _ => edgepack::media::container::ContainerFormat::Cmaf,
     };
 
@@ -986,6 +990,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
       <label><input type="radio" name="container-format" value="cmaf" checked> CMAF (.cmfv)</label>
       <label><input type="radio" name="container-format" value="fmp4"> fMP4 (.m4s)</label>
       <label><input type="radio" name="container-format" value="iso"> ISO BMFF (.mp4)</label>
+      <label><input type="radio" name="container-format" value="ts"> MPEG-TS (.ts)</label>
     </div>
 
     <details style="margin-bottom:1rem;">
@@ -1208,13 +1213,16 @@ async function pollStatus(contentId, format, containerFormat, targetSchemes) {
         linksEl.innerHTML = '';
 
         const ext = format === 'hls' ? 'm3u8' : 'mpd';
-        const segExt = containerFormat === 'fmp4' ? '.m4s' : containerFormat === 'iso' ? '.mp4' : '.cmfv';
+        const segExt = containerFormat === 'ts' ? '.ts' : containerFormat === 'fmp4' ? '.m4s' : containerFormat === 'iso' ? '.mp4' : '.cmfv';
+        const isTs = containerFormat === 'ts';
         // Generate links per target scheme (e.g. hls_cenc, hls_cbcs)
         for (const scheme of targetSchemes) {
           const fmtScheme = `${format}_${scheme}`;
           const base = `/api/output/${contentId}/${fmtScheme}`;
           linksEl.innerHTML += `<a href="${base}/manifest.${ext}" target="_blank">${fmtScheme}/manifest.${ext}</a>`;
-          linksEl.innerHTML += `<a href="${base}/init.mp4" target="_blank">${fmtScheme}/init.mp4</a>`;
+          if (!isTs) {
+            linksEl.innerHTML += `<a href="${base}/init.mp4" target="_blank">${fmtScheme}/init.mp4</a>`;
+          }
           for (let i = 0; i < data.segments_completed; i++) {
             linksEl.innerHTML += `<a href="${base}/segment_${i}${segExt}" target="_blank">${fmtScheme}/segment_${i}${segExt}</a>`;
           }

@@ -288,6 +288,13 @@ fn run_e2e_container_format(
                 container
             );
         }
+        #[cfg(feature = "ts")]
+        ContainerFormat::Ts => {
+            assert!(
+                rewritten_init.is_empty(),
+                "TS must produce empty ftyp"
+            );
+        }
     }
 
     // 3. Build ManifestState with the container format
@@ -328,6 +335,10 @@ fn run_e2e_container_format(
                         "{:?} DASH must use isoff-live profile",
                         container
                     );
+                }
+                #[cfg(feature = "ts")]
+                ContainerFormat::Ts => {
+                    panic!("TS + DASH should never reach here — rejected at validation")
                 }
             }
         }

@@ -17,6 +17,18 @@ fn hex_encode_base64(b64: &str) -> String {
     }
 }
 
+/// Emit HLS KEY tag for TS AES-128 whole-segment encryption.
+///
+/// For TS output, the method is always `AES-128` regardless of the target scheme.
+/// The key URI points to a key delivery endpoint. IV defaults to the media sequence
+/// number per the HLS spec (no explicit IV tag needed).
+#[cfg(feature = "ts")]
+fn emit_hls_ts_key(m3u8: &mut String, key_uri: &str) {
+    m3u8.push_str(&format!(
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"{key_uri}\"\n"
+    ));
+}
+
 /// Emit HLS DRM KEY tags for a given ManifestDrmInfo.
 fn emit_hls_drm_keys(m3u8: &mut String, drm: &crate::manifest::types::ManifestDrmInfo) {
     let method = drm.encryption_scheme.hls_method_string();
@@ -85,7 +97,12 @@ pub fn render(state: &ManifestState) -> Result<String> {
     if is_ll_hls {
         m3u8.push_str("#EXT-X-VERSION:9\n");
     } else {
-        m3u8.push_str("#EXT-X-VERSION:7\n");
+        // TS segments are compatible with HLS version 3 (lower compat than CMAF's v7)
+        #[cfg(feature = "ts")]
+        let version = if !state.container_format.is_isobmff() { 3 } else { 7 };
+        #[cfg(not(feature = "ts"))]
+        let version = 7;
+        m3u8.push_str(&format!("#EXT-X-VERSION:{version}\n"));
     }
 
     // Target duration (rounded up to nearest integer)
@@ -149,10 +166,24 @@ pub fn render(state: &ManifestState) -> Result<String> {
     let has_clear_lead = state.clear_lead_boundary.is_some() && state.drm_info.is_some();
     let clear_lead_boundary = state.clear_lead_boundary.unwrap_or(0);
 
+    // TS output uses AES-128 whole-segment encryption instead of per-sample DRM
+    #[cfg(feature = "ts")]
+    let is_ts = !state.container_format.is_isobmff();
+    #[cfg(not(feature = "ts"))]
+    let is_ts = false;
+
     if has_clear_lead {
         m3u8.push_str("#EXT-X-KEY:METHOD=NONE\n");
-    } else if let Some(ref drm) = state.drm_info {
-        emit_hls_drm_keys(&mut m3u8, drm);
+    } else if let Some(ref _drm) = state.drm_info {
+        if is_ts {
+            #[cfg(feature = "ts")]
+            {
+                let key_uri = format!("{}key", state.base_url);
+                emit_hls_ts_key(&mut m3u8, &key_uri);
+            }
+        } else {
+            emit_hls_drm_keys(&mut m3u8, _drm);
+        }
     }
 
     // Init segment (EXT-X-MAP)
@@ -167,16 +198,32 @@ pub fn render(state: &ManifestState) -> Result<String> {
     for segment in state.windowed_segments() {
         // Clear lead transition
         if has_clear_lead && segment.number == clear_lead_boundary {
-            if let Some(ref drm) = state.drm_info {
-                emit_hls_drm_keys(&mut m3u8, drm);
+            if let Some(ref _drm) = state.drm_info {
+                if is_ts {
+                    #[cfg(feature = "ts")]
+                    {
+                        let key_uri = format!("{}key", state.base_url);
+                        emit_hls_ts_key(&mut m3u8, &key_uri);
+                    }
+                } else {
+                    emit_hls_drm_keys(&mut m3u8, _drm);
+                }
             }
         }
 
         // Key rotation: emit new KEY tag when period changes
         if let Some(period) = segment.key_period {
             if last_key_period != Some(period) && !state.rotation_drm_info.is_empty() {
-                let drm_idx = period as usize % state.rotation_drm_info.len();
-                emit_hls_drm_keys(&mut m3u8, &state.rotation_drm_info[drm_idx]);
+                if is_ts {
+                    #[cfg(feature = "ts")]
+                    {
+                        let key_uri = format!("{}key", state.base_url);
+                        emit_hls_ts_key(&mut m3u8, &key_uri);
+                    }
+                } else {
+                    let drm_idx = period as usize % state.rotation_drm_info.len();
+                    emit_hls_drm_keys(&mut m3u8, &state.rotation_drm_info[drm_idx]);
+                }
                 last_key_period = Some(period);
             }
         }

@@ -878,10 +878,17 @@ pub fn make_manifest_state_with_container(
         container,
     );
     state.phase = phase;
-    state.init_segment = Some(InitSegmentInfo {
-        uri: format!("{}init.mp4", base_url),
-        byte_size: 1024,
-    });
+    // TS has no init segment (PAT/PMT embedded in each segment)
+    #[cfg(feature = "ts")]
+    let has_init = container.is_isobmff();
+    #[cfg(not(feature = "ts"))]
+    let has_init = true;
+    if has_init {
+        state.init_segment = Some(InitSegmentInfo {
+            uri: format!("{}init.mp4", base_url),
+            byte_size: 1024,
+        });
+    }
     state.drm_info = Some(ManifestDrmInfo {
         encryption_scheme: EncryptionScheme::Cenc,
         widevine_pssh: Some("AAAAOHBzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAABgIARIQ".into()),
