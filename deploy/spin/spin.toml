@@ -1,0 +1,47 @@
+# Fermyon Spin manifest for edgepack
+#
+# Deploys on: Fermyon Cloud, Akamai (via Fermyon Wasm Functions), SpinKube (Kubernetes)
+#
+# Prerequisites:
+#   rustup target add wasm32-wasip2
+#   cargo install spin (or download from https://developer.fermyon.com)
+#
+# Build & run locally:
+#   make build
+#   spin up --from deploy/spin/spin.toml
+#
+# Deploy to Fermyon Cloud:
+#   make build
+#   spin deploy --from deploy/spin/spin.toml
+#
+# Deploy to Akamai (via Fermyon Wasm Functions):
+#   make build
+#   spin deploy --from deploy/spin/spin.toml --environment-id <akamai-env-id>
+
+spin_manifest_version = 2
+
+[application]
+name = "edgepack"
+version = "0.1.0"
+description = "JIT media repackager — DASH/HLS encryption transforms at the CDN edge"
+
+[application.trigger.http]
+base = "/"
+
+[[trigger.http]]
+id = "edgepack"
+component = "edgepack"
+route = "/..."
+
+[component.edgepack]
+source = "../../target/wasm32-wasip2/release/edgepack.wasm"
+allowed_outbound_hosts = [
+    # DRM license server (SPEKE 2.0)
+    "https://*:443",
+]
+
+# Environment variables — set these for your deployment.
+# For Fermyon Cloud / Akamai, use `spin deploy --variable` or dashboard config.
+[component.edgepack.variables]
+# SPEKE_URL = "https://drm.example.com/speke/v2"
+# SPEKE_BEARER_TOKEN = "your-drm-token"

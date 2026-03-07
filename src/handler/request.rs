@@ -1,24 +1,24 @@
-use crate::cache::CacheKeys;
+use crate::cache::{self, CacheBackend, CacheKeys};
 use crate::error::Result;
 use crate::handler::{format_str, HandlerContext, HttpResponse};
 use crate::manifest;
 use crate::manifest::types::{ManifestState, OutputFormat};
-use crate::repackager::JobStatus;
 
 /// Handle a request for a manifest.
 ///
-/// Looks up ManifestState from Redis, renders it, and returns with
+/// Looks up ManifestState from cache, renders it, and returns with
 /// appropriate cache headers based on whether the manifest is live or complete.
 /// When `scheme` is provided, uses scheme-qualified cache keys.
 ///
-/// When JIT is enabled (feature = "jit"), a cache miss triggers on-demand
-/// setup: fetch source manifest, init segment, and DRM keys, then render.
+/// On cache miss, triggers JIT on-demand setup: fetch source manifest,
+/// init segment, and DRM keys, then render.
 pub fn handle_manifest_request(
     content_id: &str,
     format: OutputFormat,
     scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
+    let cache = cache::global_cache();
     let fmt = format_str(format);
     let key = if let Some(s) = scheme {
         CacheKeys::manifest_state_for_scheme(content_id, fmt, s)
@@ -26,15 +26,12 @@ pub fn handle_manifest_request(
         CacheKeys::manifest_state(content_id, fmt)
     };
 
-    let state_bytes = match ctx.cache.get(&key)? {
+    let state_bytes = match cache.get(&key)? {
         Some(data) => data,
         None => {
             // JIT fallback: trigger on-demand setup on cache miss
-            #[cfg(feature = "jit")]
-            {
-                if let Some(resp) = jit_manifest_fallback(content_id, format, fmt, scheme, ctx)? {
-                    return Ok(resp);
-                }
+            if let Some(resp) = jit_manifest_fallback(content_id, format, fmt, scheme, ctx)? {
+                return Ok(resp);
             }
 
             return Ok(HttpResponse::not_found(&format!(
@@ -50,22 +47,23 @@ pub fn handle_manifest_request(
 ///
 /// Init segments are immutable once created — always served with long cache TTL.
 ///
-/// When JIT is enabled, a cache miss triggers JIT setup (which caches the init
-/// segment), then reads it back from cache.
+/// On cache miss, triggers JIT setup (which caches the init segment), then
+/// reads it back from cache.
 pub fn handle_init_segment_request(
     content_id: &str,
     format: OutputFormat,
     scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
+    let cache = cache::global_cache();
     let fmt = format_str(format);
 
     // Try format-agnostic key first (Phase 21+), then legacy format-qualified key
     let data = if let Some(s) = scheme {
-        ctx.cache.get(&CacheKeys::init_segment_for_scheme_only(content_id, s))?
-            .or(ctx.cache.get(&CacheKeys::init_segment_for_scheme(content_id, fmt, s))?)
+        cache.get(&CacheKeys::init_segment_for_scheme_only(content_id, s))?
+            .or(cache.get(&CacheKeys::init_segment_for_scheme(content_id, fmt, s))?)
     } else {
-        ctx.cache.get(&CacheKeys::init_segment(content_id, fmt))?
+        cache.get(&CacheKeys::init_segment(content_id, fmt))?
     };
 
     match data {
@@ -79,11 +77,8 @@ pub fn handle_init_segment_request(
         )),
         None => {
             // JIT fallback: trigger setup then read init from cache
-            #[cfg(feature = "jit")]
-            {
-                if let Some(resp) = jit_init_fallback(content_id, format, fmt, scheme, ctx)? {
-                    return Ok(resp);
-                }
+            if let Some(resp) = jit_init_fallback(content_id, format, fmt, scheme, ctx)? {
+                return Ok(resp);
             }
 
             Ok(HttpResponse::not_found(&format!(
@@ -97,8 +92,8 @@ pub fn handle_init_segment_request(
 ///
 /// Segments are immutable once created — always served with long cache TTL.
 ///
-/// When JIT is enabled, a cache miss triggers on-demand segment processing:
-/// fetches the source segment, decrypts, re-encrypts, and caches the result.
+/// On cache miss, triggers on-demand segment processing: fetches the source
+/// segment, decrypts, re-encrypts, and caches the result.
 pub fn handle_media_segment_request(
     content_id: &str,
     format: OutputFormat,
@@ -106,14 +101,15 @@ pub fn handle_media_segment_request(
     scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
+    let cache = cache::global_cache();
     let fmt = format_str(format);
 
     // Try format-agnostic key first (Phase 21+), then legacy format-qualified key
     let data = if let Some(s) = scheme {
-        ctx.cache.get(&CacheKeys::media_segment_for_scheme_only(content_id, s, segment_number))?
-            .or(ctx.cache.get(&CacheKeys::media_segment_for_scheme(content_id, fmt, s, segment_number))?)
+        cache.get(&CacheKeys::media_segment_for_scheme_only(content_id, s, segment_number))?
+            .or(cache.get(&CacheKeys::media_segment_for_scheme(content_id, fmt, s, segment_number))?)
     } else {
-        ctx.cache.get(&CacheKeys::media_segment(content_id, fmt, segment_number))?
+        cache.get(&CacheKeys::media_segment(content_id, fmt, segment_number))?
     };
 
     match data {
@@ -127,11 +123,8 @@ pub fn handle_media_segment_request(
         )),
         None => {
             // JIT fallback: process segment on demand
-            #[cfg(feature = "jit")]
-            {
-                if let Some(resp) = jit_segment_fallback(content_id, format, fmt, segment_number, scheme, ctx)? {
-                    return Ok(resp);
-                }
+            if let Some(resp) = jit_segment_fallback(content_id, format, fmt, segment_number, scheme, ctx)? {
+                return Ok(resp);
             }
 
             Ok(HttpResponse::not_found(&format!(
@@ -158,6 +151,7 @@ pub fn handle_iframe_manifest_request(
         ));
     }
 
+    let cache = cache::global_cache();
     let fmt = format_str(format);
     let key = if let Some(s) = scheme {
         CacheKeys::manifest_state_for_scheme(content_id, fmt, s)
@@ -165,7 +159,7 @@ pub fn handle_iframe_manifest_request(
         CacheKeys::manifest_state(content_id, fmt)
     };
 
-    let state_bytes = match ctx.cache.get(&key)? {
+    let state_bytes = match cache.get(&key)? {
         Some(data) => data,
         None => {
             return Ok(HttpResponse::not_found(&format!(
@@ -193,34 +187,6 @@ pub fn handle_iframe_manifest_request(
     }
 }
 
-/// Handle a request for job status.
-pub fn handle_status_request(
-    content_id: &str,
-    format: OutputFormat,
-    ctx: &HandlerContext,
-) -> Result<HttpResponse> {
-    let fmt = format_str(format);
-    let key = CacheKeys::job_state(content_id, fmt);
-
-    match ctx.cache.get(&key)? {
-        Some(data) => {
-            // Validate it's valid JSON by attempting to deserialize
-            let _status: JobStatus = serde_json::from_slice(&data).map_err(|e| {
-                crate::error::EdgepackError::Cache(format!("deserialize job status: {e}"))
-            })?;
-
-            Ok(HttpResponse::ok_with_cache(
-                data,
-                "application/json",
-                "no-cache",
-            ))
-        }
-        None => Ok(HttpResponse::not_found(&format!(
-            "no job found for {content_id}/{fmt}"
-        ))),
-    }
-}
-
 /// Handle a request for the AES-128 content key (TS output only).
 ///
 /// Returns the raw 16-byte content key for HLS AES-128 decryption.
@@ -229,10 +195,12 @@ pub fn handle_key_request(
     content_id: &str,
     _format: OutputFormat,
     scheme: Option<&str>,
-    ctx: &HandlerContext,
+    _ctx: &HandlerContext,
 ) -> Result<HttpResponse> {
+    let cache = cache::global_cache();
+
     // Load the DRM key set from cache
-    let key_data = ctx.cache.get(&CacheKeys::drm_keys(content_id))?;
+    let key_data = cache.get(&CacheKeys::drm_keys(content_id))?;
     match key_data {
         Some(data) => {
             // Parse the cached key set to extract the raw content key
@@ -289,13 +257,12 @@ fn render_manifest_response(
 }
 
 // ---------------------------------------------------------------------------
-// JIT Fallback Handlers (feature = "jit")
+// JIT Fallback Handlers
 // ---------------------------------------------------------------------------
 
 /// Resolve the effective scheme string for JIT operations.
 ///
 /// Uses the URL scheme if present, otherwise falls back to the JIT default.
-#[cfg(feature = "jit")]
 fn resolve_jit_scheme(scheme: Option<&str>, ctx: &HandlerContext) -> String {
     scheme
         .map(|s| s.to_string())
@@ -305,7 +272,6 @@ fn resolve_jit_scheme(scheme: Option<&str>, ctx: &HandlerContext) -> String {
 /// Build a base URL for manifest references (e.g. init/segment URIs).
 ///
 /// Given content_id, format, and scheme, produces `/repackage/{id}/{fmt}_{scheme}/`.
-#[cfg(feature = "jit")]
 fn jit_base_url(content_id: &str, fmt: &str, scheme_str: &str) -> String {
     format!("/repackage/{content_id}/{fmt}_{scheme_str}/")
 }
@@ -316,7 +282,6 @@ fn jit_base_url(content_id: &str, fmt: &str, scheme_str: &str) -> String {
 /// If we acquire the lock and perform setup, returns Ok(true).
 /// If another request holds the lock (contention), returns Ok(false) — caller
 /// should return 202 Accepted with Retry-After.
-#[cfg(feature = "jit")]
 fn ensure_jit_setup(
     content_id: &str,
     format: OutputFormat,
@@ -327,61 +292,65 @@ fn ensure_jit_setup(
     use crate::drm::scheme::EncryptionScheme;
     use crate::repackager::pipeline::{resolve_source_config, RepackagePipeline};
 
+    let cache = cache::global_cache();
+
     // Check if setup is already done
     let setup_key = CacheKeys::jit_setup(content_id, fmt);
-    if ctx.cache.exists(&setup_key)? {
+    if cache.exists(&setup_key)? {
         return Ok(true);
     }
 
     // Try to acquire the processing lock
     let lock_key = CacheKeys::processing_lock(content_id, fmt, "setup");
     let lock_ttl = ctx.config.jit.lock_ttl_seconds;
-    let acquired = ctx.cache.set_nx(&lock_key, b"1", lock_ttl)?;
+    let acquired = cache.set_nx(&lock_key, b"1", lock_ttl)?;
 
     if !acquired {
         // Another request is processing — check cache one more time
-        if ctx.cache.exists(&setup_key)? {
+        if cache.exists(&setup_key)? {
             return Ok(true);
         }
         return Ok(false); // Lock contention → 202
     }
 
-    // We hold the lock — perform JIT setup
-    let target_scheme = EncryptionScheme::from_str_value(scheme_str)
-        .unwrap_or(ctx.config.jit.default_target_scheme);
+    // We hold the lock — perform JIT setup.
+    // Use a closure to ensure the lock is always released, even on early errors.
+    let setup_result = (|| -> Result<()> {
+        let target_scheme = EncryptionScheme::from_str_value(scheme_str)
+            .unwrap_or(ctx.config.jit.default_target_scheme);
 
-    let source_config = resolve_source_config(
-        ctx.cache.as_ref(),
-        content_id,
-        &ctx.config,
-        Some(scheme_str),
-    )?;
+        let source_config = resolve_source_config(
+            content_id,
+            &ctx.config,
+            Some(scheme_str),
+        )?;
 
-    let cache = crate::cache::create_backend(&ctx.config)?;
-    let pipeline = RepackagePipeline::new(ctx.config.clone(), cache);
+        let pipeline = RepackagePipeline::new(ctx.config.clone());
 
-    let base_url = jit_base_url(content_id, fmt, scheme_str);
+        let base_url = jit_base_url(content_id, fmt, scheme_str);
 
-    let result = pipeline.jit_setup(
-        content_id,
-        &source_config,
-        format,
-        target_scheme,
-        &base_url,
-    );
+        pipeline.jit_setup(
+            content_id,
+            &source_config,
+            format,
+            target_scheme,
+            &base_url,
+        )?;
 
-    // Release lock regardless of success
-    let _ = ctx.cache.delete(&lock_key);
+        Ok(())
+    })();
 
-    result?;
+    // Release lock regardless of success or failure
+    let _ = cache.delete(&lock_key);
+
+    setup_result?;
     Ok(true)
 }
 
 /// JIT manifest fallback: on cache miss, trigger setup and render manifest.
 ///
-/// Returns `Some(HttpResponse)` if JIT handled the request, `None` if JIT is
-/// disabled or source config is unavailable.
-#[cfg(feature = "jit")]
+/// Returns `Some(HttpResponse)` if JIT handled the request, `None` if
+/// source config is unavailable.
 fn jit_manifest_fallback(
     content_id: &str,
     format: OutputFormat,
@@ -389,17 +358,14 @@ fn jit_manifest_fallback(
     scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<Option<HttpResponse>> {
-    if !ctx.config.jit.enabled {
-        return Ok(None);
-    }
-
+    let cache = cache::global_cache();
     let scheme_str = resolve_jit_scheme(scheme, ctx);
 
     match ensure_jit_setup(content_id, format, fmt, &scheme_str, ctx) {
         Ok(true) => {
             // Setup complete — read the manifest from cache and render
             let key = CacheKeys::manifest_state_for_scheme(content_id, fmt, &scheme_str);
-            match ctx.cache.get(&key)? {
+            match cache.get(&key)? {
                 Some(data) => Ok(Some(render_manifest_response(&data, format, ctx)?)),
                 None => Ok(None), // Setup succeeded but no manifest — shouldn't happen
             }
@@ -425,7 +391,6 @@ fn jit_manifest_fallback(
 }
 
 /// JIT init segment fallback: ensure setup is done, then read init from cache.
-#[cfg(feature = "jit")]
 fn jit_init_fallback(
     content_id: &str,
     format: OutputFormat,
@@ -433,17 +398,14 @@ fn jit_init_fallback(
     scheme: Option<&str>,
     ctx: &HandlerContext,
 ) -> Result<Option<HttpResponse>> {
-    if !ctx.config.jit.enabled {
-        return Ok(None);
-    }
-
+    let cache = cache::global_cache();
     let scheme_str = resolve_jit_scheme(scheme, ctx);
 
     match ensure_jit_setup(content_id, format, fmt, &scheme_str, ctx) {
         Ok(true) => {
             // Setup complete — init segment should now be in cache
             let key = CacheKeys::init_segment_for_scheme(content_id, fmt, &scheme_str);
-            match ctx.cache.get(&key)? {
+            match cache.get(&key)? {
                 Some(data) => Ok(Some(HttpResponse::ok_with_cache(
                     data,
                     "video/mp4",
@@ -474,7 +436,6 @@ fn jit_init_fallback(
 }
 
 /// JIT media segment fallback: ensure setup is done, then process segment on demand.
-#[cfg(feature = "jit")]
 fn jit_segment_fallback(
     content_id: &str,
     format: OutputFormat,
@@ -486,10 +447,7 @@ fn jit_segment_fallback(
     use crate::drm::scheme::EncryptionScheme;
     use crate::repackager::pipeline::RepackagePipeline;
 
-    if !ctx.config.jit.enabled {
-        return Ok(None);
-    }
-
+    let cache = cache::global_cache();
     let scheme_str = resolve_jit_scheme(scheme, ctx);
 
     // Ensure setup has been done first
@@ -515,12 +473,12 @@ fn jit_segment_fallback(
     // Try to acquire segment-level processing lock
     let lock_key = CacheKeys::processing_lock(content_id, fmt, &format!("seg:{segment_number}"));
     let lock_ttl = ctx.config.jit.lock_ttl_seconds;
-    let acquired = ctx.cache.set_nx(&lock_key, b"1", lock_ttl)?;
+    let acquired = cache.set_nx(&lock_key, b"1", lock_ttl)?;
 
     if !acquired {
         // Another request is processing this segment — check cache one more time
         let seg_key = CacheKeys::media_segment_for_scheme(content_id, fmt, &scheme_str, segment_number);
-        if let Some(data) = ctx.cache.get(&seg_key)? {
+        if let Some(data) = cache.get(&seg_key)? {
             return Ok(Some(HttpResponse::ok_with_cache(
                 data,
                 "video/mp4",
@@ -548,13 +506,12 @@ fn jit_segment_fallback(
     let target_scheme = EncryptionScheme::from_str_value(&scheme_str)
         .unwrap_or(ctx.config.jit.default_target_scheme);
 
-    let cache = crate::cache::create_backend(&ctx.config)?;
-    let pipeline = RepackagePipeline::new(ctx.config.clone(), cache);
+    let pipeline = RepackagePipeline::new(ctx.config.clone());
 
     let result = pipeline.jit_segment(content_id, format, target_scheme, segment_number);
 
     // Release lock
-    let _ = ctx.cache.delete(&lock_key);
+    let _ = cache.delete(&lock_key);
 
     match result {
         Ok(data) => Ok(Some(HttpResponse::ok_with_cache(
@@ -580,7 +537,7 @@ mod tests {
     #[test]
     fn handle_manifest_request_hls_not_found() {
         let ctx = test_context();
-        let resp = handle_manifest_request("content-1", OutputFormat::Hls, None, &ctx).unwrap();
+        let resp = handle_manifest_request("req-hls-mfst-1", OutputFormat::Hls, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("manifest not found"));
     }
@@ -588,7 +545,7 @@ mod tests {
     #[test]
     fn handle_manifest_request_dash_not_found() {
         let ctx = test_context();
-        let resp = handle_manifest_request("content-2", OutputFormat::Dash, None, &ctx).unwrap();
+        let resp = handle_manifest_request("req-dash-mfst-2", OutputFormat::Dash, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("dash"));
     }
@@ -596,14 +553,14 @@ mod tests {
     #[test]
     fn handle_manifest_request_with_scheme_not_found() {
         let ctx = test_context();
-        let resp = handle_manifest_request("content-1", OutputFormat::Hls, Some("cenc"), &ctx).unwrap();
+        let resp = handle_manifest_request("req-scheme-mfst-3", OutputFormat::Hls, Some("cenc"), &ctx).unwrap();
         assert_eq!(resp.status, 404);
     }
 
     #[test]
     fn handle_init_segment_request_not_found() {
         let ctx = test_context();
-        let resp = handle_init_segment_request("content-1", OutputFormat::Hls, None, &ctx).unwrap();
+        let resp = handle_init_segment_request("req-init-4", OutputFormat::Hls, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("init segment not found"));
     }
@@ -612,7 +569,7 @@ mod tests {
     fn handle_media_segment_request_not_found() {
         let ctx = test_context();
         let resp =
-            handle_media_segment_request("content-1", OutputFormat::Hls, 5, None, &ctx).unwrap();
+            handle_media_segment_request("req-seg-5", OutputFormat::Hls, 5, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("segment 5 not found"));
     }
@@ -620,33 +577,17 @@ mod tests {
     #[test]
     fn handle_media_segment_request_different_numbers() {
         let ctx = test_context();
-        let resp = handle_media_segment_request("c", OutputFormat::Dash, 0, None, &ctx).unwrap();
+        let resp = handle_media_segment_request("req-segnum-6", OutputFormat::Dash, 0, None, &ctx).unwrap();
         assert!(String::from_utf8_lossy(&resp.body).contains("segment 0"));
 
-        let resp = handle_media_segment_request("c", OutputFormat::Dash, 42, None, &ctx).unwrap();
+        let resp = handle_media_segment_request("req-segnum-6b", OutputFormat::Dash, 42, None, &ctx).unwrap();
         assert!(String::from_utf8_lossy(&resp.body).contains("segment 42"));
-    }
-
-    #[test]
-    fn handle_status_request_not_found() {
-        let ctx = test_context();
-        let resp = handle_status_request("content-1", OutputFormat::Hls, &ctx).unwrap();
-        assert_eq!(resp.status, 404);
-        assert!(String::from_utf8_lossy(&resp.body).contains("no job found"));
-    }
-
-    #[test]
-    fn handle_status_request_dash_not_found() {
-        let ctx = test_context();
-        let resp = handle_status_request("content-99", OutputFormat::Dash, &ctx).unwrap();
-        assert_eq!(resp.status, 404);
-        assert!(String::from_utf8_lossy(&resp.body).contains("content-99"));
     }
 
     #[test]
     fn handle_iframe_manifest_hls_not_found() {
         let ctx = test_context();
-        let resp = handle_iframe_manifest_request("content-1", OutputFormat::Hls, None, &ctx).unwrap();
+        let resp = handle_iframe_manifest_request("req-iframe-7", OutputFormat::Hls, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("manifest not found"));
     }
@@ -654,7 +595,7 @@ mod tests {
     #[test]
     fn handle_iframe_manifest_dash_returns_404() {
         let ctx = test_context();
-        let resp = handle_iframe_manifest_request("content-1", OutputFormat::Dash, None, &ctx).unwrap();
+        let resp = handle_iframe_manifest_request("req-iframe-8", OutputFormat::Dash, None, &ctx).unwrap();
         assert_eq!(resp.status, 404);
         assert!(String::from_utf8_lossy(&resp.body).contains("embedded in the regular MPD"));
     }
@@ -662,7 +603,7 @@ mod tests {
     #[test]
     fn handle_iframe_manifest_with_scheme_not_found() {
         let ctx = test_context();
-        let resp = handle_iframe_manifest_request("content-1", OutputFormat::Hls, Some("cenc"), &ctx).unwrap();
+        let resp = handle_iframe_manifest_request("req-iframe-9", OutputFormat::Hls, Some("cenc"), &ctx).unwrap();
         assert_eq!(resp.status, 404);
     }
 }

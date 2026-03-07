@@ -94,7 +94,6 @@ fn default_target_schemes() -> Vec<EncryptionScheme> {
 ///
 /// Maps a `content_id` to its source parameters, enabling GET-triggered
 /// on-demand repackaging without a prior webhook call.
-#[cfg(feature = "jit")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     /// URL of the source manifest.
@@ -107,29 +106,6 @@ pub struct SourceConfig {
     pub container_format: ContainerFormat,
 }
 
-/// Status of a repackaging job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobStatus {
-    pub content_id: String,
-    pub format: OutputFormat,
-    pub state: JobState,
-    pub segments_completed: u32,
-    pub segments_total: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobState {
-    /// Job is queued but not started.
-    Pending,
-    /// Fetching DRM keys from license server.
-    FetchingKeys,
-    /// Processing segments.
-    Processing,
-    /// All segments processed, manifest finalized.
-    Complete,
-    /// Job failed.
-    Failed,
-}
 
 #[cfg(test)]
 mod tests {
@@ -232,58 +208,6 @@ mod tests {
         assert_eq!(parsed.target_schemes[1], EncryptionScheme::Cbcs);
     }
 
-    #[test]
-    fn job_status_construction() {
-        let status = JobStatus {
-            content_id: "c1".into(),
-            format: OutputFormat::Hls,
-            state: JobState::Processing,
-            segments_completed: 5,
-            segments_total: Some(10),
-        };
-        assert_eq!(status.segments_completed, 5);
-        assert_eq!(status.segments_total, Some(10));
-    }
-
-    #[test]
-    fn job_status_serde_roundtrip() {
-        let status = JobStatus {
-            content_id: "c2".into(),
-            format: OutputFormat::Dash,
-            state: JobState::Complete,
-            segments_completed: 10,
-            segments_total: Some(10),
-        };
-        let json = serde_json::to_string(&status).unwrap();
-        let parsed: JobStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.state, JobState::Complete);
-        assert_eq!(parsed.segments_completed, 10);
-    }
-
-    #[test]
-    fn job_state_values() {
-        assert_eq!(JobState::Pending, JobState::Pending);
-        assert_eq!(JobState::FetchingKeys, JobState::FetchingKeys);
-        assert_eq!(JobState::Processing, JobState::Processing);
-        assert_eq!(JobState::Complete, JobState::Complete);
-        assert_eq!(JobState::Failed, JobState::Failed);
-        assert_ne!(JobState::Pending, JobState::Complete);
-    }
-
-    #[test]
-    fn job_state_serde_roundtrip() {
-        for state in [
-            JobState::Pending,
-            JobState::FetchingKeys,
-            JobState::Processing,
-            JobState::Complete,
-            JobState::Failed,
-        ] {
-            let json = serde_json::to_string(&state).unwrap();
-            let parsed: JobState = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, state);
-        }
-    }
 
     #[test]
     fn repackage_request_empty_key_ids() {
@@ -308,7 +232,6 @@ mod tests {
         assert!(parsed.key_ids.is_empty());
     }
 
-    #[cfg(feature = "jit")]
     #[test]
     fn source_config_construction() {
         let cfg = SourceConfig {
@@ -321,7 +244,6 @@ mod tests {
         assert_eq!(cfg.container_format, ContainerFormat::Cmaf);
     }
 
-    #[cfg(feature = "jit")]
     #[test]
     fn source_config_serde_roundtrip() {
         let cfg = SourceConfig {
@@ -336,7 +258,6 @@ mod tests {
         assert_eq!(parsed.container_format, cfg.container_format);
     }
 
-    #[cfg(feature = "jit")]
     #[test]
     fn source_config_defaults() {
         // When optional fields are missing, defaults should apply
@@ -344,18 +265,6 @@ mod tests {
         let parsed: SourceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.target_schemes, vec![EncryptionScheme::Cenc]);
         assert_eq!(parsed.container_format, ContainerFormat::Cmaf);
-    }
-
-    #[test]
-    fn job_status_no_total() {
-        let status = JobStatus {
-            content_id: "c3".into(),
-            format: OutputFormat::Hls,
-            state: JobState::FetchingKeys,
-            segments_completed: 0,
-            segments_total: None,
-        };
-        assert!(status.segments_total.is_none());
     }
 
     #[test]

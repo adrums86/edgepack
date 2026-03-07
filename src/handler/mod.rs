@@ -1,7 +1,6 @@
 pub mod request;
 pub mod webhook;
 
-use crate::cache::CacheBackend;
 use crate::config::AppConfig;
 use crate::error::{EdgepackError, Result};
 use crate::manifest::types::OutputFormat;
@@ -31,10 +30,7 @@ pub enum HttpMethod {
 }
 
 /// Context shared across all handlers within a single request.
-///
-/// Contains the cache backend (Redis) and application config.
 pub struct HandlerContext {
-    pub cache: Box<dyn CacheBackend>,
     pub config: AppConfig,
 }
 
@@ -146,26 +142,9 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
             }
         }
 
-        // Webhook: POST /webhook/repackage
-        (HttpMethod::Post, ["webhook", "repackage"]) => {
-            webhook::handle_repackage_webhook(req, ctx)
-        }
-
-        // Continuation: POST /webhook/repackage/continue (internal self-invocation)
-        (HttpMethod::Post, ["webhook", "repackage", "continue"]) => {
-            webhook::handle_continue(req, ctx)
-        }
-
-        // Source config: POST /config/source (JIT per-content source registration)
-        #[cfg(feature = "jit")]
+        // Source config: POST /config/source (per-content source registration)
         (HttpMethod::Post, ["config", "source"]) => {
             webhook::handle_source_config(req, ctx)
-        }
-
-        // Status: GET /status/{content_id}/{format}
-        (HttpMethod::Get, ["status", content_id, format]) => {
-            let (output_format, _scheme) = parse_format_with_scheme(format)?;
-            request::handle_status_request(content_id, output_format, ctx)
         }
 
         _ => Ok(HttpResponse::not_found("not found")),
@@ -241,38 +220,12 @@ pub(crate) fn format_str(format: OutputFormat) -> &'static str {
 pub(crate) mod test_helpers {
     use super::*;
     use crate::config::{
-        AppConfig, CacheBackendType, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, StoreConfig,
+        AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig,
         SpekeAuth,
     };
 
-    /// A stub cache backend for tests that always returns None/Ok.
-    pub struct StubCacheBackend;
-
-    impl CacheBackend for StubCacheBackend {
-        fn get(&self, _key: &str) -> crate::error::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> crate::error::Result<()> {
-            Ok(())
-        }
-        fn set_nx(&self, _key: &str, _value: &[u8], _ttl: u64) -> crate::error::Result<bool> {
-            Ok(true)
-        }
-        fn exists(&self, _key: &str) -> crate::error::Result<bool> {
-            Ok(false)
-        }
-        fn delete(&self, _key: &str) -> crate::error::Result<()> {
-            Ok(())
-        }
-    }
-
     pub fn test_config() -> AppConfig {
         AppConfig {
-            store: StoreConfig {
-                url: "https://test-redis.example.com".into(),
-                token: "test-token".into(),
-                backend: CacheBackendType::RedisHttp,
-            },
             drm: DrmConfig {
                 speke_url: crate::url::Url::parse("https://drm.example.com/speke").unwrap(),
                 speke_auth: SpekeAuth::Bearer("test-bearer-token".into()),
@@ -280,15 +233,11 @@ pub(crate) mod test_helpers {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
-            #[cfg(feature = "cloudflare")]
-            cloudflare_kv: None,
-            http_kv: None,
         }
     }
 
     pub fn test_context() -> HandlerContext {
         HandlerContext {
-            cache: Box::new(StubCacheBackend),
             config: test_config(),
         }
     }
@@ -477,7 +426,7 @@ mod tests {
         let ctx = test_context();
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: "/repackage/content-1/hls/manifest".to_string(),
+            path: "/repackage/rt-mfst-nf/hls/manifest".to_string(),
             headers: vec![],
             body: None,
         };
@@ -490,7 +439,7 @@ mod tests {
         let ctx = test_context();
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: "/repackage/content-1/dash/init.mp4".to_string(),
+            path: "/repackage/rt-init-nf/dash/init.mp4".to_string(),
             headers: vec![],
             body: None,
         };
@@ -503,7 +452,7 @@ mod tests {
         let ctx = test_context();
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: "/repackage/content-1/hls/segment_5.cmfv".to_string(),
+            path: "/repackage/rt-seg-cmfv/hls/segment_5.cmfv".to_string(),
             headers: vec![],
             body: None,
         };
@@ -516,12 +465,11 @@ mod tests {
         let ctx = test_context();
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: "/repackage/content-1/hls/segment_3.m4s".to_string(),
+            path: "/repackage/rt-seg-m4s/hls/segment_3.m4s".to_string(),
             headers: vec![],
             body: None,
         };
         let resp = route(&req, &ctx).unwrap();
-        // Should parse correctly (not "unknown resource") — just no data in cache
         assert_eq!(resp.status, 404);
     }
 
@@ -530,12 +478,11 @@ mod tests {
         let ctx = test_context();
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: "/repackage/content-1/hls/segment_0.mp4".to_string(),
+            path: "/repackage/rt-seg-mp4/hls/segment_0.mp4".to_string(),
             headers: vec![],
             body: None,
         };
         let resp = route(&req, &ctx).unwrap();
-        // Should parse correctly (not "unknown resource") — just no data in cache
         assert_eq!(resp.status, 404);
     }
 
@@ -544,12 +491,11 @@ mod tests {
         let ctx = test_context();
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: "/repackage/content-1/hls/segment_0.cmfa".to_string(),
+            path: "/repackage/rt-seg-cmfa/hls/segment_0.cmfa".to_string(),
             headers: vec![],
             body: None,
         };
         let resp = route(&req, &ctx).unwrap();
-        // CMAF audio segment routes correctly — just no data in cache
         assert_eq!(resp.status, 404);
     }
 
@@ -558,12 +504,11 @@ mod tests {
         let ctx = test_context();
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: "/repackage/content-1/hls/segment_0.m4a".to_string(),
+            path: "/repackage/rt-seg-m4a/hls/segment_0.m4a".to_string(),
             headers: vec![],
             body: None,
         };
         let resp = route(&req, &ctx).unwrap();
-        // ISOBMFF audio segment routes correctly — just no data in cache
         assert_eq!(resp.status, 404);
     }
 
@@ -573,59 +518,6 @@ mod tests {
         let req = HttpRequest {
             method: HttpMethod::Get,
             path: "/repackage/content-1/hls/unknown_file.xyz".to_string(),
-            headers: vec![],
-            body: None,
-        };
-        let resp = route(&req, &ctx).unwrap();
-        assert_eq!(resp.status, 404);
-    }
-
-    #[test]
-    fn route_webhook_repackage_valid() {
-        let ctx = test_context();
-        let payload = serde_json::json!({
-            "content_id": "test",
-            "source_url": "https://example.com/source.m3u8",
-            "format": "hls"
-        });
-        let body = serde_json::to_vec(&payload).unwrap();
-        let req = HttpRequest {
-            method: HttpMethod::Post,
-            path: "/webhook/repackage".to_string(),
-            headers: vec![],
-            body: Some(body),
-        };
-        let resp = route(&req, &ctx).unwrap();
-        // On native targets, pipeline fails (no HTTP client), so webhook returns 500.
-        // On WASI targets, it would return 200 after first manifest publishes.
-        assert!(resp.status == 200 || resp.status == 500);
-    }
-
-    #[test]
-    fn route_webhook_continue_no_state() {
-        let ctx = test_context();
-        let payload = serde_json::json!({
-            "content_id": "test",
-            "format": "hls"
-        });
-        let body = serde_json::to_vec(&payload).unwrap();
-        let req = HttpRequest {
-            method: HttpMethod::Post,
-            path: "/webhook/repackage/continue".to_string(),
-            headers: vec![],
-            body: Some(body),
-        };
-        let resp = route(&req, &ctx).unwrap();
-        // No job state in stub cache → 404
-        assert_eq!(resp.status, 404);
-    }
-
-    #[test]
-    fn route_status_request_not_found() {
-        let ctx = test_context();
-        let req = HttpRequest {
-            method: HttpMethod::Get,
-            path: "/status/content-1/hls".to_string(),
             headers: vec![],
             body: None,
         };
@@ -681,7 +573,6 @@ mod tests {
         assert_ne!(HttpMethod::Get, HttpMethod::Post);
     }
 
-    #[cfg(feature = "jit")]
     #[test]
     fn route_config_source_post() {
         let ctx = test_context();

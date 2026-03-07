@@ -1,0 +1,53 @@
+# Fastly Compute deployment for edgepack
+#
+# Status: Fastly Compute is adding WASI Preview 2 / component model support.
+#         Check https://community.fastly.com for the latest compatibility.
+#
+# Prerequisites:
+#   fastly CLI (https://developer.fastly.com/learning/tools/cli)
+#   rustup target add wasm32-wasip2
+#
+# Build & deploy:
+#   make build-fastly
+#   cd deploy/fastly && fastly compute deploy
+#
+# Local testing:
+#   cd deploy/fastly && fastly compute serve
+
+manifest_version = 3
+
+[setup]
+
+[setup.backends]
+
+[setup.backends.origin]
+description = "Source media origin server"
+address = "origin.example.com"
+port = 443
+
+[setup.backends.speke]
+description = "DRM license server (SPEKE 2.0)"
+address = "your-drm-provider.com"
+port = 443
+
+[setup.config_stores]
+
+[setup.config_stores.env]
+description = "Environment variables for edgepack"
+items = [
+    "SPEKE_URL",
+    "SPEKE_BEARER_TOKEN",
+]
+
+[scripts]
+build = "cargo build --release --target wasm32-wasip2"
+
+[local_server]
+
+[local_server.backends]
+
+[local_server.backends.origin]
+url = "https://origin.example.com"
+
+[local_server.backends.speke]
+url = "https://your-drm-provider.com"

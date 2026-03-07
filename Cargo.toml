@@ -8,8 +8,6 @@ description = "CDN edge WASM application for repackaging DASH/HLS CMAF media fro
 crate-type = ["cdylib", "rlib"]
 
 [features]
-jit = []
-cloudflare = []
 ts = []
 sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
 
@@ -30,7 +28,6 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 cipher = "0.4"
-aes-gcm = "0.10"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasi = "0.14"

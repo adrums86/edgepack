@@ -1,20 +1,19 @@
-//! In-memory cache backend for the local sandbox.
+//! In-memory cache backend.
 //!
 //! Stores all data in a `HashMap` behind `Arc<RwLock<...>>` for thread-safe
-//! shared access between the pipeline processing thread and the API server.
-//! TTL values are accepted but ignored (sandbox lifetime is short enough
-//! that expiration is irrelevant).
+//! shared access. TTL values are accepted but ignored — the CDN layer handles
+//! cache expiration via HTTP Cache-Control headers.
 
 use crate::cache::CacheBackend;
 use crate::error::{EdgepackError, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// In-memory cache backend for sandbox use.
+/// In-memory cache backend.
 ///
-/// Clone is cheap — it shares the underlying `Arc`. This allows the same
-/// cache instance to be shared between the pipeline thread (writer) and
-/// the Axum API server (reader for status polling).
+/// Clone is cheap — it shares the underlying `Arc`. Used as a global
+/// singleton via `cache::global_cache()` for DRM key caching, JIT state,
+/// and manifest progress tracking within a single process.
 #[derive(Clone)]
 pub struct InMemoryCacheBackend {
     store: Arc<RwLock<HashMap<String, Vec<u8>>>>,

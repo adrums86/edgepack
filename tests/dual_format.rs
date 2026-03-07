@@ -267,49 +267,6 @@ fn dual_format_produces_different_manifests() {
     assert!(!dash_text.contains("#EXTM3U"));
 }
 
-// ─── Webhook Payload ──────────────────────────────────────────────────
-
-#[test]
-fn webhook_payload_output_formats_multi() {
-    use edgepack::handler::webhook::WebhookPayload;
-    let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","output_formats":["hls","dash"]}"#;
-    let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.resolved_output_formats(), vec!["hls", "dash"]);
-}
-
-#[test]
-fn webhook_payload_output_formats_backward_compat() {
-    use edgepack::handler::webhook::WebhookPayload;
-    let json = r#"{"content_id":"test","source_url":"https://example.com","format":"dash"}"#;
-    let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.resolved_output_formats(), vec!["dash"]);
-}
-
-#[test]
-fn webhook_payload_output_formats_takes_precedence() {
-    use edgepack::handler::webhook::WebhookPayload;
-    let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","output_formats":["dash"]}"#;
-    let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.resolved_output_formats(), vec!["dash"]);
-}
-
-#[test]
-fn webhook_payload_dual_format_dual_scheme() {
-    use edgepack::handler::webhook::WebhookPayload;
-    let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","output_formats":["hls","dash"],"target_schemes":["cenc","cbcs"]}"#;
-    let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.resolved_output_formats(), vec!["hls", "dash"]);
-    assert_eq!(parsed.resolved_target_schemes(), vec!["cenc", "cbcs"]);
-}
-
-#[test]
-fn webhook_payload_empty_output_formats_uses_format() {
-    use edgepack::handler::webhook::WebhookPayload;
-    let json = r#"{"content_id":"test","source_url":"https://example.com","format":"hls","output_formats":[]}"#;
-    let parsed: WebhookPayload = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.resolved_output_formats(), vec!["hls"]);
-}
-
 // ─── Container Format Independence ────────────────────────────────────
 
 #[test]

@@ -9,13 +9,11 @@
 //!
 //! 1. Converts `IncomingRequest` → library `HttpRequest`
 //! 2. Loads `AppConfig` from environment variables
-//! 3. Creates a `CacheBackend` (Redis HTTP)
-//! 4. Constructs a `HandlerContext`
-//! 5. Calls `handler::route(&req, &ctx)`
-//! 6. Converts library `HttpResponse` → WASI `OutgoingResponse`
-//! 7. Maps library errors to appropriate HTTP error responses
+//! 3. Constructs a `HandlerContext`
+//! 4. Calls `handler::route(&req, &ctx)`
+//! 5. Converts library `HttpResponse` → WASI `OutgoingResponse`
+//! 6. Maps library errors to appropriate HTTP error responses
 
-use crate::cache;
 use crate::config::AppConfig;
 use crate::error::EdgepackError;
 use crate::handler::{self, HandlerContext, HttpMethod, HttpRequest, HttpResponse};
@@ -47,16 +45,10 @@ fn handle_inner(request: IncomingRequest) -> Result<HttpResponse, EdgepackError>
     // 2. Load configuration from environment variables
     let config = AppConfig::from_env()?;
 
-    // 3. Create cache backend from config
-    let cache_backend = cache::create_backend(&config)?;
+    // 3. Build handler context
+    let ctx = HandlerContext { config };
 
-    // 4. Build handler context
-    let ctx = HandlerContext {
-        cache: cache_backend,
-        config,
-    };
-
-    // 5. Route the request
+    // 4. Route the request
     handler::route(&http_req, &ctx)
 }
 

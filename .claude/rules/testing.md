@@ -10,8 +10,7 @@ paths:
 - Test constants: `TEST_SOURCE_KEY`, `TEST_TARGET_KEY`, `TEST_KID`, `TEST_IV` (all `[u8; 16]`).
 - Run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') module::name`.
 - Run a specific integration test file: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test file_name`.
-- To run with all features (excl. TS): add `--features jit,cloudflare`.
-- To run with all features (incl. TS): add `--features jit,cloudflare,ts`.
+- To run with TS support: add `--features ts`.
 - TS-specific tests are gated behind `#[cfg(feature = "ts")]` — they only run with `--features ts`.
 - Output integrity tests (`tests/output_integrity.rs`) validate structural correctness across all input/output lanes: segment ISOBMFF structure, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips, cache-control body invariants (manifest body unchanged with cache_control overrides, AwaitingFirstSegment always no-cache), TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip.
 - Cache control tests (`tests/cache_control.rs`) validate configurable cache-control headers: system defaults, per-request overrides, safety invariants, progressive output integration, backward compat, DVR/container format interactions.

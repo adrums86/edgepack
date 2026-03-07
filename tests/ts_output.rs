@@ -505,89 +505,6 @@ fn ts_encrypt_empty_data() {
     assert!(result.is_empty());
 }
 
-// ─── Webhook: TS Container Format ────────────────────────────────────
-
-#[test]
-fn webhook_accepts_ts_container_format() {
-    use edgepack::handler::{route, HttpMethod, HttpRequest};
-
-    let ctx = make_test_handler_context();
-    let payload = serde_json::json!({
-        "content_id": "ts-test-1",
-        "source_url": "https://cdn.example.com/source.m3u8",
-        "format": "hls",
-        "container_format": "ts"
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: Some(body),
-    };
-
-    // Should not fail at validation (will fail later due to no real SPEKE, but 200 or 500 is OK)
-    let resp = route(&req, &ctx).unwrap();
-    assert!(resp.status == 200 || resp.status == 500);
-}
-
-#[test]
-fn webhook_rejects_ts_with_dash() {
-    use edgepack::handler::{route, HttpMethod, HttpRequest};
-
-    let ctx = make_test_handler_context();
-    let payload = serde_json::json!({
-        "content_id": "ts-dash-test",
-        "source_url": "https://cdn.example.com/source.m3u8",
-        "format": "dash",
-        "output_formats": ["dash"],
-        "container_format": "ts"
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: Some(body),
-    };
-
-    let result = route(&req, &ctx);
-    // Should fail validation with TS+DASH incompatibility error
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("TS") && err.contains("DASH"),
-        "Error should mention TS+DASH incompatibility: {err}"
-    );
-}
-
-#[test]
-fn webhook_rejects_ts_with_dual_format_including_dash() {
-    use edgepack::handler::{route, HttpMethod, HttpRequest};
-
-    let ctx = make_test_handler_context();
-    let payload = serde_json::json!({
-        "content_id": "ts-dual-test",
-        "source_url": "https://cdn.example.com/source.m3u8",
-        "format": "hls",
-        "output_formats": ["hls", "dash"],
-        "container_format": "ts"
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: Some(body),
-    };
-
-    let result = route(&req, &ctx);
-    assert!(result.is_err());
-}
-
 // ─── Handler: Key Endpoint Routing ───────────────────────────────────
 
 #[test]
@@ -781,49 +698,12 @@ fn sample_rate_to_index_unknown_defaults() {
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 fn make_test_handler_context() -> edgepack::handler::HandlerContext {
-    use edgepack::cache::CacheBackend;
     use edgepack::config::{
-        AppConfig, CacheBackendType, CacheConfig, DrmConfig, DrmSystemIds, JitConfig,
-        SpekeAuth, StoreConfig,
+        AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, SpekeAuth,
     };
 
-    struct StubCache;
-    impl CacheBackend for StubCache {
-        fn get(&self, _key: &str) -> edgepack::error::Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        fn set(
-            &self,
-            _key: &str,
-            _value: &[u8],
-            _ttl: u64,
-        ) -> edgepack::error::Result<()> {
-            Ok(())
-        }
-        fn set_nx(
-            &self,
-            _key: &str,
-            _value: &[u8],
-            _ttl: u64,
-        ) -> edgepack::error::Result<bool> {
-            Ok(true)
-        }
-        fn exists(&self, _key: &str) -> edgepack::error::Result<bool> {
-            Ok(false)
-        }
-        fn delete(&self, _key: &str) -> edgepack::error::Result<()> {
-            Ok(())
-        }
-    }
-
     edgepack::handler::HandlerContext {
-        cache: Box::new(StubCache),
         config: AppConfig {
-            store: StoreConfig {
-                url: "https://test.example.com".into(),
-                token: "test-token".into(),
-                backend: CacheBackendType::RedisHttp,
-            },
             drm: DrmConfig {
                 speke_url: edgepack::url::Url::parse("https://drm.example.com/speke")
                     .unwrap(),
@@ -832,9 +712,6 @@ fn make_test_handler_context() -> edgepack::handler::HandlerContext {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
-            #[cfg(feature = "cloudflare")]
-            cloudflare_kv: None,
-            http_kv: None,
         },
     }
 }

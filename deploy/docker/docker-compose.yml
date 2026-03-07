@@ -1,0 +1,16 @@
+# Docker Compose for local development with edgepack
+#
+# Usage:
+#   docker compose -f deploy/docker/docker-compose.yml up
+
+services:
+  edgepack:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - SPEKE_URL=${SPEKE_URL}
+      - SPEKE_BEARER_TOKEN=${SPEKE_BEARER_TOKEN}
+    restart: unless-stopped

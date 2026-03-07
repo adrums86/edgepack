@@ -2,7 +2,7 @@
 //!
 //! Provides a web UI and API server for testing the repackaging pipeline
 //! locally without deploying to a CDN edge. Uses reqwest for HTTP transport
-//! and an in-memory cache backend instead of Redis.
+//! and the global in-memory cache singleton instead of Redis.
 //!
 //! Run with: `cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | awk '{print $2}')`
 
@@ -17,25 +17,21 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use edgepack::cache::memory::InMemoryCacheBackend;
 use edgepack::cache::{CacheBackend, CacheKeys};
 use edgepack::config::{
-    AppConfig, CacheBackendType, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, StoreConfig,
-    SpekeAuth,
+    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, SpekeAuth,
 };
 use edgepack::manifest;
 use edgepack::manifest::types::OutputFormat;
 use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::repackager::pipeline::RepackagePipeline;
 use edgepack::repackager::progressive::ProgressiveOutput;
-use edgepack::repackager::{JobStatus, RepackageRequest};
-#[cfg(feature = "jit")]
+use edgepack::repackager::RepackageRequest;
 use edgepack::repackager::SourceConfig;
 
 // ─── Application State ─────────────────────────────────────────────────
 
 struct AppState {
-    cache: InMemoryCacheBackend,
     jobs: Mutex<HashMap<String, JobHandle>>,
 }
 
@@ -259,13 +255,8 @@ async fn handle_repackage(
         payload.source_url.clone()
     };
 
-    // Build config — store config is unused (in-memory cache), but required by AppConfig
+    // Build config
     let config = AppConfig {
-        store: StoreConfig {
-            url: "unused://localhost".into(),
-            token: "unused".into(),
-            backend: CacheBackendType::RedisHttp,
-        },
         drm: DrmConfig {
             speke_url,
             speke_auth,
@@ -273,9 +264,6 @@ async fn handle_repackage(
         },
         cache: CacheConfig::default(),
         jit: JitConfig::default(),
-        #[cfg(feature = "cloudflare")]
-        cloudflare_kv: None,
-        http_kv: None,
     };
 
     let container_format_str = payload.container_format.clone();
@@ -315,25 +303,16 @@ async fn handle_repackage(
     }
 
     // Run pipeline in a blocking thread
-    let cache = state.cache.clone();
     let cid = content_id.clone();
-    let fmt = output_format;
+    let _fmt = output_format;
     tokio::task::spawn_blocking(move || {
-        // Wrap cache with encryption layer so sensitive data (DRM keys, SPEKE
-        // responses, rewrite params) is never stored in plaintext.
-        let enc_key = edgepack::cache::encrypted::derive_key("edgepack-sandbox");
-        let encrypted_cache = edgepack::cache::encrypted::EncryptedCacheBackend::new(
-            Box::new(cache.clone()),
-            &enc_key,
-        );
-        let pipeline = RepackagePipeline::new(config, Box::new(encrypted_cache));
+        let pipeline = RepackagePipeline::new(config);
         match pipeline.execute(&request) {
-            Ok((status, outputs)) => {
+            Ok(outputs) => {
                 eprintln!(
-                    "  Pipeline complete: {}/{} — {} segments, {} output(s)",
-                    status.content_id,
+                    "  Pipeline complete: {}/{} — {} output(s)",
+                    cid,
                     fmt_str,
-                    status.segments_completed,
                     outputs.len()
                 );
                 // Write output per (format, scheme) pair
@@ -367,7 +346,7 @@ async fn handle_repackage(
 }
 
 async fn handle_status(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path((content_id, format)): Path<(String, String)>,
 ) -> Response {
     let fmt = match format.as_str() {
@@ -383,11 +362,14 @@ async fn handle_status(
         }
     };
 
+    let cache = edgepack::cache::global_cache();
     let key = CacheKeys::job_state(&content_id, fmt);
-    match state.cache.get(&key) {
-        Ok(Some(data)) => match serde_json::from_slice::<JobStatus>(&data) {
+    match cache.get(&key) {
+        Ok(Some(data)) => match serde_json::from_slice::<serde_json::Value>(&data) {
             Ok(status) => {
-                let state_str = format!("{:?}", status.state);
+                let state_str = status.get("state").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+                let segments_completed = status.get("segments_completed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let segments_total = status.get("segments_total").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let output_dir = if state_str == "Complete" {
                     Some(format!("sandbox/output/{content_id}/{fmt}_*/"))
                 } else {
@@ -397,8 +379,8 @@ async fn handle_status(
                     StatusCode::OK,
                     Json(StatusResponse {
                         state: state_str,
-                        segments_completed: status.segments_completed,
-                        segments_total: status.segments_total,
+                        segments_completed,
+                        segments_total,
                         output_dir,
                     }),
                 )
@@ -469,9 +451,8 @@ async fn handle_output(
     }
 }
 
-// ─── JIT Source Config (feature = "jit") ─────────────────────────────────
+// ─── JIT Source Config ───────────────────────────────────────────────────
 
-#[cfg(feature = "jit")]
 #[derive(Deserialize)]
 struct SourceConfigPayload {
     content_id: String,
@@ -482,9 +463,8 @@ struct SourceConfigPayload {
     container_format: String,
 }
 
-#[cfg(feature = "jit")]
 async fn handle_source_config(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Json(payload): Json<SourceConfigPayload>,
 ) -> Response {
     if payload.content_id.is_empty() {
@@ -560,8 +540,9 @@ async fn handle_source_config(
         }
     };
 
+    let cache = edgepack::cache::global_cache();
     let cache_key = CacheKeys::source_config(&payload.content_id);
-    if let Err(e) = state.cache.set(&cache_key, &data, 172_800) {
+    if let Err(e) = cache.set(&cache_key, &data, 172_800) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -703,7 +684,6 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let state = Arc::new(AppState {
-        cache: InMemoryCacheBackend::new(),
         jobs: Mutex::new(HashMap::new()),
     });
 
@@ -723,11 +703,8 @@ async fn main() {
             get(handle_output),
         );
 
-    // JIT source config endpoint (when jit feature is enabled)
-    #[cfg(feature = "jit")]
-    {
-        app = app.route("/api/config/source", post(handle_source_config));
-    }
+    // JIT source config endpoint
+    app = app.route("/api/config/source", post(handle_source_config));
 
     let app = app.with_state(state);
 

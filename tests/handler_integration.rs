@@ -8,43 +8,14 @@
 
 mod common;
 
-use edgepack::cache::CacheBackend;
 use edgepack::config::{
-    AppConfig, CacheBackendType, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, StoreConfig,
-    SpekeAuth,
+    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, SpekeAuth,
 };
 use edgepack::handler::{route, HandlerContext, HttpMethod, HttpRequest, HttpResponse};
 
-/// A stub cache backend for integration tests that always returns None/Ok.
-struct StubCacheBackend;
-
-impl CacheBackend for StubCacheBackend {
-    fn get(&self, _key: &str) -> edgepack::error::Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-    fn set(&self, _key: &str, _value: &[u8], _ttl: u64) -> edgepack::error::Result<()> {
-        Ok(())
-    }
-    fn set_nx(&self, _key: &str, _value: &[u8], _ttl: u64) -> edgepack::error::Result<bool> {
-        Ok(true)
-    }
-    fn exists(&self, _key: &str) -> edgepack::error::Result<bool> {
-        Ok(false)
-    }
-    fn delete(&self, _key: &str) -> edgepack::error::Result<()> {
-        Ok(())
-    }
-}
-
 fn test_context() -> HandlerContext {
     HandlerContext {
-        cache: Box::new(StubCacheBackend),
         config: AppConfig {
-            store: StoreConfig {
-                url: "https://test-redis.example.com".into(),
-                token: "test-token".into(),
-                backend: CacheBackendType::RedisHttp,
-            },
             drm: DrmConfig {
                 speke_url: edgepack::url::Url::parse("https://drm.example.com/speke").unwrap(),
                 speke_auth: SpekeAuth::Bearer("test-bearer-token".into()),
@@ -52,9 +23,6 @@ fn test_context() -> HandlerContext {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
-            #[cfg(feature = "cloudflare")]
-            cloudflare_kv: None,
-            http_kv: None,
         },
     }
 }
@@ -95,7 +63,7 @@ fn manifest_request_routes_correctly_hls() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/manifest".into(),
+        path: "/repackage/hi-hls-mfst/hls/manifest".into(),
         headers: vec![],
         body: None,
     };
@@ -109,7 +77,7 @@ fn manifest_request_routes_correctly_dash() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/dash/manifest".into(),
+        path: "/repackage/hi-dash-mfst/dash/manifest".into(),
         headers: vec![],
         body: None,
     };
@@ -122,7 +90,7 @@ fn manifest_request_invalid_format() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/mp4/manifest".into(),
+        path: "/repackage/hi-mp4-mfst/mp4/manifest".into(),
         headers: vec![],
         body: None,
     };
@@ -141,7 +109,7 @@ fn init_segment_request_routes_correctly() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/init.mp4".into(),
+        path: "/repackage/hi-hls-init/hls/init.mp4".into(),
         headers: vec![],
         body: None,
     };
@@ -156,7 +124,7 @@ fn media_segment_request_segment_0() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/segment_0.cmfv".into(),
+        path: "/repackage/hi-hls-cmfv0/hls/segment_0.cmfv".into(),
         headers: vec![],
         body: None,
     };
@@ -169,7 +137,7 @@ fn media_segment_request_segment_42() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/dash/segment_42.cmfv".into(),
+        path: "/repackage/hi-dash-cmfv42/dash/segment_42.cmfv".into(),
         headers: vec![],
         body: None,
     };
@@ -182,7 +150,7 @@ fn media_segment_request_m4s_segment_0() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/segment_0.m4s".into(),
+        path: "/repackage/hi-hls-m4s0/hls/segment_0.m4s".into(),
         headers: vec![],
         body: None,
     };
@@ -196,7 +164,7 @@ fn media_segment_request_m4s_segment_42() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/dash/segment_42.m4s".into(),
+        path: "/repackage/hi-dash-m4s42/dash/segment_42.m4s".into(),
         headers: vec![],
         body: None,
     };
@@ -209,7 +177,7 @@ fn media_segment_request_mp4_segment_0() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/segment_0.mp4".into(),
+        path: "/repackage/hi-hls-mp40/hls/segment_0.mp4".into(),
         headers: vec![],
         body: None,
     };
@@ -223,7 +191,7 @@ fn media_segment_request_mp4_segment_42() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/dash/segment_42.mp4".into(),
+        path: "/repackage/hi-dash-mp442/dash/segment_42.mp4".into(),
         headers: vec![],
         body: None,
     };
@@ -236,7 +204,7 @@ fn media_segment_request_cmfa_segment_0() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/segment_0.cmfa".into(),
+        path: "/repackage/hi-hls-cmfa0/hls/segment_0.cmfa".into(),
         headers: vec![],
         body: None,
     };
@@ -250,7 +218,7 @@ fn media_segment_request_m4a_segment_0() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/segment_0.m4a".into(),
+        path: "/repackage/hi-hls-m4a0/hls/segment_0.m4a".into(),
         headers: vec![],
         body: None,
     };
@@ -264,7 +232,7 @@ fn media_segment_request_invalid_filename() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-123/hls/invalid_file.xyz".into(),
+        path: "/repackage/hi-hls-invalid/hls/invalid_file.xyz".into(),
         headers: vec![],
         body: None,
     };
@@ -279,141 +247,13 @@ fn status_request_routes_correctly() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/status/movie-123/hls".into(),
+        path: "/status/hi-status/hls".into(),
         headers: vec![],
         body: None,
     };
     // With stub cache, status returns 404
     let resp = route(&req, &ctx).unwrap();
     assert_eq!(resp.status, 404);
-}
-
-// ─── Webhook Routing ────────────────────────────────────────────────
-
-#[test]
-fn webhook_repackage_valid_hls_payload() {
-    let ctx = test_context();
-    let payload = serde_json::json!({
-        "content_id": "movie-123",
-        "source_url": "https://cdn.example.com/master.m3u8",
-        "format": "hls"
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![("Content-Type".into(), "application/json".into())],
-        body: Some(body),
-    };
-
-    let resp = route(&req, &ctx).unwrap();
-    // On native targets, pipeline fails (HTTP client not available) → 500
-    // On WASI targets, would succeed → 200
-    assert!(resp.status == 200 || resp.status == 500);
-}
-
-#[test]
-fn webhook_repackage_valid_dash_payload() {
-    let ctx = test_context();
-    let payload = serde_json::json!({
-        "content_id": "show-456",
-        "source_url": "https://cdn.example.com/manifest.mpd",
-        "format": "dash"
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: Some(body),
-    };
-
-    let resp = route(&req, &ctx).unwrap();
-    assert!(resp.status == 200 || resp.status == 500);
-}
-
-#[test]
-fn webhook_repackage_with_key_ids() {
-    let ctx = test_context();
-    let payload = serde_json::json!({
-        "content_id": "movie-789",
-        "source_url": "https://cdn.example.com/source.m3u8",
-        "format": "hls",
-        "key_ids": ["aabbccdd11223344", "55667788aabbccdd"]
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: Some(body),
-    };
-
-    let resp = route(&req, &ctx).unwrap();
-    assert!(resp.status == 200 || resp.status == 500);
-}
-
-#[test]
-fn webhook_repackage_missing_body() {
-    let ctx = test_context();
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: None,
-    };
-
-    let result = route(&req, &ctx);
-    assert!(result.is_err(), "missing body should return an error");
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("missing request body"),
-        "error should mention missing body"
-    );
-}
-
-#[test]
-fn webhook_repackage_invalid_json() {
-    let ctx = test_context();
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: Some(b"not json{".to_vec()),
-    };
-
-    let result = route(&req, &ctx);
-    assert!(result.is_err(), "invalid JSON should return an error");
-    assert!(
-        result.unwrap_err().to_string().contains("invalid JSON"),
-        "error should mention invalid JSON"
-    );
-}
-
-#[test]
-fn webhook_repackage_missing_required_fields() {
-    let ctx = test_context();
-    // Missing content_id
-    let payload = serde_json::json!({
-        "source_url": "https://example.com/source.m3u8",
-        "format": "hls"
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/webhook/repackage".into(),
-        headers: vec![],
-        body: Some(body),
-    };
-
-    let result = route(&req, &ctx);
-    assert!(result.is_err(), "missing content_id should return an error");
 }
 
 // ─── Unknown Routes ─────────────────────────────────────────────────
@@ -450,7 +290,7 @@ fn options_method_returns_404() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Options,
-        path: "/repackage/movie-123/hls/manifest".into(),
+        path: "/repackage/hi-hls-mfst/hls/manifest".into(),
         headers: vec![],
         body: None,
     };
@@ -523,7 +363,7 @@ fn content_ids_with_special_characters() {
     let ctx = test_context();
     let req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/my-movie-123-hd/hls/manifest".into(),
+        path: "/repackage/hi-hyphen-id/hls/manifest".into(),
         headers: vec![],
         body: None,
     };
@@ -539,13 +379,13 @@ fn multiple_format_requests_for_same_content() {
     let ctx = test_context();
     let hls_req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-1/hls/manifest".into(),
+        path: "/repackage/hi-multi-fmt/hls/manifest".into(),
         headers: vec![],
         body: None,
     };
     let dash_req = HttpRequest {
         method: HttpMethod::Get,
-        path: "/repackage/movie-1/dash/manifest".into(),
+        path: "/repackage/hi-multi-fmt/dash/manifest".into(),
         headers: vec![],
         body: None,
     };
@@ -563,7 +403,7 @@ fn sequential_segment_requests() {
     for i in 0..5 {
         let req = HttpRequest {
             method: HttpMethod::Get,
-            path: format!("/repackage/movie-1/hls/segment_{i}.cmfv"),
+            path: format!("/repackage/hi-seq-seg-{i}/hls/segment_{i}.cmfv"),
             headers: vec![],
             body: None,
         };

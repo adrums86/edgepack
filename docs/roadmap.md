@@ -51,7 +51,6 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Scheme-qualified cache keys using `{format}_{scheme}` pattern (e.g. `ep:{id}:hls_cenc:seg:{n}`)
 - Scheme-qualified URL routes (e.g. `/repackage/{id}/hls_cenc/manifest`)
 - Pipeline `execute()` returns `Vec<(EncryptionScheme, ProgressiveOutput)>` — one output per scheme
-- Split execution (`execute_first()`/`execute_remaining()`) stores per-scheme continuation params, init segments, manifest state
 - Source segments decrypted once, re-encrypted for each target scheme
 - `cleanup_sensitive_data()` accepts `&[EncryptionScheme]` and deletes per-scheme rewrite params
 - Sandbox UI supports "Both (Dual-Scheme)" option, writes output per scheme
@@ -92,11 +91,10 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 ### ~~Phase 8: JIT Packaging (On-Demand GET)~~ ✅ Complete
 - Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging on cache miss)
 - Request coalescing via `set_nx` distributed locking with configurable TTL
-- Hybrid mode (JIT + proactive webhook coexist — webhook detects JIT setup marker)
 - `POST /config/source` endpoint for per-content source configuration
 - URL pattern-based source resolution with `{content_id}` placeholder
-- All JIT code behind `#[cfg(feature = "jit")]` feature flag
-- Result: 762 tests total with `--features jit` (27 new JIT integration tests)
+- JIT is always enabled (no feature flag required)
+- Result: 762 tests total (27 new JIT integration tests)
 
 ### ~~Phase 9: LL-HLS & LL-DASH~~ ✅ Complete
 - LL-HLS (`#EXT-X-PART`, `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PRELOAD-HINT`)
@@ -159,7 +157,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Override priority: webhook config takes precedence over source-extracted steering
 - New type: `ContentSteeringConfig` (server_uri, default_pathway_id, query_before_start)
 - New webhook field: `content_steering` on `WebhookPayload` with validation (reject empty `server_uri`)
-- Pipeline threading in both `execute()` and `execute_first()` paths
+- Pipeline threading in `execute()` path
 - HLS pass-through not applicable (edgepack parses media playlists; steering tag only in master playlists)
 - New: `tests/content_steering.rs` (20 integration tests)
 - Result: 1,290 tests total with `--features jit,cloudflare,ts` (85 new phase tests + 18 output integrity tests)
@@ -167,11 +165,10 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Criterion benchmarks (`benches/jit_latency.rs`): segment rewrite latency (CBCS→CENC, clear→CENC, passthrough at 4/32/128 samples), init rewrite latency, manifest render/parse latency (HLS/DASH at varying segment counts)
 
 ### Phase 18: Binary Size Monitoring & Selective Feature Gating — P2
-The current binary (~692 KB base, ~730 KB full) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
+The current binary (~628 KB base) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
 
 **Policy:** Monitor binary size as new features land. Feature-gate only when a phase introduces a **heavy new dependency or parser** that meaningfully increases the binary (50+ KB). Existing examples of this approach:
 - `ts` feature (Phase 10): MPEG-TS demuxer + transmuxer adds a substantial new parser — feature-gated to keep it out of builds that don't need TS input
-- `cloudflare` feature (Phase 17): Cloudflare KV backend — only needed on Cloudflare Workers deployments
 
 **Action items (reactive, not pre-emptive):**
 - If the binary exceeds **800 KB** with all features enabled, audit the largest new modules and consider feature-gating the heaviest one
@@ -184,12 +181,12 @@ The current binary (~692 KB base, ~730 KB full) is well within cold start budget
 - `CacheControlConfig` struct: `segment_max_age`, `final_manifest_max_age`, `live_manifest_max_age`, `live_manifest_s_maxage`, `immutable` (all `Option`)
 - `CacheConfig` extended with `final_manifest_max_age` field + env var loading (`CACHE_MAX_AGE_SEGMENTS`, `CACHE_MAX_AGE_MANIFEST_LIVE`, `CACHE_MAX_AGE_MANIFEST_FINAL`)
 - `ManifestState.manifest_cache_header()` and `segment_cache_header()` methods — phase-based with per-request override → system default fallback
-- Per-request overrides apply to manifests only (segments use system defaults to avoid extra Redis GET per segment request)
+- Per-request overrides apply to manifests only (segments use system defaults to avoid overhead per segment request)
 - Safety invariants: `AwaitingFirstSegment` → always `no-cache`, `public` prefix → always present
 - Separate immutable flag control (default: true)
 - Separate `max-age` and `s-maxage` for live manifests (CDN vs browser caching)
 - `CacheControlInput` webhook type (separate from internal `CacheControlConfig`)
-- Pipeline threading: `RepackageRequest` → `execute()`/`execute_first()` → `ProgressiveOutput.set_cache_control()` → `ManifestState`
+- Pipeline threading: `RepackageRequest` → `execute()` → `ProgressiveOutput.set_cache_control()` → `ManifestState`
 - Request handlers simplified: inline phase-matching replaced with `state.manifest_cache_header(&ctx.config.cache)`
 - Sandbox UI: collapsible "Cache-Control Overrides" section with all 5 config fields
 - New: `tests/cache_control.rs` (43 integration tests), 3 new output integrity tests, 12 new unit tests (webhook + progressive)
@@ -219,10 +216,7 @@ The current binary (~692 KB base, ~730 KB full) is well within cold start budget
 - Format-agnostic segment cache keys: `ep:{id}:{scheme}:init` and `ep:{id}:{scheme}:seg:{n}` (no format prefix — segments are identical for HLS and DASH)
 - Per-format manifest state: `ep:{id}:{format}_{scheme}:manifest_state` stays format-qualified (manifests differ between HLS and DASH)
 - `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair
-- `execute_first()`/`execute_remaining()` encrypt segments once per scheme and store with format-agnostic keys, then build per-(format, scheme) manifest states
-- Request handlers try format-agnostic keys first, then fall back to legacy format-qualified keys for backward compatibility
 - Webhook API: `output_formats: ["hls", "dash"]` for dual-format, `format` (singular) for backward compat; `resolved_output_formats()` mirrors `resolved_target_schemes()` pattern
-- `target_formats` cached alongside `target_schemes` for continuation; cleaned up in `cleanup_sensitive_data()`
 - Dual-format + dual-scheme: `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs (HLS+CENC, HLS+CBCS, DASH+CENC, DASH+CBCS)
 - Result: 1,331 tests total (924 unit + 407 integration), including 25 new dual_format integration tests
 
@@ -235,36 +229,19 @@ The current binary (~692 KB base, ~730 KB full) is well within cold start budget
 - Post-rewrite debug validation (init + segment structure checks)
 - New: `src/media/compat.rs` (28 unit tests), `tests/conformance.rs` (23 integration tests)
 
-### ~~Phase 17: CDN Provider Adapters & Binary Optimization~~ ✅ Complete
-- Generalized config: `RedisConfig` → `StoreConfig`, `RedisBackendType` → `CacheBackendType`
-- **Cloudflare Workers KV** backend (`cloudflare` feature) via REST API
-- **Generic HTTP KV** backend (always available) for AWS DynamoDB via API Gateway, Akamai EdgeKV via proxy, or custom KV stores
-- HTTP client extended with `PUT` and `DELETE` methods
-- Backward compatible: `REDIS_URL`/`REDIS_TOKEN` env vars still work unchanged
-- `CACHE_BACKEND` env var override for backend selection
-- `CACHE_ENCRYPTION_TOKEN` env var for custom key derivation source
-- No new crate dependencies — all backends use existing `http_client.rs` and `serde_json`
-- `set_nx()` is best-effort (GET then PUT) on non-Redis backends (acceptable for JIT lock coalescing)
-- Result: 807 tests total with `--features jit,cloudflare` (18 new CDN adapter integration tests)
+### ~~Phase 17: CDN Provider Adapters & Binary Optimization~~ ✅ Simplified
+- External cache backends (Redis HTTP, Redis TCP, Cloudflare KV, HTTP KV) have been removed
+- Cache is now in-process `EncryptedCacheBackend<InMemoryCacheBackend>` with AES-128-CTR encryption for sensitive entries
+- No external state store dependencies — the CDN layer caches responses via HTTP headers
 
-### CDN Platform Compatibility
+### CDN Platform Deployment
 
-| CDN Platform | WASI P2 Support | Recommended Backend | Alternative |
-|---|---|---|---|
-| Generic WASI P2 | Native | Redis HTTP (default) | — |
-| Cloudflare Workers | Via component model | **Cloudflare KV** (`cloudflare` feature) | Redis HTTP |
-| Fastly Compute | Native | Redis HTTP (existing) | HTTP KV |
-| AWS CloudFront / Lambda@Edge | Via wasmtime in Lambda | **HTTP KV** (DynamoDB via API Gateway) | Redis HTTP |
-| Akamai EdgeWorkers / EdgeCompute | Via WASI runtime | **HTTP KV** (EdgeKV via auth proxy) | Redis HTTP |
-| Vercel Edge Functions | Via V8 WASI shim | Redis HTTP (existing) | HTTP KV |
+edgepack compiles to a portable WASI P2 component — no CDN-specific APIs or external state stores needed.
 
-Build commands per platform:
+Build commands:
 ```bash
-cargo build --release                           # Generic WASI P2 (Redis HTTP)
-cargo build --release --features cloudflare     # Cloudflare Workers
-cargo build --release --features jit            # JIT only
-cargo build --release --features jit,cloudflare # All features (excl. TS)
-cargo build --release --features jit,cloudflare,ts # All features (incl. TS input)
+cargo build --release                  # Base (no TS)
+cargo build --release --features ts    # With MPEG-TS input/output
 ```
 
 ### ~~Phase 22: TS Segment Output~~ ✅ Complete
@@ -273,7 +250,7 @@ cargo build --release --features jit,cloudflare,ts # All features (incl. TS inpu
 - AES-128-CBC whole-segment encryption (`encrypt_ts_segment()`) — reverse of Phase 10's `decrypt_ts_segment()`
 - HLS manifest rendering: no `#EXT-X-MAP` tag, `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` instead of SAMPLE-AES/SAMPLE-AES-CTR, `#EXT-X-VERSION:3`, `.ts` segment URIs
 - Key delivery endpoint: `GET /repackage/{id}/{format}/key` serves raw 16-byte AES key for HLS-TS `#EXT-X-KEY` URI
-- Pipeline integration: `TsMuxConfig` extracted from init segment and cached in `ContinuationParams`, segments muxed via `mux_to_ts()` then optionally encrypted
+- Pipeline integration: `TsMuxConfig` extracted from init segment, segments muxed via `mux_to_ts()` then optionally encrypted
 - Webhook validation: accepts `"ts"` as `container_format`, rejects TS+DASH combination
 - Sandbox UI: TS container format option, `.ts` output files, no `init.mp4` for TS
 - All code behind existing `#[cfg(feature = "ts")]` gate — zero impact on non-TS builds

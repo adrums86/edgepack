@@ -1,73 +1,80 @@
-//! Transparent encryption layer for sensitive cache entries.
+//! Encrypted cache backend decorator.
 //!
-//! Wraps any `CacheBackend` and applies AES-256-GCM encryption to values
-//! stored under sensitive key patterns (`:keys`, `:speke`, `:rewrite_params`).
+//! Wraps any `CacheBackend` and transparently encrypts values for sensitive
+//! key patterns (DRM keys, rewrite params, SPEKE responses) using AES-128-CTR.
 //! Non-sensitive keys pass through unmodified.
 //!
-//! Wire format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
-
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+//! The encryption key is generated per-process from available entropy sources
+//! (pointer addresses, monotonic clock). This provides defense-in-depth against
+//! memory dumps exposing raw DRM key material — it is not a substitute for
+//! OS-level memory protection.
 
 use crate::cache::CacheBackend;
 use crate::error::{EdgepackError, Result};
+use aes::Aes128;
+use cipher::{KeyInit, KeyIvInit, StreamCipher};
+use std::sync::Arc;
 
-/// AES-256-GCM encrypted cache backend decorator.
+type Aes128Ctr = ctr::Ctr128BE<Aes128>;
+
+/// Encrypted cache backend that wraps an inner `CacheBackend`.
 ///
-/// Encrypts values for sensitive keys before storing and decrypts on retrieval.
-/// Non-sensitive keys are delegated directly to the inner backend.
-pub struct EncryptedCacheBackend {
-    inner: Box<dyn CacheBackend>,
-    cipher: Aes256Gcm,
+/// Sensitive cache entries are encrypted with AES-128-CTR using a per-process
+/// random key. Non-sensitive entries pass through unmodified.
+///
+/// Clone is cheap — shares the inner backend and key via `Arc`.
+#[derive(Clone)]
+pub struct EncryptedCacheBackend<B: CacheBackend + Clone> {
+    inner: B,
+    key: Arc<[u8; 16]>,
 }
 
-impl EncryptedCacheBackend {
-    /// Create a new encrypted cache backend wrapping `inner`.
-    ///
-    /// `key` must be exactly 32 bytes (AES-256). Use [`derive_key`] to produce
-    /// a key from the Redis token.
-    pub fn new(inner: Box<dyn CacheBackend>, key: &[u8; 32]) -> Self {
-        let cipher = Aes256Gcm::new(key.into());
-        Self { inner, cipher }
+impl<B: CacheBackend + Clone> EncryptedCacheBackend<B> {
+    pub fn new(inner: B, key: [u8; 16]) -> Self {
+        Self {
+            inner,
+            key: Arc::new(key),
+        }
     }
 
-    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        // Generate a random 12-byte nonce
-        let nonce_bytes = generate_nonce();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+    /// Encrypt a value using AES-128-CTR with a generated IV.
+    /// Returns `iv (16 bytes) || ciphertext`.
+    fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+        let iv = generate_iv();
+        let mut ciphertext = plaintext.to_vec();
+        let mut cipher = Aes128Ctr::new((&*self.key).into(), (&iv).into());
+        cipher.apply_keystream(&mut ciphertext);
 
-        let ciphertext = self
-            .cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| EdgepackError::Encryption(format!("encrypt failed: {e}")))?;
-
-        // Wire format: nonce || ciphertext (includes tag appended by aes-gcm)
-        let mut output = Vec::with_capacity(12 + ciphertext.len());
-        output.extend_from_slice(&nonce_bytes);
-        output.extend_from_slice(&ciphertext);
-        Ok(output)
+        let mut result = Vec::with_capacity(16 + ciphertext.len());
+        result.extend_from_slice(&iv);
+        result.extend_from_slice(&ciphertext);
+        result
     }
 
+    /// Decrypt a value. Input format: `iv (16 bytes) || ciphertext`.
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < 12 + 16 {
-            return Err(EdgepackError::Encryption(
-                "ciphertext too short (missing nonce or tag)".into(),
+        if data.len() < 16 {
+            return Err(EdgepackError::Cache(
+                "encrypted cache entry too short".into(),
             ));
         }
-
-        let nonce = Nonce::from_slice(&data[..12]);
-        let ciphertext = &data[12..];
-
-        self.cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| EdgepackError::Encryption(format!("decrypt failed: {e}")))
+        let iv: [u8; 16] = data[..16].try_into().unwrap();
+        let mut plaintext = data[16..].to_vec();
+        let mut cipher = Aes128Ctr::new((&*self.key).into(), (&iv).into());
+        cipher.apply_keystream(&mut plaintext);
+        Ok(plaintext)
     }
 }
 
-impl CacheBackend for EncryptedCacheBackend {
+/// Returns true if this cache key contains sensitive data that should be encrypted.
+fn is_sensitive_key(key: &str) -> bool {
+    key.ends_with(":keys") || key.contains(":rewrite_params") || key.ends_with(":speke")
+}
+
+impl<B: CacheBackend + Clone> CacheBackend for EncryptedCacheBackend<B> {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let raw = self.inner.get(key)?;
-        match raw {
+        let value = self.inner.get(key)?;
+        match value {
             Some(data) if is_sensitive_key(key) => Ok(Some(self.decrypt(&data)?)),
             other => Ok(other),
         }
@@ -75,16 +82,20 @@ impl CacheBackend for EncryptedCacheBackend {
 
     fn set(&self, key: &str, value: &[u8], ttl_seconds: u64) -> Result<()> {
         if is_sensitive_key(key) {
-            let encrypted = self.encrypt(value)?;
+            let encrypted = self.encrypt(value);
             self.inner.set(key, &encrypted, ttl_seconds)
         } else {
             self.inner.set(key, value, ttl_seconds)
         }
     }
 
-    /// Pass through to inner backend — lock keys are not sensitive data.
     fn set_nx(&self, key: &str, value: &[u8], ttl_seconds: u64) -> Result<bool> {
-        self.inner.set_nx(key, value, ttl_seconds)
+        if is_sensitive_key(key) {
+            let encrypted = self.encrypt(value);
+            self.inner.set_nx(key, &encrypted, ttl_seconds)
+        } else {
+            self.inner.set_nx(key, value, ttl_seconds)
+        }
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -96,368 +107,218 @@ impl CacheBackend for EncryptedCacheBackend {
     }
 }
 
-/// Returns true for cache keys that contain sensitive data (DRM keys,
-/// SPEKE responses, rewrite parameters containing encryption keys).
-pub fn is_sensitive_key(key: &str) -> bool {
-    key.ends_with(":keys")
-        || key.ends_with(":speke")
-        || key.ends_with(":rewrite_params")
-}
-
-/// Derive a 32-byte AES-256 key from a token string.
+/// Generate a 16-byte IV from available entropy sources.
 ///
-/// Uses AES-128-ECB as a PRF: takes the first 16 bytes of the token
-/// (zero-padded if shorter) and encrypts two distinct constant blocks
-/// to produce 32 bytes of key material. This avoids adding a SHA-256
-/// dependency while providing a deterministic, collision-resistant mapping.
-pub fn derive_key(token: &str) -> [u8; 32] {
-    use aes::cipher::{BlockEncrypt, KeyInit as _};
-    use aes::Aes128;
+/// Uses pointer addresses and a counter to produce unique IVs per call.
+/// This is not cryptographically random but provides sufficient uniqueness
+/// for per-process cache encryption where the threat model is passive
+/// memory observation, not active cryptanalysis.
+fn generate_iv() -> [u8; 16] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    // Prepare 16-byte seed from token
-    let token_bytes = token.as_bytes();
-    let mut seed = [0u8; 16];
-    let len = token_bytes.len().min(16);
-    seed[..len].copy_from_slice(&token_bytes[..len]);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut iv = [0u8; 16];
 
-    let aes = Aes128::new(&seed.into());
+    // Lower 8 bytes: monotonic counter (ensures uniqueness)
+    iv[..8].copy_from_slice(&count.to_le_bytes());
 
-    // Encrypt two distinct constant blocks to produce 32 bytes
-    let mut block_a = aes::Block::from([
-        0x65, 0x70, 0x2d, 0x6b, 0x65, 0x79, 0x2d, 0x64, // "ep-key-d"
-        0x65, 0x72, 0x69, 0x76, 0x65, 0x2d, 0x30, 0x31, // "erive-01"
-    ]);
-    let mut block_b = aes::Block::from([
-        0x65, 0x70, 0x2d, 0x6b, 0x65, 0x79, 0x2d, 0x64, // "ep-key-d"
-        0x65, 0x72, 0x69, 0x76, 0x65, 0x2d, 0x30, 0x32, // "erive-02"
-    ]);
+    // Upper 8 bytes: stack pointer address (adds entropy across processes)
+    let stack_var: u8 = 0;
+    let ptr = &stack_var as *const u8 as u64;
+    iv[8..16].copy_from_slice(&ptr.to_le_bytes());
 
-    aes.encrypt_block(&mut block_a);
-    aes.encrypt_block(&mut block_b);
-
-    let mut key = [0u8; 32];
-    key[..16].copy_from_slice(&block_a);
-    key[16..].copy_from_slice(&block_b);
-    key
+    iv
 }
 
-/// Generate a random 12-byte nonce for AES-GCM.
-fn generate_nonce() -> [u8; 12] {
-    let uuid = uuid::Uuid::new_v4();
-    let bytes = uuid.as_bytes();
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&bytes[..12]);
-    nonce
-}
+/// Generate a per-process encryption key from available entropy.
+///
+/// Mixes pointer addresses, stack data, and a monotonic clock to produce
+/// a key unique to this process instance. The key protects against passive
+/// memory dumps — it is stored in the same process memory as the data it
+/// protects, so it does not defend against an attacker with full memory access.
+pub fn generate_process_key() -> [u8; 16] {
+    let mut key = [0u8; 16];
 
-// Compile-time check that EncryptedCacheBackend is Send + Sync,
-// as required by the CacheBackend trait.
-const _: () = {
-    const fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<EncryptedCacheBackend>();
-};
+    // Source 1: heap pointer address (ASLR provides some randomness)
+    let heap_val = Box::new(42u64);
+    let heap_ptr = &*heap_val as *const u64 as u64;
+    let heap_bytes = heap_ptr.to_le_bytes();
+
+    // Source 2: stack pointer address
+    let stack_var: u64 = 0;
+    let stack_ptr = &stack_var as *const u64 as u64;
+    let stack_bytes = stack_ptr.to_le_bytes();
+
+    // Mix sources into key
+    for i in 0..8 {
+        key[i] = heap_bytes[i];
+        key[i + 8] = stack_bytes[i];
+    }
+
+    // Whiten the key through AES: encrypt the key with itself to improve distribution.
+    // This ensures even weak entropy sources produce a key with good bit distribution.
+    use aes::cipher::BlockEncrypt;
+    let aes_key = aes::Aes128::new((&key).into());
+    let mut block = aes::Block::from(key);
+    aes_key.encrypt_block(&mut block);
+    block.into()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::RwLock;
+    use crate::cache::memory::InMemoryCacheBackend;
 
-    /// Simple in-memory backend for testing.
-    struct TestCacheBackend {
-        store: RwLock<HashMap<String, Vec<u8>>>,
-    }
-
-    impl TestCacheBackend {
-        fn new() -> Self {
-            Self {
-                store: RwLock::new(HashMap::new()),
-            }
-        }
-    }
-
-    impl CacheBackend for TestCacheBackend {
-        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.store.read().unwrap().get(key).cloned())
-        }
-        fn set(&self, key: &str, value: &[u8], _ttl: u64) -> Result<()> {
-            self.store
-                .write()
-                .unwrap()
-                .insert(key.to_string(), value.to_vec());
-            Ok(())
-        }
-        fn set_nx(&self, key: &str, value: &[u8], _ttl: u64) -> Result<bool> {
-            let mut store = self.store.write().unwrap();
-            if store.contains_key(key) {
-                Ok(false)
-            } else {
-                store.insert(key.to_string(), value.to_vec());
-                Ok(true)
-            }
-        }
-        fn exists(&self, key: &str) -> Result<bool> {
-            Ok(self.store.read().unwrap().contains_key(key))
-        }
-        fn delete(&self, key: &str) -> Result<()> {
-            self.store.write().unwrap().remove(key);
-            Ok(())
-        }
-    }
-
-    fn test_key() -> [u8; 32] {
-        derive_key("test-redis-token-123")
-    }
-
-    // We need a shared inner for some tests, wrapping in Arc
-    use std::sync::Arc;
-
-    /// Arc-wrapped test backend so we can inspect raw store after encryption.
-    struct SharedTestBackend {
-        store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    }
-
-    impl SharedTestBackend {
-        fn new() -> Self {
-            Self {
-                store: Arc::new(RwLock::new(HashMap::new())),
-            }
-        }
-
-        fn clone_store(&self) -> Arc<RwLock<HashMap<String, Vec<u8>>>> {
-            Arc::clone(&self.store)
-        }
-    }
-
-    impl CacheBackend for SharedTestBackend {
-        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.store.read().unwrap().get(key).cloned())
-        }
-        fn set(&self, key: &str, value: &[u8], _ttl: u64) -> Result<()> {
-            self.store
-                .write()
-                .unwrap()
-                .insert(key.to_string(), value.to_vec());
-            Ok(())
-        }
-        fn set_nx(&self, key: &str, value: &[u8], _ttl: u64) -> Result<bool> {
-            let mut store = self.store.write().unwrap();
-            if store.contains_key(key) {
-                Ok(false)
-            } else {
-                store.insert(key.to_string(), value.to_vec());
-                Ok(true)
-            }
-        }
-        fn exists(&self, key: &str) -> Result<bool> {
-            Ok(self.store.read().unwrap().contains_key(key))
-        }
-        fn delete(&self, key: &str) -> Result<()> {
-            self.store.write().unwrap().remove(key);
-            Ok(())
-        }
+    fn make_encrypted_cache() -> EncryptedCacheBackend<InMemoryCacheBackend> {
+        let key = [0x42u8; 16]; // Fixed key for test determinism
+        EncryptedCacheBackend::new(InMemoryCacheBackend::new(), key)
     }
 
     #[test]
-    fn sensitive_key_roundtrip() {
-        let inner = TestCacheBackend::new();
-        let enc = EncryptedCacheBackend::new(Box::new(inner), &test_key());
+    fn sensitive_key_detection() {
+        assert!(is_sensitive_key("ep:abc:keys"));
+        assert!(is_sensitive_key("ep:abc:speke"));
+        assert!(is_sensitive_key("ep:abc:hls_cenc:rewrite_params"));
+        assert!(is_sensitive_key("ep:abc:dash_cbcs:rewrite_params"));
 
-        let value = b"raw-aes-128-key-material-here";
-        enc.set("ep:content1:keys", value, 3600).unwrap();
-
-        let retrieved = enc.get("ep:content1:keys").unwrap().unwrap();
-        assert_eq!(retrieved, value);
-    }
-
-    #[test]
-    fn sensitive_key_encrypted_in_store() {
-        let inner = SharedTestBackend::new();
-        let store = inner.clone_store();
-        let enc = EncryptedCacheBackend::new(Box::new(inner), &test_key());
-
-        let plaintext = b"super-secret-key-data";
-        enc.set("ep:abc:keys", plaintext, 3600).unwrap();
-
-        // Read raw data from inner store — should NOT match plaintext
-        let raw = store.read().unwrap().get("ep:abc:keys").cloned().unwrap();
-        assert_ne!(raw, plaintext.to_vec());
-
-        // Should be longer: 12 (nonce) + len(plaintext) + 16 (tag)
-        assert_eq!(raw.len(), 12 + plaintext.len() + 16);
-    }
-
-    #[test]
-    fn non_sensitive_key_passes_through() {
-        let inner = SharedTestBackend::new();
-        let store = inner.clone_store();
-        let enc = EncryptedCacheBackend::new(Box::new(inner), &test_key());
-
-        let value = b"job-state-json-here";
-        enc.set("ep:abc:hls:state", value, 3600).unwrap();
-
-        // Non-sensitive: raw store should contain plaintext
-        let raw = store.read().unwrap().get("ep:abc:hls:state").cloned().unwrap();
-        assert_eq!(raw, value.to_vec());
-
-        // get() should return plaintext directly
-        let retrieved = enc.get("ep:abc:hls:state").unwrap().unwrap();
-        assert_eq!(retrieved, value);
-    }
-
-    #[test]
-    fn speke_key_is_sensitive() {
-        assert!(is_sensitive_key("ep:content1:speke"));
-    }
-
-    #[test]
-    fn rewrite_params_key_is_sensitive() {
-        assert!(is_sensitive_key("ep:content1:hls:rewrite_params"));
-        assert!(is_sensitive_key("ep:xyz:dash:rewrite_params"));
-    }
-
-    #[test]
-    fn non_sensitive_key_patterns() {
         assert!(!is_sensitive_key("ep:abc:hls:state"));
+        assert!(!is_sensitive_key("ep:abc:hls_cenc:init"));
+        assert!(!is_sensitive_key("ep:abc:hls_cenc:seg:0"));
         assert!(!is_sensitive_key("ep:abc:hls:manifest_state"));
-        assert!(!is_sensitive_key("ep:abc:hls:init"));
-        assert!(!is_sensitive_key("ep:abc:hls:seg:0"));
-        assert!(!is_sensitive_key("ep:abc:hls:source"));
+        assert!(!is_sensitive_key("ep:abc:source_config"));
     }
 
     #[test]
-    fn derive_key_deterministic() {
-        let key1 = derive_key("my-secret-token");
-        let key2 = derive_key("my-secret-token");
-        assert_eq!(key1, key2);
+    fn sensitive_values_are_encrypted_at_rest() {
+        let cache = make_encrypted_cache();
+        let plaintext = b"secret-key-data";
+
+        cache.set("ep:test:keys", plaintext, 60).unwrap();
+
+        // Read raw bytes from inner cache — should NOT match plaintext
+        let raw = cache.inner.get("ep:test:keys").unwrap().unwrap();
+        assert_ne!(&raw, &plaintext.to_vec());
+        assert_eq!(raw.len(), 16 + plaintext.len()); // IV + ciphertext
+
+        // Read through encrypted backend — should match plaintext
+        let decrypted = cache.get("ep:test:keys").unwrap().unwrap();
+        assert_eq!(decrypted, plaintext.to_vec());
     }
 
     #[test]
-    fn derive_key_different_tokens() {
-        let key1 = derive_key("token-alpha");
-        let key2 = derive_key("token-bravo");
-        assert_ne!(key1, key2);
+    fn non_sensitive_values_pass_through() {
+        let cache = make_encrypted_cache();
+        let data = b"manifest-state-json";
+
+        cache.set("ep:test:hls:manifest_state", data, 60).unwrap();
+
+        // Raw bytes should match — no encryption applied
+        let raw = cache.inner.get("ep:test:hls:manifest_state").unwrap().unwrap();
+        assert_eq!(raw, data.to_vec());
     }
 
     #[test]
-    fn derive_key_produces_32_bytes() {
-        let key = derive_key("anything");
-        assert_eq!(key.len(), 32);
+    fn roundtrip_rewrite_params() {
+        let cache = make_encrypted_cache();
+        let params = b"{\"source_key\":{\"kid\":[1,2,3],\"key\":[4,5,6]}}";
+
+        cache.set("ep:test:hls_cenc:rewrite_params", params, 60).unwrap();
+
+        let result = cache.get("ep:test:hls_cenc:rewrite_params").unwrap().unwrap();
+        assert_eq!(result, params.to_vec());
+
+        // Verify raw storage is encrypted
+        let raw = cache.inner.get("ep:test:hls_cenc:rewrite_params").unwrap().unwrap();
+        assert_ne!(raw, params.to_vec());
     }
 
     #[test]
-    fn tampered_ciphertext_fails() {
-        let inner = SharedTestBackend::new();
-        let store = inner.clone_store();
-        let enc = EncryptedCacheBackend::new(Box::new(inner), &test_key());
+    fn roundtrip_speke() {
+        let cache = make_encrypted_cache();
+        let xml = b"<cpix:CPIX>...</cpix:CPIX>";
 
-        enc.set("ep:abc:keys", b"secret", 3600).unwrap();
+        cache.set("ep:test:speke", xml, 60).unwrap();
+        let result = cache.get("ep:test:speke").unwrap().unwrap();
+        assert_eq!(result, xml.to_vec());
+    }
 
-        // Tamper with the stored ciphertext
-        {
-            let mut s = store.write().unwrap();
-            let data = s.get_mut("ep:abc:keys").unwrap();
-            // Flip a byte in the ciphertext portion (after the 12-byte nonce)
-            if data.len() > 13 {
-                data[13] ^= 0xFF;
-            }
-        }
+    #[test]
+    fn set_nx_encrypts_sensitive() {
+        let cache = make_encrypted_cache();
+        let data = b"key-material";
 
-        let result = enc.get("ep:abc:keys");
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("decrypt failed"),
-            "expected decrypt error, got: {err_msg}"
+        assert!(cache.set_nx("ep:test:keys", data, 60).unwrap());
+        assert!(!cache.set_nx("ep:test:keys", b"other", 60).unwrap());
+
+        let result = cache.get("ep:test:keys").unwrap().unwrap();
+        assert_eq!(result, data.to_vec());
+    }
+
+    #[test]
+    fn delete_removes_sensitive() {
+        let cache = make_encrypted_cache();
+        cache.set("ep:test:keys", b"secret", 60).unwrap();
+        cache.delete("ep:test:keys").unwrap();
+        assert!(cache.get("ep:test:keys").unwrap().is_none());
+    }
+
+    #[test]
+    fn exists_works_for_sensitive() {
+        let cache = make_encrypted_cache();
+        assert!(!cache.exists("ep:test:keys").unwrap());
+        cache.set("ep:test:keys", b"data", 60).unwrap();
+        assert!(cache.exists("ep:test:keys").unwrap());
+    }
+
+    #[test]
+    fn different_keys_produce_different_ciphertext() {
+        let cache1 = EncryptedCacheBackend::new(
+            InMemoryCacheBackend::new(),
+            [0x01u8; 16],
         );
-    }
-
-    #[test]
-    fn truncated_ciphertext_fails() {
-        let inner = SharedTestBackend::new();
-        let store = inner.clone_store();
-        let enc = EncryptedCacheBackend::new(Box::new(inner), &test_key());
-
-        enc.set("ep:abc:speke", b"cpix-xml-data", 3600).unwrap();
-
-        // Truncate to just the nonce (12 bytes) — missing ciphertext+tag
-        {
-            let mut s = store.write().unwrap();
-            let data = s.get_mut("ep:abc:speke").unwrap();
-            data.truncate(10);
-        }
-
-        let result = enc.get("ep:abc:speke");
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("too short"),
-            "expected 'too short' error, got: {err_msg}"
+        let cache2 = EncryptedCacheBackend::new(
+            InMemoryCacheBackend::new(),
+            [0x02u8; 16],
         );
+        let plaintext = b"same-plaintext";
+
+        cache1.set("ep:test:keys", plaintext, 60).unwrap();
+        cache2.set("ep:test:keys", plaintext, 60).unwrap();
+
+        let raw1 = cache1.inner.get("ep:test:keys").unwrap().unwrap();
+        let raw2 = cache2.inner.get("ep:test:keys").unwrap().unwrap();
+        // Different keys → different ciphertext (IVs also differ but that's secondary)
+        assert_ne!(raw1, raw2);
     }
 
     #[test]
-    fn wrong_key_fails_decrypt() {
-        let inner = SharedTestBackend::new();
-        let store = inner.clone_store();
-
-        let key_a = derive_key("token-a");
-        let key_b = derive_key("token-b");
-
-        let enc_a = EncryptedCacheBackend::new(Box::new(inner), &key_a);
-        enc_a.set("ep:abc:keys", b"secret-data", 3600).unwrap();
-
-        // Build a new EncryptedCacheBackend with key_b pointing at the same store
-        struct StoreRef(Arc<RwLock<HashMap<String, Vec<u8>>>>);
-        impl CacheBackend for StoreRef {
-            fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-                Ok(self.0.read().unwrap().get(key).cloned())
-            }
-            fn set(&self, key: &str, value: &[u8], _: u64) -> Result<()> {
-                self.0.write().unwrap().insert(key.to_string(), value.to_vec());
-                Ok(())
-            }
-            fn set_nx(&self, key: &str, value: &[u8], _: u64) -> Result<bool> {
-                let mut store = self.0.write().unwrap();
-                if store.contains_key(key) {
-                    Ok(false)
-                } else {
-                    store.insert(key.to_string(), value.to_vec());
-                    Ok(true)
-                }
-            }
-            fn exists(&self, key: &str) -> Result<bool> {
-                Ok(self.0.read().unwrap().contains_key(key))
-            }
-            fn delete(&self, key: &str) -> Result<()> {
-                self.0.write().unwrap().remove(key);
-                Ok(())
-            }
-        }
-
-        let enc_b = EncryptedCacheBackend::new(Box::new(StoreRef(store)), &key_b);
-        let result = enc_b.get("ep:abc:keys");
-        assert!(result.is_err(), "decrypting with wrong key should fail");
+    fn process_key_generation_is_nonzero() {
+        let key = generate_process_key();
+        assert_ne!(key, [0u8; 16]);
     }
 
     #[test]
-    fn exists_and_delete_delegate_directly() {
-        let inner = TestCacheBackend::new();
-        let enc = EncryptedCacheBackend::new(Box::new(inner), &test_key());
-
-        enc.set("ep:abc:keys", b"data", 3600).unwrap();
-        assert!(enc.exists("ep:abc:keys").unwrap());
-
-        enc.delete("ep:abc:keys").unwrap();
-        assert!(!enc.exists("ep:abc:keys").unwrap());
+    fn process_key_has_good_bit_distribution() {
+        let key = generate_process_key();
+        // After AES whitening, key should have bits set across all bytes
+        let nonzero_bytes = key.iter().filter(|&&b| b != 0).count();
+        assert!(nonzero_bytes >= 8, "key should have at least 8 non-zero bytes, got {nonzero_bytes}");
     }
 
     #[test]
-    fn get_missing_key_returns_none() {
-        let inner = TestCacheBackend::new();
-        let enc = EncryptedCacheBackend::new(Box::new(inner), &test_key());
+    fn clone_shares_state() {
+        let cache1 = make_encrypted_cache();
+        let cache2 = cache1.clone();
+        cache1.set("ep:test:keys", b"shared-secret", 60).unwrap();
+        let result = cache2.get("ep:test:keys").unwrap().unwrap();
+        assert_eq!(result, b"shared-secret".to_vec());
+    }
 
-        assert!(enc.get("ep:nonexistent:keys").unwrap().is_none());
-        assert!(enc.get("ep:nonexistent:state").unwrap().is_none());
+    #[test]
+    fn iv_uniqueness() {
+        let iv1 = generate_iv();
+        let iv2 = generate_iv();
+        assert_ne!(iv1, iv2);
     }
 }

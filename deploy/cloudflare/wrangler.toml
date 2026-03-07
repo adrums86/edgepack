@@ -1,0 +1,27 @@
+# Cloudflare Workers deployment for edgepack
+#
+# Prerequisites:
+#   npm install -g wrangler
+#   rustup target add wasm32-wasip2
+#
+# Build & deploy:
+#   make build
+#   cd deploy/cloudflare && npx wrangler deploy
+#
+# Local development:
+#   cd deploy/cloudflare && npx wrangler dev
+
+name = "edgepack"
+main = "../../target/wasm32-wasip2/release/edgepack.wasm"
+compatibility_date = "2025-12-01"
+
+# WASI component model support
+compatibility_flags = ["nodejs_compat_v2"]
+
+[vars]
+# Set secrets via: wrangler secret put <NAME>
+# Required secrets:
+#   SPEKE_URL, SPEKE_BEARER_TOKEN (for DRM)
+
+[build]
+command = "cargo build --release --target wasm32-wasip2"

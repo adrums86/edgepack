@@ -1,20 +1,14 @@
 pub mod encrypted;
-pub mod http_kv;
-pub mod redis_http;
-pub mod redis_tcp;
-
-#[cfg(feature = "cloudflare")]
-pub mod cloudflare_kv;
-
-#[cfg(feature = "sandbox")]
 pub mod memory;
 
-use crate::config::{AppConfig, CacheBackendType};
-use crate::error::{EdgepackError, Result};
+use crate::error::Result;
+use encrypted::EncryptedCacheBackend;
+use memory::InMemoryCacheBackend;
+use std::sync::OnceLock;
 
 /// Abstract cache backend for application state storage.
 ///
-/// Used for DRM keys, repackaging job state, and manifest progress tracking.
+/// Used for DRM keys, JIT packaging state, and manifest progress tracking.
 /// Media segments/manifests themselves are cached at the CDN level via HTTP headers.
 pub trait CacheBackend: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
@@ -26,41 +20,30 @@ pub trait CacheBackend: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
 }
 
-/// Create a cache backend from application configuration.
+/// Type alias for the global cache backend (encrypted wrapper over in-memory HashMap).
+pub type GlobalCacheBackend = EncryptedCacheBackend<InMemoryCacheBackend>;
+
+/// Global encrypted in-memory cache singleton.
 ///
-/// The returned backend automatically encrypts sensitive cache entries
-/// (DRM keys, SPEKE responses, rewrite parameters) using AES-256-GCM
-/// with a key derived from the store token.
+/// Sensitive cache entries (DRM keys, rewrite params) are encrypted with a per-process
+/// AES-128-CTR key. Non-sensitive entries pass through unmodified.
 ///
-/// Dispatches to the appropriate backend based on `config.store.backend`:
-/// - `RedisHttp` → Upstash-compatible HTTP Redis
-/// - `RedisTcp` → TCP Redis (stub)
-/// - `CloudflareKv` → Cloudflare Workers KV REST API (requires `cloudflare` feature)
-/// - `HttpKv` → Generic HTTP KV (for DynamoDB via API GW, EdgeKV via proxy, etc.)
-pub fn create_backend(config: &AppConfig) -> Result<Box<dyn CacheBackend>> {
-    let inner: Box<dyn CacheBackend> = match config.store.backend {
-        CacheBackendType::RedisHttp => Box::new(redis_http::RedisHttpBackend::new(
-            &config.store.url,
-            &config.store.token,
-        )),
-        CacheBackendType::RedisTcp => Box::new(redis_tcp::RedisTcpBackend::new(
-            &config.store.url,
-            &config.store.token,
-        )?),
-        #[cfg(feature = "cloudflare")]
-        CacheBackendType::CloudflareKv => {
-            let cf = config.cloudflare_kv.as_ref()
-                .ok_or_else(|| EdgepackError::Config("cloudflare_kv config required for CloudflareKv backend".into()))?;
-            Box::new(cloudflare_kv::CloudflareKvBackend::new(cf))
-        }
-        CacheBackendType::HttpKv => {
-            let hkv = config.http_kv.as_ref()
-                .ok_or_else(|| EdgepackError::Config("http_kv config required for HttpKv backend".into()))?;
-            Box::new(http_kv::HttpKvBackend::new(hkv))
-        }
-    };
-    let enc_key = encrypted::derive_key(config.cache_encryption_token());
-    Ok(Box::new(encrypted::EncryptedCacheBackend::new(inner, &enc_key)))
+/// Persists between requests in long-running runtimes (wasmtime serve, Cloudflare Workers).
+/// In per-request runtimes (Spin), each request starts with an empty cache — SPEKE is
+/// called on the first cache miss, which is acceptable since the CDN caches the HTTP response.
+static CACHE: OnceLock<GlobalCacheBackend> = OnceLock::new();
+
+/// Get the global encrypted in-memory cache instance.
+///
+/// Initializes on first call with a random per-process encryption key.
+/// Subsequent calls return the same instance.
+pub fn global_cache() -> GlobalCacheBackend {
+    CACHE
+        .get_or_init(|| {
+            let key = encrypted::generate_process_key();
+            EncryptedCacheBackend::new(InMemoryCacheBackend::new(), key)
+        })
+        .clone()
 }
 
 /// Cache key builders for consistent key naming.
@@ -97,17 +80,17 @@ impl CacheKeys {
         format!("ep:{content_id}:{format}:seg:{number}")
     }
 
-    /// Serialized source manifest metadata (for continuation chaining).
+    /// Serialized source manifest metadata.
     pub fn source_manifest(content_id: &str, format: &str) -> String {
         format!("ep:{content_id}:{format}:source")
     }
 
-    /// Serialized segment rewrite parameters (for continuation chaining).
+    /// Serialized segment rewrite parameters.
     pub fn rewrite_params(content_id: &str, format: &str) -> String {
         format!("ep:{content_id}:{format}:rewrite_params")
     }
 
-    /// Target schemes list for continuation chaining (stored during execute_first).
+    /// Target schemes list.
     pub fn target_schemes(content_id: &str, format: &str) -> String {
         format!("ep:{content_id}:{format}:target_schemes")
     }
@@ -125,7 +108,7 @@ impl CacheKeys {
         format!("ep:{content_id}:{scheme}:seg:{number}")
     }
 
-    /// Target output formats list for continuation chaining (stored during execute_first).
+    /// Target output formats list.
     pub fn target_formats(content_id: &str) -> String {
         format!("ep:{content_id}:target_formats")
     }
@@ -155,13 +138,13 @@ impl CacheKeys {
         format!("ep:{content_id}:{sf}:seg:{number}")
     }
 
-    /// Rewrite parameters for a specific scheme (continuation chaining).
+    /// Rewrite parameters for a specific scheme.
     pub fn rewrite_params_for_scheme(content_id: &str, format: &str, scheme: &str) -> String {
         let sf = Self::scheme_fmt(format, scheme);
         format!("ep:{content_id}:{sf}:rewrite_params")
     }
 
-    // --- JIT Packaging key builders (Phase 8) ---
+    // --- JIT Packaging key builders ---
 
     /// Per-content source configuration (source URL, target schemes, container format).
     pub fn source_config(content_id: &str) -> String {
@@ -188,6 +171,14 @@ impl CacheKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_cache_returns_same_instance() {
+        let c1 = global_cache();
+        let c2 = global_cache();
+        c1.set("test_global", b"hello", 0).unwrap();
+        assert_eq!(c2.get("test_global").unwrap(), Some(b"hello".to_vec()));
+    }
 
     #[test]
     fn cache_keys_drm_keys() {
@@ -381,54 +372,5 @@ mod tests {
         let unqualified = CacheKeys::init_segment("abc", "hls");
         let qualified = CacheKeys::init_segment_for_scheme("abc", "hls", "cenc");
         assert_ne!(unqualified, qualified);
-    }
-
-    #[test]
-    fn create_backend_http() {
-        use crate::config::*;
-        let config = AppConfig {
-            store: StoreConfig {
-                url: "https://redis.example.com".into(),
-                token: "token123".into(),
-                backend: CacheBackendType::RedisHttp,
-            },
-            drm: DrmConfig {
-                speke_url: crate::url::Url::parse("https://speke.test/v2").unwrap(),
-                speke_auth: SpekeAuth::Bearer("test".into()),
-                system_ids: DrmSystemIds::default(),
-            },
-            cache: CacheConfig::default(),
-            jit: JitConfig::default(),
-            #[cfg(feature = "cloudflare")]
-            cloudflare_kv: None,
-            http_kv: None,
-        };
-        let backend = create_backend(&config);
-        assert!(backend.is_ok());
-    }
-
-    #[test]
-    fn create_backend_tcp() {
-        use crate::config::*;
-        let config = AppConfig {
-            store: StoreConfig {
-                url: "redis://localhost:6379".into(),
-                token: "token123".into(),
-                backend: CacheBackendType::RedisTcp,
-            },
-            drm: DrmConfig {
-                speke_url: crate::url::Url::parse("https://speke.test/v2").unwrap(),
-                speke_auth: SpekeAuth::Bearer("test".into()),
-                system_ids: DrmSystemIds::default(),
-            },
-            cache: CacheConfig::default(),
-            jit: JitConfig::default(),
-            #[cfg(feature = "cloudflare")]
-            cloudflare_kv: None,
-            http_kv: None,
-        };
-        let backend = create_backend(&config);
-        // TCP backend constructor should succeed (it's a stub)
-        assert!(backend.is_ok());
     }
 }
