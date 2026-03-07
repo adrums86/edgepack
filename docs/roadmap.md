@@ -24,7 +24,7 @@
 
 # Refactoring Roadmap
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, 19, 21, and 22 are complete. All P0 and P1 items are done. Remaining phases:
+The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, 19, 21, and 22 are complete. All P0 and P1 items are done. Remaining phases (18, 23):
 
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
@@ -192,25 +192,6 @@ The current binary (~628 KB base) is well within cold start budgets (<1 ms). Fea
 - New: `tests/cache_control.rs` (43 integration tests), 3 new output integrity tests, 12 new unit tests (webhook + progressive)
 - Result: 1,291 tests total with `--features jit,cloudflare` (80 new tests)
 
-### Phase 20: Multi-Source Manifest Merging — P2
-- Combine multiple source manifests (HLS/DASH) into a single unified output manifest
-- Feature-gated behind `#[cfg(feature = "merge")]` to keep it modular and avoid binary impact on builds that don't need it
-- Accept an array of source manifest URLs in the webhook payload (`source_urls: Vec<String>`) instead of a single `source_url`
-- Mixed-format input: each source can be a different manifest format (e.g., HLS M3U8 + DASH MPD) — auto-detected per URL via the existing `hls_input`/`dash_input` parsers, then normalized into `SourceManifest` before merging
-- Each source is fetched independently, parsed into `SourceManifest`, and its variants/tracks are merged into a unified manifest
-- Variant deduplication: detect overlapping bitrates/resolutions across sources and apply configurable conflict resolution (prefer first, prefer highest quality, error)
-- Track type merging: combine video variants from one source with audio/subtitle tracks from another (e.g., separate audio-only and video-only CMAF sources, or an HLS video source merged with a DASH audio source)
-- Per-source encryption: each source may have a different encryption scheme — decrypt each independently, re-encrypt all to the target scheme(s)
-- Per-source container format: sources may use different container formats (CMAF, fMP4, TS) — each is parsed/transmuxed independently before merging into the target output format
-- Per-source init segments: each variant retains its own init segment (no re-muxing across sources)
-- Unified DRM signaling: merged manifest gets a single consistent set of DRM tags/ContentProtection elements
-- HLS: merged master playlist with all `#EXT-X-STREAM-INF` entries, unified `#EXT-X-MEDIA` groups for audio/subtitle renditions
-- DASH: merged MPD with multiple `<AdaptationSet>` elements, one per source track type
-- Segment URIs remain source-specific (each segment is fetched and repackaged from its original source)
-- Pipeline changes: `RepackagePipeline` accepts `Vec<SourceManifest>`, iterates sources to build merged `ManifestState` before entering the segment processing loop
-- Sandbox UI: multi-URL input field for testing merged output
-- New: `src/manifest/merge.rs` for manifest merging logic
-
 ### ~~Phase 21: Generic HLS/DASH Pipeline (Dual-Format)~~ ✅ Complete
 - Changed `RepackageRequest.output_format` to `output_formats: Vec<OutputFormat>` with backward-compatible webhook API (`format` singular still accepted, `output_formats` array takes precedence)
 - Format-agnostic segment cache keys: `ep:{id}:{scheme}:init` and `ep:{id}:{scheme}:seg:{n}` (no format prefix — segments are identical for HLS and DASH)
@@ -372,6 +353,6 @@ This phase requires significant research and prototyping before implementation b
 - [ ] **E2E encryption interop:** Understand how MoQ Secure Objects (SFrame) interacts with edgepack's DRM encryption — potential double-encryption or key management complexity
 - [ ] **Live-to-VOD with MoQ:** Design how MoQ's group-based delivery maps to edgepack's `ManifestPhase` state machine (AwaitingFirstSegment → Live → Complete)
 
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phases (18, 20) are P2, Phase 23 is P3.
+**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phase 18 is P2, Phase 23 is P3.
 
 Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`

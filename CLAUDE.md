@@ -580,4 +580,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Refactoring Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, and 22 are complete (all P0/P1 done). Remaining P2 phases: 18 (Binary Size Monitoring), 20 (Multi-Source Manifest Merging). P3: 23 (MoQ Ingest — feature-gated, requires research).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, and 22 are complete (all P0/P1 done). Remaining P2 phase: 18 (Binary Size Monitoring). P3: 23 (MoQ Ingest — feature-gated, requires research).
