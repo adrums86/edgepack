@@ -2,6 +2,7 @@ pub mod request;
 pub mod webhook;
 
 use crate::config::AppConfig;
+use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
 use crate::manifest::types::OutputFormat;
 
@@ -106,27 +107,27 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
         // On-demand: GET /repackage/{content_id}/{format}/manifest
         // {format} can be "hls", "dash", "hls_cenc", "dash_cbcs", etc.
         (HttpMethod::Get, ["repackage", content_id, format, "manifest"]) => {
-            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
             request::handle_manifest_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
         // On-demand: GET /repackage/{content_id}/{format}/init.mp4
         (HttpMethod::Get, ["repackage", content_id, format, "init.mp4"]) => {
-            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
             request::handle_init_segment_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
         // On-demand: GET /repackage/{content_id}/{format}/iframes
         // Serves the I-frame-only playlist (HLS) or 404 (DASH — trick play is in regular MPD)
         (HttpMethod::Get, ["repackage", content_id, format, "iframes"]) => {
-            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
             request::handle_iframe_manifest_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
         // On-demand: GET /repackage/{content_id}/{format}/key
         // Serves the raw AES-128 content key for TS segment decryption (HLS AES-128 only)
         (HttpMethod::Get, ["repackage", content_id, format, "key"]) => {
-            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
             request::handle_key_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
@@ -134,7 +135,7 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
         // Accepts all CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions:
         // .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a, .ts
         (HttpMethod::Get, ["repackage", content_id, format, segment_file]) => {
-            let (output_format, scheme) = parse_format_with_scheme(format)?;
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
             if let Some(seg_num) = parse_segment_number(segment_file) {
                 request::handle_media_segment_request(content_id, output_format, seg_num, scheme.as_deref(), ctx)
             } else {
@@ -189,6 +190,33 @@ fn parse_format_with_scheme(s: &str) -> Result<(OutputFormat, Option<String>)> {
     }
 }
 
+/// Parse a format string and enforce runtime policy checks.
+///
+/// This is the **primary enforcement point** for policy controls — called at the
+/// route level before any cache lookup, JIT setup, or processing.
+///
+/// Checks:
+/// - Output format is allowed by policy
+/// - Encryption scheme (if explicit in URL) is allowed by policy
+fn parse_and_check_policy(
+    format: &str,
+    ctx: &HandlerContext,
+) -> Result<(OutputFormat, Option<String>)> {
+    let (output_format, scheme) = parse_format_with_scheme(format)?;
+
+    // Check output format policy
+    ctx.config.policy.check_format(&output_format)?;
+
+    // Check encryption scheme policy (when scheme is explicit in URL)
+    if let Some(ref s) = scheme {
+        if let Some(enc) = EncryptionScheme::from_str_value(s) {
+            ctx.config.policy.check_scheme(&enc)?;
+        }
+    }
+
+    Ok((output_format, scheme))
+}
+
 fn parse_segment_number(filename: &str) -> Option<u32> {
     // All ISOBMFF (ISO 14496-12) and CMAF (ISO 23000-19) segment extensions.
     const SEGMENT_EXTENSIONS: &[&str] = &[
@@ -221,7 +249,7 @@ pub(crate) mod test_helpers {
     use super::*;
     use crate::config::{
         AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig,
-        SpekeAuth,
+        PolicyConfig, SpekeAuth,
     };
 
     pub fn test_config() -> AppConfig {
@@ -233,6 +261,7 @@ pub(crate) mod test_helpers {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 
@@ -246,6 +275,7 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PolicyConfig;
     use test_helpers::test_context;
 
     #[test]
@@ -611,5 +641,208 @@ mod tests {
     fn format_str_values() {
         assert_eq!(format_str(OutputFormat::Hls), "hls");
         assert_eq!(format_str(OutputFormat::Dash), "dash");
+    }
+
+    // --- Policy enforcement tests ---
+
+    fn test_config_with_policy(policy: PolicyConfig) -> AppConfig {
+        AppConfig {
+            policy,
+            ..test_helpers::test_config()
+        }
+    }
+
+    #[test]
+    fn route_policy_denies_format() {
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_formats: Some(vec![OutputFormat::Hls]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-fmt-1/dash/manifest".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = route(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn route_policy_allows_format() {
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_formats: Some(vec![OutputFormat::Hls]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-fmt-2/hls/manifest".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        // Should succeed (returns 404 because content doesn't exist, not 403)
+        let resp = route(&req, &ctx).unwrap();
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn route_policy_denies_scheme() {
+        use crate::drm::scheme::EncryptionScheme;
+
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_schemes: Some(vec![EncryptionScheme::Cbcs]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-sch-1/hls_cenc/manifest".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = route(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn route_policy_allows_scheme() {
+        use crate::drm::scheme::EncryptionScheme;
+
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_schemes: Some(vec![EncryptionScheme::Cenc]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-sch-2/hls_cenc/manifest".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        // Should succeed (404 because content doesn't exist, not 403)
+        let resp = route(&req, &ctx).unwrap();
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn route_policy_denies_init_segment() {
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_formats: Some(vec![OutputFormat::Dash]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-init-1/hls/init.mp4".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = route(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn route_policy_denies_media_segment() {
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_formats: Some(vec![OutputFormat::Dash]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-seg-1/hls/segment_0.cmfv".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = route(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn route_policy_denies_iframe() {
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_formats: Some(vec![OutputFormat::Dash]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-iframe-1/hls/iframes".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = route(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn route_policy_denies_key() {
+        use crate::drm::scheme::EncryptionScheme;
+
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_schemes: Some(vec![EncryptionScheme::Cbcs]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-key-1/hls_cenc/key".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        let result = route(&req, &ctx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("forbidden"));
+    }
+
+    #[test]
+    fn route_policy_default_allows_all() {
+        // Default policy (no restrictions) should not block anything
+        let ctx = test_context();
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-dflt-1/hls_cenc/manifest".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        // Should succeed (404 because content doesn't exist, not 403)
+        let resp = route(&req, &ctx).unwrap();
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn route_policy_empty_lockdown() {
+        // All empty vectors = full lockdown
+        let config = test_config_with_policy(PolicyConfig {
+            allowed_formats: Some(vec![]),
+            allowed_schemes: Some(vec![]),
+            ..Default::default()
+        });
+        let ctx = HandlerContext { config };
+
+        // Plain format denied
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-lock-1/hls/manifest".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        assert!(route(&req, &ctx).is_err());
+
+        // Scheme-qualified format denied
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            path: "/repackage/policy-lock-2/dash_cenc/manifest".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        assert!(route(&req, &ctx).is_err());
     }
 }

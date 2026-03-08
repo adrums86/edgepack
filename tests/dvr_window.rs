@@ -6,7 +6,7 @@
 //! - DVR with DRM, I-frame playlists, ad breaks, and LL-HLS parts
 //! - Live-to-VOD transition (Complete phase renders all segments)
 //! - Serde backward compatibility
-//! - Webhook validation (positive duration required)
+//! - Source config validation (positive duration required)
 //! - Container format variations
 
 mod common;

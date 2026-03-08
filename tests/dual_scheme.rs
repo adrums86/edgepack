@@ -1,6 +1,6 @@
 //! Integration tests: Phase 4 — Dual-Scheme Output.
 //!
-//! Tests scheme-qualified routing, cache key generation, webhook payload
+//! Tests scheme-qualified routing, cache key generation, source config payload
 //! parsing with multiple target schemes, and backward compatibility.
 
 mod common;
@@ -9,7 +9,7 @@ use edgepack::cache::CacheKeys;
 use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::handler::{route, HandlerContext, HttpMethod, HttpRequest};
 use edgepack::config::{
-    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, SpekeAuth,
+    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, PolicyConfig, SpekeAuth,
 };
 
 fn test_context() -> HandlerContext {
@@ -22,6 +22,7 @@ fn test_context() -> HandlerContext {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
+            policy: PolicyConfig::default(),
         },
     }
 }

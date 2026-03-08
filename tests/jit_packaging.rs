@@ -7,7 +7,7 @@ mod common;
 
 use edgepack::cache::{CacheBackend, CacheKeys};
 use edgepack::config::{
-    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, SpekeAuth,
+    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, PolicyConfig, SpekeAuth,
 };
 use edgepack::drm::scheme::EncryptionScheme;
 use edgepack::handler::{route, HandlerContext, HttpMethod, HttpRequest};
@@ -23,6 +23,7 @@ fn test_config() -> AppConfig {
         },
         cache: CacheConfig::default(),
         jit: JitConfig::default(),
+        policy: PolicyConfig::default(),
     }
 }
 

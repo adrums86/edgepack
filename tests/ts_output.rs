@@ -1,7 +1,7 @@
 //! Integration tests: TS segment output (Phase 22).
 //!
 //! Tests CMAF→TS muxing, TS-specific HLS manifest rendering,
-//! container format validation, webhook/handler integration,
+//! container format validation, handler integration,
 //! and output integrity for the TS output path.
 
 #![cfg(feature = "ts")]
@@ -699,7 +699,7 @@ fn sample_rate_to_index_unknown_defaults() {
 
 fn make_test_handler_context() -> edgepack::handler::HandlerContext {
     use edgepack::config::{
-        AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, SpekeAuth,
+        AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, PolicyConfig, SpekeAuth,
     };
 
     edgepack::handler::HandlerContext {
@@ -712,6 +712,7 @@ fn make_test_handler_context() -> edgepack::handler::HandlerContext {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
+            policy: PolicyConfig::default(),
         },
     }
 }

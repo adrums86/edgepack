@@ -597,7 +597,7 @@ fn segment_handler_uses_system_defaults_by_design() {
 #[test]
 fn jit_manifest_state_has_no_cache_control_by_design() {
     // Documents that JIT-created ManifestState always has cache_control: None.
-    // JIT requests come from GET cache misses — there's no webhook payload
+    // JIT requests come from GET cache misses — there's no request payload
     // to carry per-request overrides. JIT always uses system defaults.
     //
     // The pipeline.rs JIT ManifestState constructor (struct literal at ~line 1239)

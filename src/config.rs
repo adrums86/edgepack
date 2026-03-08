@@ -1,5 +1,6 @@
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
+use crate::manifest::types::OutputFormat;
 use crate::media::container::ContainerFormat;
 use crate::url::Url;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,9 @@ pub struct AppConfig {
     /// JIT (just-in-time) packaging configuration.
     #[serde(default)]
     pub jit: JitConfig,
+    /// Runtime policy controls for restricting endpoint access.
+    #[serde(default)]
+    pub policy: PolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +120,76 @@ impl CacheControlConfig {
     }
 }
 
+/// Runtime policy controls for restricting which schemes, formats, and containers
+/// are available to end users.
+///
+/// Uses a fail-closed allowlist model:
+/// - `None` → no restriction (all values allowed) — backward compatible default
+/// - `Some(vec![...])` → only listed values are allowed
+/// - `Some(vec![])` → nothing allowed (full lockdown)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PolicyConfig {
+    /// Allowed encryption schemes. None = all allowed (no restriction).
+    #[serde(default)]
+    pub allowed_schemes: Option<Vec<EncryptionScheme>>,
+    /// Allowed output formats. None = all allowed.
+    #[serde(default)]
+    pub allowed_formats: Option<Vec<OutputFormat>>,
+    /// Allowed container formats. None = all allowed.
+    #[serde(default)]
+    pub allowed_containers: Option<Vec<ContainerFormat>>,
+}
+
+impl PolicyConfig {
+    /// Check whether the given encryption scheme is allowed by policy.
+    ///
+    /// Returns `Ok(())` if allowed, `Err(Forbidden)` if denied.
+    pub fn check_scheme(&self, scheme: &EncryptionScheme) -> Result<()> {
+        if let Some(ref allowed) = self.allowed_schemes {
+            if !allowed.contains(scheme) {
+                return Err(EdgepackError::Forbidden(format!(
+                    "encryption scheme '{}' is not allowed by policy",
+                    scheme.scheme_type_str()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check whether the given output format is allowed by policy.
+    ///
+    /// Returns `Ok(())` if allowed, `Err(Forbidden)` if denied.
+    pub fn check_format(&self, format: &OutputFormat) -> Result<()> {
+        if let Some(ref allowed) = self.allowed_formats {
+            if !allowed.contains(format) {
+                let name = match format {
+                    OutputFormat::Hls => "hls",
+                    OutputFormat::Dash => "dash",
+                };
+                return Err(EdgepackError::Forbidden(format!(
+                    "output format '{name}' is not allowed by policy"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check whether the given container format is allowed by policy.
+    ///
+    /// Returns `Ok(())` if allowed, `Err(Forbidden)` if denied.
+    pub fn check_container(&self, container: &ContainerFormat) -> Result<()> {
+        if let Some(ref allowed) = self.allowed_containers {
+            if !allowed.contains(container) {
+                return Err(EdgepackError::Forbidden(format!(
+                    "container format '{}' is not allowed by policy",
+                    container
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// JIT (just-in-time) packaging configuration.
 ///
 /// Controls on-demand repackaging behavior where GET requests for
@@ -179,6 +253,21 @@ impl AppConfig {
             .parse()
             .unwrap_or(30);
 
+        // Policy configuration (allowlists)
+        let policy_allowed_schemes = parse_policy_list("POLICY_ALLOWED_SCHEMES", |s| {
+            EncryptionScheme::from_str_value(s)
+        });
+        let policy_allowed_formats = parse_policy_list("POLICY_ALLOWED_FORMATS", |s| {
+            match s {
+                "hls" => Some(OutputFormat::Hls),
+                "dash" => Some(OutputFormat::Dash),
+                _ => None,
+            }
+        });
+        let policy_allowed_containers = parse_policy_list("POLICY_ALLOWED_CONTAINERS", |s| {
+            ContainerFormat::from_str_value(s)
+        });
+
         Ok(Self {
             drm: DrmConfig {
                 speke_url,
@@ -202,6 +291,11 @@ impl AppConfig {
                 default_container_format: jit_default_container_format,
                 lock_ttl_seconds: jit_lock_ttl,
             },
+            policy: PolicyConfig {
+                allowed_schemes: policy_allowed_schemes,
+                allowed_formats: policy_allowed_formats,
+                allowed_containers: policy_allowed_containers,
+            },
         })
     }
 }
@@ -212,6 +306,45 @@ fn env_var(name: &str) -> Result<String> {
 
 fn env_var_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse a comma-separated env var into an allowlist.
+///
+/// - Unset env var → `None` (no restriction)
+/// - Empty string → `Some(vec![])` (nothing allowed)
+/// - Comma-separated values → `Some(vec![...])` (only listed values allowed)
+///
+/// Unknown values are silently ignored (log a warning in production).
+fn parse_policy_list<T, F>(env_name: &str, parse_fn: F) -> Option<Vec<T>>
+where
+    F: Fn(&str) -> Option<T>,
+{
+    let val = match std::env::var(env_name) {
+        Ok(v) => v,
+        Err(_) => return None, // Unset = no restriction
+    };
+
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return Some(Vec::new()); // Empty = nothing allowed
+    }
+
+    let items: Vec<T> = trimmed
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            let parsed = parse_fn(s);
+            if parsed.is_none() {
+                log::warn!("{env_name}: ignoring unknown value '{s}'");
+            }
+            parsed
+        })
+        .collect();
+
+    Some(items)
 }
 
 #[cfg(test)]
@@ -360,6 +493,219 @@ mod tests {
         }"#;
         let parsed: AppConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.jit.source_url_pattern.is_none());
+    }
+
+    // --- PolicyConfig tests ---
+
+    #[test]
+    fn policy_config_default_is_all_none() {
+        let p = PolicyConfig::default();
+        assert!(p.allowed_schemes.is_none());
+        assert!(p.allowed_formats.is_none());
+        assert!(p.allowed_containers.is_none());
+    }
+
+    #[test]
+    fn policy_check_scheme_none_allows_all() {
+        let p = PolicyConfig::default();
+        assert!(p.check_scheme(&EncryptionScheme::Cenc).is_ok());
+        assert!(p.check_scheme(&EncryptionScheme::Cbcs).is_ok());
+        assert!(p.check_scheme(&EncryptionScheme::None).is_ok());
+    }
+
+    #[test]
+    fn policy_check_scheme_allowlist() {
+        let p = PolicyConfig {
+            allowed_schemes: Some(vec![EncryptionScheme::Cenc]),
+            ..Default::default()
+        };
+        assert!(p.check_scheme(&EncryptionScheme::Cenc).is_ok());
+        assert!(p.check_scheme(&EncryptionScheme::Cbcs).is_err());
+        assert!(p.check_scheme(&EncryptionScheme::None).is_err());
+    }
+
+    #[test]
+    fn policy_check_scheme_empty_denies_all() {
+        let p = PolicyConfig {
+            allowed_schemes: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(p.check_scheme(&EncryptionScheme::Cenc).is_err());
+        assert!(p.check_scheme(&EncryptionScheme::Cbcs).is_err());
+        assert!(p.check_scheme(&EncryptionScheme::None).is_err());
+    }
+
+    #[test]
+    fn policy_check_scheme_forbidden_message() {
+        let p = PolicyConfig {
+            allowed_schemes: Some(vec![EncryptionScheme::Cbcs]),
+            ..Default::default()
+        };
+        let err = p.check_scheme(&EncryptionScheme::Cenc).unwrap_err();
+        assert!(err.to_string().contains("forbidden"));
+        assert!(err.to_string().contains("cenc"));
+        assert!(err.to_string().contains("not allowed by policy"));
+    }
+
+    #[test]
+    fn policy_check_format_none_allows_all() {
+        let p = PolicyConfig::default();
+        assert!(p.check_format(&OutputFormat::Hls).is_ok());
+        assert!(p.check_format(&OutputFormat::Dash).is_ok());
+    }
+
+    #[test]
+    fn policy_check_format_allowlist() {
+        let p = PolicyConfig {
+            allowed_formats: Some(vec![OutputFormat::Hls]),
+            ..Default::default()
+        };
+        assert!(p.check_format(&OutputFormat::Hls).is_ok());
+        assert!(p.check_format(&OutputFormat::Dash).is_err());
+    }
+
+    #[test]
+    fn policy_check_format_empty_denies_all() {
+        let p = PolicyConfig {
+            allowed_formats: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(p.check_format(&OutputFormat::Hls).is_err());
+        assert!(p.check_format(&OutputFormat::Dash).is_err());
+    }
+
+    #[test]
+    fn policy_check_format_forbidden_message() {
+        let p = PolicyConfig {
+            allowed_formats: Some(vec![OutputFormat::Hls]),
+            ..Default::default()
+        };
+        let err = p.check_format(&OutputFormat::Dash).unwrap_err();
+        assert!(err.to_string().contains("forbidden"));
+        assert!(err.to_string().contains("dash"));
+    }
+
+    #[test]
+    fn policy_check_container_none_allows_all() {
+        let p = PolicyConfig::default();
+        assert!(p.check_container(&ContainerFormat::Cmaf).is_ok());
+        assert!(p.check_container(&ContainerFormat::Fmp4).is_ok());
+        assert!(p.check_container(&ContainerFormat::Iso).is_ok());
+    }
+
+    #[test]
+    fn policy_check_container_allowlist() {
+        let p = PolicyConfig {
+            allowed_containers: Some(vec![ContainerFormat::Cmaf]),
+            ..Default::default()
+        };
+        assert!(p.check_container(&ContainerFormat::Cmaf).is_ok());
+        assert!(p.check_container(&ContainerFormat::Fmp4).is_err());
+    }
+
+    #[test]
+    fn policy_check_container_empty_denies_all() {
+        let p = PolicyConfig {
+            allowed_containers: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(p.check_container(&ContainerFormat::Cmaf).is_err());
+        assert!(p.check_container(&ContainerFormat::Fmp4).is_err());
+    }
+
+    #[test]
+    fn policy_config_serde_roundtrip() {
+        let p = PolicyConfig {
+            allowed_schemes: Some(vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs]),
+            allowed_formats: Some(vec![OutputFormat::Hls]),
+            allowed_containers: Some(vec![ContainerFormat::Cmaf, ContainerFormat::Fmp4]),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: PolicyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.allowed_schemes.as_ref().unwrap().len(), 2);
+        assert_eq!(parsed.allowed_formats.as_ref().unwrap().len(), 1);
+        assert_eq!(parsed.allowed_containers.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn policy_config_serde_empty_json_defaults() {
+        let p: PolicyConfig = serde_json::from_str("{}").unwrap();
+        assert!(p.allowed_schemes.is_none());
+        assert!(p.allowed_formats.is_none());
+        assert!(p.allowed_containers.is_none());
+    }
+
+    #[test]
+    fn app_config_backward_compat_without_policy() {
+        // Old JSON without policy field should deserialize with defaults
+        let json = r#"{
+            "drm": {"speke_url": "https://speke.test/v2", "speke_auth": {"Bearer": "test"}, "system_ids": {"widevine": true, "playready": true}},
+            "cache": {"vod_max_age": 31536000, "live_manifest_max_age": 1}
+        }"#;
+        let parsed: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.policy.allowed_schemes.is_none());
+        assert!(parsed.policy.allowed_formats.is_none());
+        assert!(parsed.policy.allowed_containers.is_none());
+    }
+
+    #[test]
+    fn parse_policy_list_unset_returns_none() {
+        std::env::remove_var("EDGEPACK_TEST_POLICY_UNSET");
+        let result = parse_policy_list("EDGEPACK_TEST_POLICY_UNSET", |s| {
+            EncryptionScheme::from_str_value(s)
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_policy_list_empty_returns_empty_vec() {
+        std::env::set_var("EDGEPACK_TEST_POLICY_EMPTY", "");
+        let result = parse_policy_list("EDGEPACK_TEST_POLICY_EMPTY", |s| {
+            EncryptionScheme::from_str_value(s)
+        });
+        assert_eq!(result, Some(vec![]));
+        std::env::remove_var("EDGEPACK_TEST_POLICY_EMPTY");
+    }
+
+    #[test]
+    fn parse_policy_list_single_value() {
+        std::env::set_var("EDGEPACK_TEST_POLICY_SINGLE", "cenc");
+        let result = parse_policy_list("EDGEPACK_TEST_POLICY_SINGLE", |s| {
+            EncryptionScheme::from_str_value(s)
+        });
+        assert_eq!(result, Some(vec![EncryptionScheme::Cenc]));
+        std::env::remove_var("EDGEPACK_TEST_POLICY_SINGLE");
+    }
+
+    #[test]
+    fn parse_policy_list_multiple_values() {
+        std::env::set_var("EDGEPACK_TEST_POLICY_MULTI", "cenc,cbcs");
+        let result = parse_policy_list("EDGEPACK_TEST_POLICY_MULTI", |s| {
+            EncryptionScheme::from_str_value(s)
+        });
+        assert_eq!(result, Some(vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs]));
+        std::env::remove_var("EDGEPACK_TEST_POLICY_MULTI");
+    }
+
+    #[test]
+    fn parse_policy_list_trims_whitespace() {
+        std::env::set_var("EDGEPACK_TEST_POLICY_WS", " cenc , cbcs ");
+        let result = parse_policy_list("EDGEPACK_TEST_POLICY_WS", |s| {
+            EncryptionScheme::from_str_value(s)
+        });
+        assert_eq!(result, Some(vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs]));
+        std::env::remove_var("EDGEPACK_TEST_POLICY_WS");
+    }
+
+    #[test]
+    fn parse_policy_list_ignores_unknown_values() {
+        std::env::set_var("EDGEPACK_TEST_POLICY_UNK", "cenc,aes256,cbcs");
+        let result = parse_policy_list("EDGEPACK_TEST_POLICY_UNK", |s| {
+            EncryptionScheme::from_str_value(s)
+        });
+        // aes256 is ignored, only cenc and cbcs are parsed
+        assert_eq!(result, Some(vec![EncryptionScheme::Cenc, EncryptionScheme::Cbcs]));
+        std::env::remove_var("EDGEPACK_TEST_POLICY_UNK");
     }
 
     #[test]

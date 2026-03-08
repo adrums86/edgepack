@@ -319,11 +319,18 @@ fn ensure_jit_setup(
         let target_scheme = EncryptionScheme::from_str_value(scheme_str)
             .unwrap_or(ctx.config.jit.default_target_scheme);
 
+        // Belt-and-suspenders policy check: enforce scheme policy for schemes
+        // resolved from JIT defaults (not already checked at route level).
+        ctx.config.policy.check_scheme(&target_scheme)?;
+
         let source_config = resolve_source_config(
             content_id,
             &ctx.config,
             Some(scheme_str),
         )?;
+
+        // Enforce container format policy on the resolved source config.
+        ctx.config.policy.check_container(&source_config.container_format)?;
 
         let pipeline = RepackagePipeline::new(ctx.config.clone());
 

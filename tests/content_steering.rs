@@ -1,7 +1,7 @@
 //! Integration tests for Phase 14: Content Steering & CDN Optimization.
 //!
 //! Tests content steering tag/element rendering in HLS master playlists and DASH MPDs,
-//! DASH source manifest extraction, serde roundtrips, and webhook override behavior.
+//! DASH source manifest extraction, serde roundtrips, and request override behavior.
 
 mod common;
 
@@ -305,10 +305,10 @@ fn repackage_request_no_steering_backward_compat() {
 
 #[test]
 fn content_steering_config_override_priority() {
-    // Simulate the override logic: webhook config > source config
-    let webhook_steering = Some(ContentSteeringConfig {
-        server_uri: "https://webhook-steer.example.com".into(),
-        default_pathway_id: Some("webhook-cdn".into()),
+    // Simulate the override logic: request config > source config
+    let request_steering = Some(ContentSteeringConfig {
+        server_uri: "https://request-steer.example.com".into(),
+        default_pathway_id: Some("request-cdn".into()),
         query_before_start: None,
     });
     let source_steering = Some(ContentSteeringConfig {
@@ -317,24 +317,24 @@ fn content_steering_config_override_priority() {
         query_before_start: Some(true),
     });
 
-    // Webhook should take precedence
-    let effective = webhook_steering.clone().or(source_steering.clone());
+    // Request config should take precedence
+    let effective = request_steering.clone().or(source_steering.clone());
     let cs = effective.unwrap();
-    assert_eq!(cs.server_uri, "https://webhook-steer.example.com");
-    assert_eq!(cs.default_pathway_id.as_deref(), Some("webhook-cdn"));
+    assert_eq!(cs.server_uri, "https://request-steer.example.com");
+    assert_eq!(cs.default_pathway_id.as_deref(), Some("request-cdn"));
 }
 
 #[test]
-fn content_steering_source_used_when_no_webhook() {
-    // When webhook doesn't set steering, source config should be used
-    let webhook_steering: Option<ContentSteeringConfig> = None;
+fn content_steering_source_used_when_no_request_override() {
+    // When request doesn't set steering, source config should be used
+    let request_steering: Option<ContentSteeringConfig> = None;
     let source_steering = Some(ContentSteeringConfig {
         server_uri: "https://source-steer.example.com".into(),
         default_pathway_id: Some("source-cdn".into()),
         query_before_start: Some(true),
     });
 
-    let effective = webhook_steering.or(source_steering);
+    let effective = request_steering.or(source_steering);
     let cs = effective.unwrap();
     assert_eq!(cs.server_uri, "https://source-steer.example.com");
     assert_eq!(cs.default_pathway_id.as_deref(), Some("source-cdn"));
@@ -342,8 +342,8 @@ fn content_steering_source_used_when_no_webhook() {
 
 #[test]
 fn content_steering_none_when_both_absent() {
-    let webhook_steering: Option<ContentSteeringConfig> = None;
+    let request_steering: Option<ContentSteeringConfig> = None;
     let source_steering: Option<ContentSteeringConfig> = None;
-    let effective = webhook_steering.or(source_steering);
+    let effective = request_steering.or(source_steering);
     assert!(effective.is_none());
 }

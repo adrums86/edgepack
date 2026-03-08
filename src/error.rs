@@ -38,6 +38,9 @@ pub enum EdgepackError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("IO error: {0}")]
     Io(String),
 }
@@ -121,6 +124,12 @@ mod tests {
     fn error_display_not_found() {
         let e = EdgepackError::NotFound("segment 5".into());
         assert_eq!(e.to_string(), "not found: segment 5");
+    }
+
+    #[test]
+    fn error_display_forbidden() {
+        let e = EdgepackError::Forbidden("scheme cenc is not allowed".into());
+        assert_eq!(e.to_string(), "forbidden: scheme cenc is not allowed");
     }
 
     #[test]

@@ -2,14 +2,14 @@
 //!
 //! Tests the full HTTP request flow:
 //! - Route matching for all endpoints
-//! - Webhook payload validation
+//! - Source config payload validation
 //! - Error responses for invalid inputs
 //! - Cache-Control header correctness
 
 mod common;
 
 use edgepack::config::{
-    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, SpekeAuth,
+    AppConfig, CacheConfig, DrmConfig, DrmSystemIds, JitConfig, PolicyConfig, SpekeAuth,
 };
 use edgepack::handler::{route, HandlerContext, HttpMethod, HttpRequest, HttpResponse};
 
@@ -23,6 +23,7 @@ fn test_context() -> HandlerContext {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
+            policy: PolicyConfig::default(),
         },
     }
 }

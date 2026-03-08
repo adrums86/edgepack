@@ -25,6 +25,7 @@
 | 22 | TS Segment Output (feature-gated) | Done |
 | 24 | Spec Compliance Fixes | Done |
 | 25 | Manifest Correctness Fixes | Done |
+| 26 | Runtime Policy Controls | Done |
 
 ---
 
@@ -49,7 +50,19 @@ Derived from the full audit conducted 2026-03-08 (see `edgepack-audit-2026-03-08
 
 ---
 
-### Phase 26: Error Handling Hardening — P1
+### ~~Phase 26: Runtime Policy Controls — P1~~ Done
+
+- `PolicyConfig` with fail-closed allowlist model (`Option<Vec<_>>`: `None` = no restriction, `Some(vec![])` = full lockdown).
+- `Forbidden(String)` error variant → HTTP 403 in WASI handler.
+- **Route-level enforcement**: `parse_and_check_policy()` checks output format and explicit encryption scheme before any cache lookup or JIT setup.
+- **JIT setup enforcement**: Scheme checked after JIT default resolution; container format checked after source config resolution.
+- Env vars: `POLICY_ALLOWED_SCHEMES`, `POLICY_ALLOWED_FORMATS`, `POLICY_ALLOWED_CONTAINERS` (comma-separated allowlists).
+- Health check and source config registration unaffected by policy.
+- 28 integration tests in `tests/policy.rs`, 32 unit tests across `config.rs` and `handler/mod.rs`.
+
+---
+
+### Phase 27: Error Handling Hardening — P1
 
 Replace panicking code with fallible error handling for defense-in-depth.
 
@@ -67,7 +80,7 @@ Replace panicking code with fallible error handling for defense-in-depth.
 
 ---
 
-### Phase 27: Hot Path Performance Optimization — P2
+### Phase 28: Hot Path Performance Optimization — P2
 
 Performance improvements to the segment rewriting and manifest rendering hot paths.
 
@@ -101,7 +114,7 @@ Performance improvements to the segment rewriting and manifest rendering hot pat
 
 ---
 
-### Phase 28: DASH Manifest Polish — P2
+### Phase 29: DASH Manifest Polish — P2
 
 Low-severity DASH spec improvements.
 
@@ -132,7 +145,7 @@ Monitor binary size as new features land. Feature-gate only when a phase introdu
 
 ---
 
-### Phase 29: Feature Gaps — P2
+### Phase 30: Feature Gaps — P2
 
 Features present in competing JIT packagers (AWS MediaPackage, USP, Broadpeak) but missing from edgepack.
 

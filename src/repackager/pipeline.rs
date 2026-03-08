@@ -2005,6 +2005,7 @@ mod tests {
             },
             cache: CacheConfig::default(),
             jit: JitConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 

@@ -264,6 +264,7 @@ async fn handle_repackage(
         },
         cache: CacheConfig::default(),
         jit: JitConfig::default(),
+        policy: edgepack::config::PolicyConfig::default(),
     };
 
     let container_format_str = payload.container_format.clone();

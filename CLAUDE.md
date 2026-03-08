@@ -43,7 +43,7 @@ The WASM target requires `rustup target add wasm32-wasip2`. The `.cargo/config.t
 src/
 ├── lib.rs              Module root (re-exports all submodules)
 ├── error.rs            EdgepackError enum + Result<T> alias
-├── config.rs           AppConfig loaded from env vars
+├── config.rs           AppConfig loaded from env vars (drm, cache, jit, policy)
 ├── url.rs              Lightweight URL parser (replaces `url` crate — saves ~200 KB in WASM)
 ├── http_client.rs      Shared outgoing HTTP client (WASI wasi:http/outgoing-handler)
 ├── wasi_handler.rs     WASI incoming handler bridge (wasm32 only)
@@ -302,7 +302,7 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 ## Error Handling
 
-All modules use `crate::error::Result<T>` which aliases `std::result::Result<T, EdgepackError>`. The `EdgepackError` enum has specific variants for each subsystem (Cache, Drm, Speke, Cpix, Encryption, MediaParse, SegmentRewrite, Manifest, Http, Config, InvalidInput, NotFound, Io). Use `thiserror` derive macros. Propagation is via `?` operator throughout.
+All modules use `crate::error::Result<T>` which aliases `std::result::Result<T, EdgepackError>`. The `EdgepackError` enum has specific variants for each subsystem (Cache, Drm, Speke, Cpix, Encryption, MediaParse, SegmentRewrite, Manifest, Http, Config, InvalidInput, NotFound, Forbidden, Io). Use `thiserror` derive macros. Propagation is via `?` operator throughout. `Forbidden` maps to HTTP 403 in the WASI handler — used by runtime policy controls.
 
 ## Runtime Implementation
 
@@ -375,7 +375,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,300 tests** without optional features. With `--features ts`: **1,462 tests**. All run on the native host target.
+The project has **1,360 tests** without optional features. With `--features ts`: **1,522 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -441,6 +441,7 @@ tests/
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
 ├── ts_output.rs              46 tests: ContainerFormat::Ts (serde, extension, validation), HLS-TS manifest (no EXT-X-MAP, VERSION:3, AES-128 KEY, .ts URIs), TS muxer (PAT/PMT/PES roundtrip, AVCC↔AnnexB, ADTS, encryption), TS validation, key endpoint routing, handler routing (ts feature)
 ├── output_integrity.rs       25 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants, TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip
+├── policy.rs                 28 tests: runtime policy controls — format denial (manifest/init/segment/iframes/key, all extensions), scheme denial (cenc/cbcs/none, qualified/unqualified URLs), combined policies, full lockdown, backward compat, health/source unaffected, serde roundtrips
 └── wasm_binary_size.rs        1 test: WASM binary size guard (base ≤750 KB)
 ```
 
@@ -552,6 +553,14 @@ Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mo
 | `JIT_DEFAULT_CONTAINER_FORMAT` | No | `cmaf` | Default format: `cmaf` or `fmp4` |
 | `JIT_LOCK_TTL` | No | `30` | Processing lock TTL in seconds |
 
+### Runtime Policy Controls
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `POLICY_ALLOWED_SCHEMES` | No | — (all allowed) | Comma-separated allowlist: `cenc`, `cbcs`, `none`. Unset = no restriction. Empty = deny all. |
+| `POLICY_ALLOWED_FORMATS` | No | — (all allowed) | Comma-separated allowlist: `hls`, `dash`. Unset = no restriction. Empty = deny all. |
+| `POLICY_ALLOWED_CONTAINERS` | No | — (all allowed) | Comma-separated allowlist: `cmaf`, `fmp4`, `iso`, `ts`. Unset = no restriction. Empty = deny all. |
+
 ## ISOBMFF Box Types
 
 The parser handles these box types (defined in `media::box_type`):
@@ -579,4 +588,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, 22, 24, and 25 are complete. Active roadmap derived from 2026-03-08 audit: P1: Phase 26 (Error Handling). P2: Phases 18, 27–29 (Binary Size, Performance, DASH Polish, Feature Gaps). P3: Phase 23 (MoQ Ingest).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, 22, 24, 25, and 26 are complete. Active roadmap derived from 2026-03-08 audit: P1: Phase 27 (Error Handling). P2: Phases 18, 28–30 (Binary Size, Performance, DASH Polish, Feature Gaps). P3: Phase 23 (MoQ Ingest).

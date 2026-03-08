@@ -124,6 +124,7 @@ fn read_incoming_body(request: &IncomingRequest) -> Result<Option<Vec<u8>>, Edge
 fn error_to_http_response(err: &EdgepackError) -> HttpResponse {
     let (status, message) = match err {
         EdgepackError::NotFound(msg) => (404, msg.clone()),
+        EdgepackError::Forbidden(msg) => (403, msg.clone()),
         EdgepackError::InvalidInput(msg) => (400, msg.clone()),
         EdgepackError::Config(msg) => (
             500,
