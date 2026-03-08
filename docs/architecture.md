@@ -115,7 +115,7 @@ graph TD
     subgraph Handler["handler/"]
         Router["mod.rs<br/>route() dispatcher<br/>HttpRequest/Response"]
         Request["request.rs<br/>GET handlers"]
-        Webhook["webhook.rs<br/>POST /config/source<br/>JIT source config"]
+        SourceCfg["Source config<br/>via in-process cache"]
     end
 
     subgraph Repackager["repackager/"]
@@ -140,10 +140,8 @@ graph TD
     Sandbox --> RPipeline
 
     Router --> Request
-    Router --> Webhook
     Request --> CacheMod2
     Request --> Manifest
-    Webhook --> RPipeline
 
     RPipeline --> Media
     RPipeline --> DRMMod
@@ -510,8 +508,8 @@ flowchart TD
 ### ~~Phase 8: JIT Packaging (On-Demand GET)~~ ✅ Complete
 - Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging on cache miss)
 - Request coalescing via `set_nx` distributed locking with configurable TTL
-- `POST /config/source` endpoint for per-content source configuration
 - URL pattern-based source resolution with `{content_id}` placeholder
+- Per-content source configuration via in-process cache
 
 ### ~~Phase 9: LL-HLS & LL-DASH~~ ✅ Complete
 - LL-HLS partial segments: `#EXT-X-PART`, `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PRELOAD-HINT`
@@ -532,7 +530,7 @@ flowchart TD
 
 ### ~~Phase 11: Advanced DRM~~ ✅ Complete
 - ClearKey DRM system ID (`e2719d58-a985-b3c9-781a-b030af78d30e`) with local PSSH builder (JSON `{"kids":["base64url"]}`)
-- Raw key mode: accept encryption keys directly via webhook, bypass SPEKE
+- Raw key mode: accept encryption keys directly via request config, bypass SPEKE
 - Key rotation: per-period key rotation at configurable segment boundaries, new DRM signaling per period
 - Clear lead: first N segments unencrypted, manifest transition at boundary
 - DRM systems override: explicit selection of widevine/playready/fairplay/clearkey per request
@@ -549,7 +547,7 @@ flowchart TD
 - Sandbox writes `iframes.m3u8` alongside regular HLS output
 
 ### ~~Phase 21: Generic HLS/DASH Pipeline (Dual-Format)~~ ✅ Complete
-- `RepackageRequest.output_formats: Vec<OutputFormat>` replaces singular `output_format` — backward-compatible webhook API
+- `RepackageRequest.output_formats: Vec<OutputFormat>` replaces singular `output_format` — backward-compatible API
 - Format-agnostic segment cache keys: `ep:{id}:{scheme}:init` and `ep:{id}:{scheme}:seg:{n}` (no format prefix — segments are identical for HLS and DASH)
 - Per-format manifest state: `ep:{id}:{format}_{scheme}:manifest_state` stays format-qualified (manifests differ per format)
 - `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair
@@ -564,7 +562,7 @@ flowchart TD
 - HLS manifest: no `#EXT-X-MAP`, `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"`, `#EXT-X-VERSION:3`, `.ts` segment URIs
 - Key delivery endpoint: `GET /repackage/{id}/{format}/key` serves raw 16-byte AES key
 - Pipeline: `TsMuxConfig` extracted from init segment, segments muxed via `mux_to_ts()`
-- Validation: TS+DASH rejected, webhook accepts `"ts"` as container_format
+- Validation: TS+DASH rejected, source config accepts `"ts"` as container_format
 
 ## Planned Architecture Extensions
 

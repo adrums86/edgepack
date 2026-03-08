@@ -93,7 +93,7 @@ fn default_target_schemes() -> Vec<EncryptionScheme> {
 /// Per-content source configuration for JIT packaging.
 ///
 /// Maps a `content_id` to its source parameters, enabling GET-triggered
-/// on-demand repackaging without a prior webhook call.
+/// on-demand repackaging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     /// URL of the source manifest.

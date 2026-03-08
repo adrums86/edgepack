@@ -87,8 +87,7 @@ src/
 │   └── progressive.rs  ProgressiveOutput state machine (AwaitingFirstSegment→Live→Complete)
 └── handler/            HTTP request handling
     ├── mod.rs          Router, HttpRequest/HttpResponse/HandlerContext, route() dispatcher
-    ├── request.rs      On-demand GET handlers (manifest, init, segment)
-    └── webhook.rs      POST /config/source handler (JIT source registration)
+    └── request.rs      On-demand GET handlers (manifest, init, segment)
 ```
 
 ## Architecture Diagrams
@@ -315,7 +314,6 @@ All HTTP transport and request handling is fully implemented:
 5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. `execute()` processes all segments synchronously and returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` with per-(format, scheme) output data in memory. Decrypts source segments once and re-encrypts for each target scheme, then distributes to all output formats.
 6. **`manifest/hls_input.rs` + `dash_input.rs`**: Source manifest input parsers extracting segment URLs, durations, init segment references, and live/VOD detection.
 7. **`handler/request.rs`**: GET handlers use `cache::global_cache()` for DRM key and JIT state lookups. On cache miss, JIT fallback triggers source fetching and repackaging on demand.
-8. **`handler/webhook.rs`**: Handles `POST /config/source` for JIT source registration — stores source URL and config in the global cache for later on-demand processing.
 
 ## Local Sandbox
 
@@ -375,7 +373,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,360 tests** without optional features. With `--features ts`: **1,522 tests**. All run on the native host target.
+The project has **1,346 tests** without optional features. With `--features ts`: **1,508 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -407,7 +405,7 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through pipeline, TrackKeyMapping construction and serialization, variant building from track metadata
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (all 8 extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a, .ts), all route dispatching
-- **Source config validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_schemes parsing (cenc/cbcs/none), container_format parsing (cmaf/fmp4/iso/ts), serde roundtrips
+- **Source config serde**: SourceConfig roundtrips, target_schemes parsing (cenc/cbcs/none), container_format parsing (cmaf/fmp4/iso/ts)
 - **Error variants**: Display output for every EdgepackError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
@@ -421,27 +419,27 @@ tests/
 ├── common/
 │   └── mod.rs                 Shared fixtures: synthetic ISOBMFF builders, test keys, DRM key sets, manifest states
 ├── clear_content.rs           10 tests: clear→CENC/CBCS, encrypted→clear, clear→clear (init + segment), roundtrips
-├── dual_format.rs             25 tests: multi-format output, format-agnostic cache keys, dual-format manifests, output_formats parsing, serde roundtrips
-├── dual_scheme.rs             22 tests: scheme-qualified routing, cache keys, multi-scheme parsing, backward compat
+├── dual_format.rs             20 tests: multi-format output, format-agnostic cache keys, dual-format manifests, output_formats parsing, serde roundtrips
+├── dual_scheme.rs             15 tests: scheme-qualified routing, cache keys, multi-scheme parsing, backward compat
 ├── encryption_roundtrip.rs    8 tests: CBCS→plaintext→CENC full pipeline
 ├── isobmff_integration.rs    18 tests: init/media segment parsing, rewriting (scheme + container format aware), PSSH/senc roundtrips
-├── jit_packaging.rs           27 tests: JIT source config, on-demand setup, lock contention, backward compat
+├── jit_packaging.rs           22 tests: JIT source config, on-demand setup, lock contention, backward compat
 ├── manifest_integration.rs   23 tests: progressive output lifecycle, DRM signaling, cache headers, ISO BMFF format
-├── handler_integration.rs    32 tests: HTTP routing (all 8 segment extensions incl. .ts), response helpers
+├── handler_integration.rs    26 tests: HTTP routing (all 8 segment extensions incl. .ts), response helpers
 ├── multi_key.rs              12 tests: per-track tenc, multi-KID PSSH, single-key backward compat, codec extraction, TrackKeyMapping serde, create→strip roundtrip
 ├── conformance.rs            23 tests: init/media segment structure validation, roundtrip conformance, manifest conformance
-├── scte35_integration.rs     13 tests: emsg extraction, SCTE-35 parsing, HLS/DASH ad rendering, source manifest roundtrip, serde
+├── scte35_integration.rs     14 tests: emsg extraction, SCTE-35 parsing, HLS/DASH ad rendering, source manifest roundtrip, serde
 ├── advanced_drm.rs           15 tests: ClearKey, raw key mode, key rotation, clear lead, DRM systems override
 ├── ll_hls_dash.rs            16 tests: chunk detection, LL-HLS/LL-DASH parsing+rendering, progressive parts, serde
 ├── trick_play.rs             27 tests: HLS I-frame playlist (BYTERANGE, DRM, endlist, disabled), master I-frame stream, DASH trick play, serde compat, container formats, route handling
-├── dvr_window.rs             25 tests: HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats
+├── dvr_window.rs             27 tests: HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats
 ├── content_steering.rs       20 tests: HLS master steering tag (full, URI-only, position, backward compat), DASH steering element (full, proxy-only, qbs, position), DASH input parsing (full, minimal, backward compat), serde roundtrips, override priority
 ├── cache_control.rs          43 tests: system defaults (HLS/DASH, all phases), per-request overrides (live/final/segment max-age, s-maxage split, immutable toggle), safety invariants, progressive output integration (HLS + DASH), backward compat, DVR + cache control, container format + cache control, system CacheConfig overrides, DASH per-request overrides, segment handler design documentation, JIT cache_control:None documentation
 ├── e2e.rs                   105 tests: full pipeline E2E — encryption transforms ×2 formats (18), container×format×encryption matrix (18), feature combinations incl. DVR+iframes+DRM+steering+dual-format (30), lifecycle phase transitions (18), edge cases & boundary conditions (21)
 ├── ts_integration.rs         30 tests: TS demux, transmux, AES-128, HLS TS detection, full pipeline (ts feature)
-├── ts_output.rs              46 tests: ContainerFormat::Ts (serde, extension, validation), HLS-TS manifest (no EXT-X-MAP, VERSION:3, AES-128 KEY, .ts URIs), TS muxer (PAT/PMT/PES roundtrip, AVCC↔AnnexB, ADTS, encryption), TS validation, key endpoint routing, handler routing (ts feature)
-├── output_integrity.rs       25 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants, TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip
-├── policy.rs                 28 tests: runtime policy controls — format denial (manifest/init/segment/iframes/key, all extensions), scheme denial (cenc/cbcs/none, qualified/unqualified URLs), combined policies, full lockdown, backward compat, health/source unaffected, serde roundtrips
+├── ts_output.rs              43 tests: ContainerFormat::Ts (serde, extension, validation), HLS-TS manifest (no EXT-X-MAP, VERSION:3, AES-128 KEY, .ts URIs), TS muxer (PAT/PMT/PES roundtrip, AVCC↔AnnexB, ADTS, encryption), TS validation, key endpoint routing, handler routing (ts feature)
+├── output_integrity.rs       21 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants, TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip
+├── policy.rs                 27 tests: runtime policy controls — format denial (manifest/init/segment/iframes/key, all extensions), scheme denial (cenc/cbcs/none, qualified/unqualified URLs), combined policies, full lockdown, backward compat, health unaffected, serde roundtrips
 └── wasm_binary_size.rs        1 test: WASM binary size guard (base ≤750 KB)
 ```
 
@@ -519,7 +517,6 @@ Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mo
 | GET | `/repackage/{id}/{format}/iframes` | `request::handle_iframe_manifest_request` | Serve HLS I-frame playlist (DASH returns 404 — trick play embedded in MPD) |
 | GET | `/repackage/{id}/{format}/key` | `request::handle_key_request` | Serve raw AES-128 key for HLS-TS `#EXT-X-KEY` (TS container only) |
 | GET | `/repackage/{id}/{format}/segment_{n}.{ext}` | `request::handle_media_segment_request` | Serve repackaged media segment (accepts all 8 extensions incl. `.ts`) |
-| POST | `/config/source` | `webhook::handle_source_config` | Register per-content source config for JIT packaging |
 
 `{format}` is a plain format (`hls`, `dash`) or a scheme-qualified format (`hls_cenc`, `hls_cbcs`, `dash_cenc`, `dash_cbcs`, `hls_none`, `dash_none`). Scheme-qualified routes are produced by dual-scheme requests; plain routes still work for backward compatibility (single-scheme requests).
 

@@ -198,7 +198,7 @@ impl PolicyConfig {
 pub struct JitConfig {
     /// URL pattern for resolving source manifests from content IDs.
     /// Use `{content_id}` as a placeholder, e.g. "https://origin.example.com/{content_id}/manifest.m3u8".
-    /// If not set, per-content source config must be registered via `POST /config/source`.
+    /// If not set, source config must be pre-populated in the cache.
     pub source_url_pattern: Option<String>,
     /// Default target encryption scheme when not specified in the request URL.
     pub default_target_scheme: EncryptionScheme,

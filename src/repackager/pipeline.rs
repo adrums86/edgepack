@@ -235,7 +235,7 @@ impl RepackagePipeline {
                     progressive.set_dvr_window_duration(dvr_window);
                 }
 
-                // Thread content steering (webhook override > source)
+                // Thread content steering (request override > source)
                 let effective_steering = request.content_steering.clone()
                     .or_else(|| source.content_steering.clone());
                 if let Some(cs) = effective_steering {
@@ -1278,7 +1278,7 @@ impl From<CachedKeySet> for DrmKeySet {
 /// Resolve source configuration for JIT packaging.
 ///
 /// Priority:
-/// 1. Redis cache (previously stored via `POST /config/source`)
+/// 1. In-process cache (pre-populated source config)
 /// 2. URL pattern from `JitConfig.source_url_pattern` (replaces `{content_id}`)
 /// 3. Error if neither is available
 ///

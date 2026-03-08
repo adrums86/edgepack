@@ -69,82 +69,6 @@ fn source_config_store_and_retrieve_roundtrip() {
     let _ = cache.delete(&key);
 }
 
-#[test]
-fn source_config_api_stores_in_cache() {
-    let ctx = test_context(test_config());
-
-    let payload = serde_json::json!({
-        "content_id": "jit-api-store-1",
-        "source_url": "https://origin.example.com/movie-1/manifest.m3u8",
-        "target_schemes": ["cenc", "cbcs"],
-        "container_format": "fmp4"
-    });
-    let body = serde_json::to_vec(&payload).unwrap();
-
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/config/source".to_string(),
-        headers: vec![],
-        body: Some(body),
-    };
-    let resp = route(&req, &ctx).unwrap();
-    assert_eq!(resp.status, 200);
-
-    // Verify it's stored in global cache
-    let cache = edgepack::cache::global_cache();
-    let stored = cache
-        .get(&CacheKeys::source_config("jit-api-store-1"))
-        .unwrap();
-    assert!(stored.is_some());
-    let config: SourceConfig = serde_json::from_slice(&stored.unwrap()).unwrap();
-    assert_eq!(
-        config.source_url,
-        "https://origin.example.com/movie-1/manifest.m3u8"
-    );
-    assert_eq!(config.target_schemes.len(), 2);
-
-    // Clean up
-    let _ = cache.delete(&CacheKeys::source_config("jit-api-store-1"));
-}
-
-#[test]
-fn source_config_api_rejects_empty_content_id() {
-    let ctx = test_context(test_config());
-
-    let payload = serde_json::json!({
-        "content_id": "",
-        "source_url": "https://example.com"
-    });
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/config/source".to_string(),
-        headers: vec![],
-        body: Some(serde_json::to_vec(&payload).unwrap()),
-    };
-    let result = route(&req, &ctx);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("content_id"));
-}
-
-#[test]
-fn source_config_api_rejects_empty_source_url() {
-    let ctx = test_context(test_config());
-
-    let payload = serde_json::json!({
-        "content_id": "test",
-        "source_url": ""
-    });
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/config/source".to_string(),
-        headers: vec![],
-        body: Some(serde_json::to_vec(&payload).unwrap()),
-    };
-    let result = route(&req, &ctx);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("source_url"));
-}
-
 // ─── JIT Route Handling — No Source Config ────────────────────────────────
 
 #[test]
@@ -412,21 +336,6 @@ fn jit_plain_format_returns_404_no_source() {
     };
     let resp = route(&req, &ctx).unwrap();
     // No source config → JIT falls through to 404
-    assert_eq!(resp.status, 404);
-}
-
-#[test]
-fn config_source_get_method_returns_404() {
-    // GET on /config/source should return 404 (only POST is valid)
-    let ctx = test_context(test_config());
-
-    let req = HttpRequest {
-        method: HttpMethod::Get,
-        path: "/config/source".to_string(),
-        headers: vec![],
-        body: None,
-    };
-    let resp = route(&req, &ctx).unwrap();
     assert_eq!(resp.status, 404);
 }
 

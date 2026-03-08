@@ -319,30 +319,6 @@ fn health_check_unaffected_by_policy() {
     assert_eq!(resp.body, b"ok");
 }
 
-// ─── Source config registration unaffected by policy ────────────────────
-
-#[test]
-fn source_config_registration_unaffected_by_policy() {
-    let ctx = test_context_with_policy(PolicyConfig {
-        allowed_formats: Some(vec![]),
-        allowed_schemes: Some(vec![]),
-        allowed_containers: Some(vec![]),
-    });
-    let payload = serde_json::json!({
-        "content_id": "pol-src-reg",
-        "source_url": "https://origin.example.com/manifest.m3u8"
-    });
-    let req = HttpRequest {
-        method: HttpMethod::Post,
-        path: "/config/source".to_string(),
-        headers: vec![],
-        body: Some(serde_json::to_vec(&payload).unwrap()),
-    };
-    // Source config POST should succeed even under full lockdown
-    let resp = route(&req, &ctx).unwrap();
-    assert_eq!(resp.status, 200);
-}
-
 // ─── Serde Backward Compatibility ───────────────────────────────────────
 
 #[test]

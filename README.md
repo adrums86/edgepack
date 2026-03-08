@@ -105,101 +105,14 @@ Tests run on the native host target (not WASM), since the test harness cannot ex
 cargo test --target $(rustc -vV | grep host | awk '{print $2}')
 ```
 
-On Apple Silicon Macs, this is equivalent to:
+The project includes **1,346 tests** without optional features. With `--features ts`: **1,508 tests**. See [`docs/testing.md`](docs/testing.md) for detailed coverage tables, fixtures, and benchmarks. Quick examples:
 
 ```bash
-cargo test --target aarch64-apple-darwin
+cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::            # specific module
+cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test e2e        # specific integration suite
+cargo test --target $(rustc -vV | grep host | awk '{print $2}') --features ts     # include TS tests
 ```
 
-On x86-64 Linux:
-
-```bash
-cargo test --target x86_64-unknown-linux-gnu
-```
-
-The project includes **1,290 tests** without optional features. With `--features ts`: **1,452 tests**. All tests cover every module, plus per-feature binary size guards, output integrity tests validating structural correctness of every input/output lane, and 105 end-to-end tests exercising full pipeline flows and feature combinations. To run tests for a specific module:
-
-```bash
-# Run all tests in the drm module
-cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::
-
-# Run a single test by name
-cargo test --target $(rustc -vV | grep host | awk '{print $2}') handler::tests::route_health_check
-
-# Run only integration tests
-cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test '*'
-
-# Run a specific integration test suite
-cargo test --target $(rustc -vV | grep host | awk '{print $2}') --test encryption_roundtrip
-```
-
-#### Unit Test Coverage
-
-| Module | Tests | What's Covered |
-|--------|-------|----------------|
-| `error` | 16 | Error display strings, Result alias |
-| `config` | 17 | Defaults, serde roundtrips, env var loading |
-| `url` | 14 | URL parsing, join (absolute/relative/protocol-relative, normalization), serde roundtrip, authority extraction |
-| `cache` | 76 | CacheKeys formatting (incl. scheme-qualified keys, format-agnostic keys), in-memory cache ops, encrypted backend (AES-128-CTR roundtrip, key sensitivity, IV uniqueness, key generation) |
-| `drm` | 121 | EncryptionScheme enum (serde, bytes, from_scheme_type, from_str_value, HLS methods, IV sizes, patterns, FairPlay flags, `is_encrypted()`, None variant), SampleDecryptor/SampleEncryptor (factory dispatch, CBCS/CENC roundtrips), system IDs, CPIX XML, SPEKE client (incl. ClearKey) |
-| `media` | 272 | FourCC types, ISOBMFF box parsing/building/iteration, ContainerFormat enum, init segment rewriting (scheme-aware, container-format-aware, sinf injection/stripping, ftyp rewriting, per-track tenc with TrackKeyMapping, multi-KID PSSH generation), segment rewriting (four-way dispatch), IV padding, codec string extraction (AVC/HEVC/AAC/VP9/AV1/AC-3/EC-3/Opus/FLAC/WebVTT/TTML), track metadata parsing (hdlr, mdhd timescale + language, stsd sample entries), TrackKeyMapping (single/per_type/from_tracks, serde roundtrip), emsg box parsing (v0/v1) + builder roundtrips, SCTE-35 splice_info_section parsing (splice_insert, time_signal), codec/scheme compatibility validation, HDR format detection, init/segment structure validation (incl. chunk detection, TS demux, transmux -- ts feature) |
-| `manifest` | 177 | HLS/DASH rendering for all lifecycle phases, DRM scheme signaling, FairPlay key URI, variant streams, subtitle rendition groups (HLS `TYPE=SUBTITLES`, DASH text AdaptationSet), CEA-608/708 closed caption signaling (HLS `TYPE=CLOSED-CAPTIONS` with `INSTREAM-ID`, DASH `Accessibility` descriptors), audio/subtitle language attributes, ISO 8601 duration, KID formatting, HLS/DASH input parsing (source scheme detection, `#EXT-X-DATERANGE` SCTE-35 ad breaks, DASH `EventStream` parsing), ad break manifest rendering (`#EXT-X-DATERANGE`, DASH `EventStream`), I-frame playlist rendering (`#EXT-X-I-FRAMES-ONLY`, `#EXT-X-BYTERANGE`), master playlist I-frame stream signaling (incl. LL-HLS/LL-DASH types and rendering) |
-| `repackager` | 101 | Request types/serde, progressive output state machine, cache-control headers, key set caching, pipeline execution, DRM info building (multi-KID PSSH per system), track key mapping construction, variant building from tracks, sensitive data cleanup (incl. per-scheme, target_formats), I-frame info and enable_iframe_playlist methods (incl. raw keys, key rotation, clear lead, progressive parts), multi-format output types |
-| `handler` | 113 | HTTP routing, path parsing incl. scheme-qualified formats (`hls_cenc`, `dash_cbcs`), segment number parsing (all 7 extensions), source config validation (target_schemes, container_format), I-frame manifest handler, response construction |
-| `http_client` | 9 | Response construction, native stub errors |
-
-#### Integration Test Coverage
-
-Integration tests live in `tests/` and use synthetic CMAF fixtures — no external services or network required.
-
-| Test Suite | Tests | What's Covered |
-|------------|-------|----------------|
-| `advanced_drm` | 15 | Key rotation at segment boundaries, clear lead, ClearKey DRM, raw key mode |
-| `cache_control` | 43 | System defaults (HLS/DASH, all phases), per-request overrides (live/final/segment max-age, s-maxage split, immutable toggle), safety invariants (AwaitingFirstSegment always no-cache), progressive output integration (HLS + DASH), backward compat, DVR + cache control, container format + cache control, system CacheConfig overrides, DASH per-request overrides, segment handler design documentation, JIT cache_control:None documentation |
-| `clear_content` | 10 | Clear→CENC/CBCS, encrypted→clear, clear→clear, roundtrip pipelines |
-| `conformance` | 23 | Init segment structure (ftyp/sinf/pssh ordering), media segment structure (moof/mdat/senc), encryption roundtrip conformance, manifest correctness |
-| `content_steering` | 20 | HLS master steering tag (full, URI-only, position, backward compat), DASH steering element (full, proxy-only, qbs, position), DASH input parsing (full, minimal, backward compat), serde roundtrips, override priority |
-| `dual_format` | 25 | Multi-format output (HLS+DASH), format-agnostic cache keys, dual-format manifests, output_formats parsing, serde roundtrips, container format independence |
-| `dual_scheme` | 22 | Scheme-qualified route parsing, cache key uniqueness per scheme, multi-scheme parsing, backward compat, duplicate/invalid scheme rejection |
-| `dvr_window` | 25 | HLS DVR window (sliding window, media sequence, playlist type, DRM, iframes, ad breaks), DASH DVR (timeShiftBufferDepth, startNumber, windowed segments), live-to-VOD, serde compat, container formats |
-| `encryption_roundtrip` | 8 | CBCS→plaintext→CENC: full-sample, pattern, subsample, multi-sample IV, audio, cross-segment IV isolation |
-| `handler_integration` | 32 | HTTP routing for all endpoints, source config validation, HttpResponse helpers, method filtering |
-| `isobmff_integration` | 18 | Init segment rewriting (scheme/container-aware), PSSH generation, senc roundtrip, segment decrypt→re-encrypt→verify |
-| `ll_hls_dash` | 16 | LL-HLS partial segments, preload hints, server control, LL-DASH availability time offset, CMAF chunk boundary detection |
-| `manifest_integration` | 23 | Progressive output lifecycle (HLS+DASH, all container formats), DRM signaling, cache-control headers, ManifestState serde |
-| `multi_key` | 12 | Per-track tenc (video/audio KIDs), multi-KID PSSH generation, single-key backward compat, codec string extraction, TrackKeyMapping serde roundtrip, create→strip roundtrip, TrackKeyMapping::from_tracks |
-| `scte35_integration` | 13 | emsg extraction, SCTE-35 parsing, HLS/DASH ad break rendering, source manifest ad marker roundtrip, AdBreakInfo serde |
-| `trick_play` | 27 | HLS I-frame playlist rendering (BYTERANGE, DRM, init map, endlist, disabled), HLS master I-frame stream signaling, DASH trick play AdaptationSet, manifest dispatcher, serde backward compat, container format variations, route handling |
-| `ts_integration` | 30 | MPEG-TS demux, PES/TS packet parsing, TS-to-CMAF transmux, init segment synthesis, HLS-TS manifest parsing, AES-128 decryption (ts feature) |
-| `ts_output` | 46 | ContainerFormat::Ts (serde, extension, validation), HLS-TS manifest (no EXT-X-MAP, VERSION:3, AES-128 KEY, .ts URIs), TS muxer (PAT/PMT/PES roundtrip, AVCC↔AnnexB, ADTS, encryption), TS validation, key endpoint routing, handler routing (ts feature) |
-| `e2e` | 105 | Full pipeline E2E: encryption transforms ×2 formats (18), container×format×encryption matrix (18), feature combinations incl. DVR+iframes+DRM+steering+dual-format (30), lifecycle phase transitions (18), edge cases & boundary conditions (21) |
-| `output_integrity` | 25 | Rewritten segment ISOBMFF structure validation (all 4 encryption lanes), mdat/trun size consistency, encrypt-decrypt plaintext recovery, I-frame BYTERANGE chunk validation (pre/post rewrite), init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame), cache-control body invariants (manifest body unchanged with overrides, AwaitingFirstSegment safety), TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip |
-| `wasm_binary_size` | 1 | WASM binary size guard (base ≤750 KB) with function count reporting |
-
-All tests use shared fixtures from `tests/common/mod.rs` that build synthetic ISOBMFF data programmatically — no external test media files needed. Multi-key tests use separate video/audio KIDs and keys to verify per-track tenc, multi-KID PSSH, and TrackKeyMapping behavior.
-
-> **Note:** TS-specific tests require `--features ts`. Run with `--features ts` to include all 1,452 tests. Without optional features: 1,290 tests.
-
-#### JIT Latency Benchmarks
-
-[Criterion](https://docs.rs/criterion) benchmarks measure the core operations that determine first-byte latency in JIT mode:
-
-```bash
-# Run all benchmarks
-cargo bench --target $(rustc -vV | grep host | awk '{print $2}')
-
-# Run a specific benchmark group
-cargo bench --target $(rustc -vV | grep host | awk '{print $2}') --bench jit_latency -- segment_rewrite
-```
-
-| Benchmark Group | What's Measured |
-|----------------|-----------------|
-| `segment_rewrite` | Segment re-encryption at 4/32/128 samples × 1KB: CBCS→CENC, clear→CENC, passthrough |
-| `init_rewrite` | Init segment DRM scheme transform: CBCS→CENC, clear→CENC |
-| `manifest_render` | HLS/DASH manifest generation at 10/50/200 segments, HLS I-frame at 50 segments, HLS live at 6 segments |
-| `manifest_parse` | HLS/DASH manifest input parsing at 50 segments |
-
-Benchmarks run on native targets (not WASM). WASM performance is proportional but not identical — use binary size as the cold-start proxy for WASM instantiation latency.
 
 ## Configuration
 

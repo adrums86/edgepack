@@ -1,5 +1,4 @@
 pub mod request;
-pub mod webhook;
 
 use crate::config::AppConfig;
 use crate::drm::scheme::EncryptionScheme;
@@ -141,11 +140,6 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
             } else {
                 Ok(HttpResponse::not_found("unknown resource"))
             }
-        }
-
-        // Source config: POST /config/source (per-content source registration)
-        (HttpMethod::Post, ["config", "source"]) => {
-            webhook::handle_source_config(req, ctx)
         }
 
         _ => Ok(HttpResponse::not_found("not found")),
@@ -601,40 +595,6 @@ mod tests {
         assert_eq!(HttpMethod::Post, HttpMethod::Post);
         assert_eq!(HttpMethod::Options, HttpMethod::Options);
         assert_ne!(HttpMethod::Get, HttpMethod::Post);
-    }
-
-    #[test]
-    fn route_config_source_post() {
-        let ctx = test_context();
-        let payload = serde_json::json!({
-            "content_id": "movie-1",
-            "source_url": "https://origin.example.com/movie-1/manifest.m3u8"
-        });
-        let body = serde_json::to_vec(&payload).unwrap();
-        let req = HttpRequest {
-            method: HttpMethod::Post,
-            path: "/config/source".to_string(),
-            headers: vec![],
-            body: Some(body),
-        };
-        let resp = route(&req, &ctx).unwrap();
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body["status"], "ok");
-        assert_eq!(body["content_id"], "movie-1");
-    }
-
-    #[test]
-    fn route_config_source_wrong_method() {
-        let ctx = test_context();
-        let req = HttpRequest {
-            method: HttpMethod::Get,
-            path: "/config/source".to_string(),
-            headers: vec![],
-            body: None,
-        };
-        let resp = route(&req, &ctx).unwrap();
-        assert_eq!(resp.status, 404);
     }
 
     #[test]
