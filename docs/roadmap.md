@@ -1,358 +1,220 @@
-### Completed
+# edgepack Roadmap
+
+## Completed Phases
 
 | Phase | Name | Status |
 |-------|------|--------|
-| 1 | Core CBCS→CENC Conversion | ✅ |
-| 2 | Container Format Flexibility (CMAF + fMP4 + ISO) | ✅ |
-| 3 | Unencrypted Input Support (clear content paths) | ✅ |
-| 4 | Dual-Scheme Output (multi-rendition per request) | ✅ |
-| 5 | Multi-Key DRM & Codec Awareness | ✅ |
-| 6 | Subtitle & Text Track Pass-Through | ✅ |
-| 7 | SCTE-35 Ad Markers & Ad Break Signaling | ✅ |
-| 8 | JIT Packaging (On-Demand GET) | ✅ |
-| 9 | LL-HLS & LL-DASH | ✅ |
-| 10 | MPEG-TS Input (feature-gated) | ✅ |
-| 11 | Advanced DRM | ✅ |
-| 12 | Trick Play & I-Frame Playlists | ✅ |
-| 13 | DVR Window & Time-Shift | ✅ |
-| 14 | Content Steering & CDN Optimization | ✅ |
-| 16 | Compatibility Validation & Hardening | ✅ |
-| 17 | CDN Provider Adapters & Binary Optimization | ✅ |
-| 19 | Configurable Cache-Control Headers | ✅ |
-| 21 | Generic HLS/DASH Pipeline (Dual-Format) | ✅ |
-| 22 | TS Segment Output (feature-gated) | ✅ |
+| 1 | Core CBCS→CENC Conversion | Done |
+| 2 | Container Format Flexibility (CMAF + fMP4 + ISO) | Done |
+| 3 | Unencrypted Input Support (clear content paths) | Done |
+| 4 | Dual-Scheme Output (multi-rendition per request) | Done |
+| 5 | Multi-Key DRM & Codec Awareness | Done |
+| 6 | Subtitle & Text Track Pass-Through | Done |
+| 7 | SCTE-35 Ad Markers & Ad Break Signaling | Done |
+| 8 | JIT Packaging (On-Demand GET) | Done |
+| 9 | LL-HLS & LL-DASH | Done |
+| 10 | MPEG-TS Input (feature-gated) | Done |
+| 11 | Advanced DRM | Done |
+| 12 | Trick Play & I-Frame Playlists | Done |
+| 13 | DVR Window & Time-Shift | Done |
+| 14 | Content Steering & CDN Optimization | Done |
+| 16 | Compatibility Validation & Hardening | Done |
+| 17 | CDN Provider Adapters & Binary Optimization | Done |
+| 19 | Configurable Cache-Control Headers | Done |
+| 21 | Generic HLS/DASH Pipeline (Dual-Format) | Done |
+| 22 | TS Segment Output (feature-gated) | Done |
 
-# Refactoring Roadmap
+---
 
-The codebase is being generalized from a single-purpose CBCS→CENC converter into a generic lightweight edge repackager. Phases 1–14, 16, 17, 19, 21, and 22 are complete. All P0 and P1 items are done. Remaining phases (18, 23):
+## Active Roadmap
 
-### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
-- Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
-- Added ftyp brand rewriting in `src/media/init.rs` — 3 new tests
-- Wired `container_format` through `RepackageRequest`, `ManifestState`, pipeline, progressive output, and manifest renderers
-- Updated segment URI extensions dynamically, DASH profile signaling, and route handling for `.cmfv`/`.m4s`
-- Result: 541 tests total (466 unit + 75 integration), including binary size guard test
+Derived from the full audit conducted 2026-03-08 (see `edgepack-audit-2026-03-08.md`). Phases are ordered by priority.
 
-### ~~Phase 3: Unencrypted Input Support~~ ✅ Complete
-- Added `EncryptionScheme::None` variant with `is_encrypted()` method and all match arms in `scheme.rs`
-- Added panic arms in `sample_cryptor.rs` factory functions for None (should never be called)
-- Accepted `"none"` target_scheme, enabled sandbox for clear content
-- Added `create_protection_info()` in `init.rs` — inject sinf/schm/tenc/pssh into clear init segments (clear→encrypted)
-- Added `strip_protection_info()` in `init.rs` — remove sinf/pssh and restore original sample entries (encrypted→clear)
-- Added `rewrite_ftyp_only()` in `init.rs` — format-only conversion for clear→clear
-- Added four-way segment dispatch in `segment.rs` with optional source/target keys
-- Updated pipeline with conditional SPEKE, four-way init/segment dispatch, optional DRM info
-- Updated `ProgressiveOutput::new()` to accept `Option<ManifestDrmInfo>`
-- Result: 614 tests total (522 unit + 92 integration), including 10 new clear_content integration tests
+---
 
-### ~~Phase 4: Dual-Scheme Output~~ ✅ Complete
-- Result: 652 tests total (538 unit + 114 integration), including 22 new dual_scheme integration tests
-- Changed `RepackageRequest.target_scheme` to `target_schemes: Vec<EncryptionScheme>` with backward-compatible API
-- Scheme-qualified cache keys using `{format}_{scheme}` pattern (e.g. `ep:{id}:hls_cenc:seg:{n}`)
-- Scheme-qualified URL routes (e.g. `/repackage/{id}/hls_cenc/manifest`)
-- Pipeline `execute()` returns `Vec<(EncryptionScheme, ProgressiveOutput)>` — one output per scheme
-- Source segments decrypted once, re-encrypted for each target scheme
-- `cleanup_sensitive_data()` accepts `&[EncryptionScheme]` and deletes per-scheme rewrite params
-- Sandbox UI supports "Both (Dual-Scheme)" option, writes output per scheme
-- Scheme-qualified manifest URLs for each target scheme
+### Phase 24: Spec Compliance Fixes — P0
 
-### ~~Phase 5: Multi-Key DRM & Codec Awareness~~ ✅ Complete
-- Multi-key SPEKE requests for multiple KIDs in a single CPIX exchange
-- Per-track sinf/tenc via `hdlr` box parsing (video vs audio keying) with `TrackKeyMapping`
-- Multi-key PSSH v1 generation (grouped by system_id, all KIDs per system)
-- Codec string extraction from stsd (`avcC`, `hvcC`, `vpcC`, `av1C`, `esds` → codec strings)
-- Timescale parsing from `mdhd`
-- `TrackKeyMapping` threaded through pipeline, init rewriting, and PSSH building
-- Codec strings populated into `VariantInfo` for HLS/DASH manifest signaling
-- New: `src/media/codec.rs` (34 unit tests), `tests/multi_key.rs` (12 integration tests)
+Critical output correctness issues that must be fixed before production deployment.
 
-### ~~Phase 6: Subtitle & Text Track Pass-Through~~ ✅ Complete
-- WebVTT (`wvtt`) and TTML (`stpp`) sample entry pass-through in fMP4 (subtitles bypass encryption via `encrypted_sample_entry_type()` returning `None`)
-- `TrackMediaType::Subtitle` enum variant, `language` field on `VariantInfo` and `TrackInfo`
-- ISO 639-2/T language extraction from `mdhd` box (packed 3×5-bit chars)
-- Explicit `wvtt`/`stpp` codec string detection in `extract_codec_string()`
-- `CeaCaptionInfo` struct for CEA-608/708 manifest signaling (pass-through is automatic in video SEI NALs)
-- HLS subtitle rendition groups (`#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs"`) with `SUBTITLES="subs"` on `EXT-X-STREAM-INF`
-- HLS CEA caption signaling (`#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,INSTREAM-ID=...`) with `CLOSED-CAPTIONS="cc"` on `EXT-X-STREAM-INF`
-- DASH subtitle `<AdaptationSet contentType="text">` with language attribute
-- DASH CEA `<Accessibility schemeIdUri="urn:scte:dash:cc:cea-608:2015">` descriptors inside video AdaptationSet
-- Result: 825 tests total (at time of completion) (18 new subtitle/caption tests)
+**[H1] tenc box version for CBCS pattern encryption**
+- File: `src/media/init.rs:441`
+- `build_tenc()` hardcodes version 0. Per ISO/IEC 14496-12, version MUST be 1 when `default_crypt_byte_block` and `default_skip_byte_block` are non-zero (CBCS 1:9 pattern). Strict ISOBMFF parsers may ignore the pattern fields in a v0 tenc box.
+- Fix: set version to 1 when `pattern != (0, 0)`, keep version 0 for CENC `(0, 0)`.
+- Update tests in `init.rs`, `output_integrity.rs`, `conformance.rs` to verify version byte.
 
-### ~~Phase 7: SCTE-35 Ad Markers & Multi-Period DASH~~ ✅ Complete
-- `emsg` box parsing (v0/v1) with SCTE-35 splice_info_section binary parser (`src/media/scte35.rs`)
-- `EmsgBox` type with builder/parser in `cmaf.rs`, `extract_emsg_boxes()` in `segment.rs`
-- `AdBreakInfo` type in `manifest/types.rs`, threaded through pipeline → ProgressiveOutput → ManifestState
-- HLS ad markers via `#EXT-X-DATERANGE` with `SCTE35-CMD` hex encoding
-- DASH `<EventStream>` with SCTE-35 scheme URI and `<Event>` elements
-- Source manifest parsing: `#EXT-X-DATERANGE` in HLS input, `<EventStream>` in DASH input
-- New: `src/media/scte35.rs`, `tests/scte35_integration.rs` (13 integration tests)
-- Result: 948 tests total (at time of completion)
+**[H2] LL-HLS EXT-X-PART tag ordering**
+- File: `src/manifest/hls.rs:258-275`
+- Parts are emitted *after* the `#EXTINF` + URI of their parent segment. RFC 8216bis Section 4.4.4.9 requires `#EXT-X-PART` tags *before* the `#EXTINF` of the parent segment. Current ordering will break conformant LL-HLS players.
+- Fix: move the parts loop before the `#EXTINF` line for each segment.
+- Update tests in `hls.rs`, `ll_hls_dash.rs`, `output_integrity.rs`.
 
-### ~~Phase 8: JIT Packaging (On-Demand GET)~~ ✅ Complete
-- Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging on cache miss)
-- Request coalescing via `set_nx` distributed locking with configurable TTL
-- `POST /config/source` endpoint for per-content source configuration
-- URL pattern-based source resolution with `{content_id}` placeholder
-- JIT is always enabled (no feature flag required)
-- Result: 762 tests total (27 new JIT integration tests)
+---
 
-### ~~Phase 9: LL-HLS & LL-DASH~~ ✅ Complete
-- LL-HLS (`#EXT-X-PART`, `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PRELOAD-HINT`)
-- LL-DASH `availabilityTimeOffset` and `availabilityTimeComplete` on SegmentTemplate
-- CMAF chunk boundary detection (`src/media/chunk.rs`) for partial segment extraction
-- New types: `PartInfo`, `ServerControl`, `LowLatencyDashInfo`, `SourcePartInfo`
-- Progressive output part support (`add_part`, `part_data`, LL setters)
-- HLS version bump to 9 when LL-HLS parts present
-- Pipeline integration: chunk detection after segment rewriting, source LL info threading
-- New: `src/media/chunk.rs`, `tests/ll_hls_dash.rs` (16 integration tests)
-- Result: 1,072 tests total (at time of completion) (63 new tests)
+### Phase 25: Manifest Correctness Fixes — P1
 
-### ~~Phase 10: MPEG-TS Input~~ ✅ Complete
-- TS demuxer (PES/TS packets, PAT/PMT, H.264/H.265/AAC extraction)
-- TS-to-CMAF transmuxer, init segment synthesis from codec config (SPS/PPS → avcC, ADTS → esds)
-- AES-128-CBC whole-segment decryption for HLS-TS
-- HLS input TS detection (`.ts` extension, `#EXT-X-KEY:METHOD=AES-128` parsing, optional `#EXT-X-MAP`)
-- Pipeline integration: feature-gated `process_ts_segment()` — decrypt → demux → transmux → CMAF pipeline
-- All TS code behind `#[cfg(feature = "ts")]` — zero impact on non-ts builds
-- New: `src/media/ts.rs`, `src/media/transmux.rs`, `tests/ts_integration.rs` (30 integration tests)
-- Result: 1,151 tests total with `--features ts` (79 new ts-gated tests)
+Medium-severity spec compliance and correctness issues.
 
-### ~~Phase 11: Advanced DRM~~ ✅ Complete
-- ClearKey DRM system ID (`e2719d58-a985-b3c9-781a-b030af78d30e`) with PSSH builder
-- Raw key mode: accept encryption keys directly via `raw_keys` on request (bypass SPEKE)
-- Key rotation: per-period key rotation at configurable segment boundaries
-- Clear lead: first N segments unencrypted, then encrypted with manifest transition
-- DRM systems override: explicit selection of widevine/playready/fairplay/clearkey per request
-- HLS ClearKey KEY tag, DASH ClearKey ContentProtection element
-- New: `tests/advanced_drm.rs` (15 integration tests)
-- Result: 1,003 tests total (at time of completion) (55 new tests from baseline 948)
+**[M1] DASH SegmentTimeline missing @t for DVR**
+- File: `src/manifest/dash.rs:351-357`
+- When DVR sliding window is active (`startNumber > 0`), the first `<S>` element lacks a `@t` attribute. Per ISO 23009-1, the implicit start time is 0, creating a mismatch with actual segment presentation times.
+- Fix: compute `t = sum(durations of all segments before window)` and set `@t` on the first `<S>`.
+- Update tests in `dash.rs`, `dvr_window.rs`.
 
-### ~~Phase 12: Trick Play & I-Frame Playlists~~ ✅ Complete
-- HLS `#EXT-X-I-FRAMES-ONLY` media playlists with `#EXT-X-BYTERANGE` (byte ranges into existing rewritten segments — no duplicate storage)
-- HLS master playlist `#EXT-X-I-FRAME-STREAM-INF` for each video variant
-- DASH trick play `<AdaptationSet>` with `<EssentialProperty schemeIdUri="http://dashif.org/guidelines/trickmode">`
-- I-frame detection reuses existing `chunk.rs` infrastructure (first IDR chunk per segment)
-- `IFrameSegmentInfo` type, `enable_iframe_playlist` opt-in field (default false)
-- Dedicated route: `GET /repackage/{id}/{fmt}/iframes` for HLS I-frame playlist
-- DASH trick play embedded in regular MPD (no separate endpoint)
-- Sandbox writes `iframes.m3u8` alongside regular HLS output
-- New: `tests/trick_play.rs` (27 integration tests)
-- Result: 1,111 tests total (at time of completion) (39 new tests)
+**[M2] HLS EXT-X-DATERANGE wraps at 24 hours**
+- File: `src/manifest/hls.rs:239-247`
+- `START-DATE` calculation uses `(secs / 3600) % 24`, wrapping the date after 24 hours. Streams longer than 24h produce invalid ISO 8601 timestamps.
+- Fix: compute full days and format as `1970-01-{day}T{hh}:{mm}:{ss}.{ms}Z` or use a proper epoch-to-ISO-8601 conversion.
+- Update tests in `hls.rs`, `scte35_integration.rs`.
 
-### Phase 13: DVR Window & Time-Shift — P2 ✅
-- DVR sliding window manifests for live streams (configurable `dvr_window_duration`)
-- Segments filtered during rendering (ManifestState retains all segments for live-to-VOD transitions)
-- HLS: omits `PLAYLIST-TYPE:EVENT` when DVR active, dynamic `MEDIA-SEQUENCE`, windowed segments/parts/iframes/ad breaks
-- DASH: `timeShiftBufferDepth` attribute, dynamic `startNumber` in SegmentTimeline, windowed ad break events
-- Complete phase ignores window — full VOD manifest with all segments
-- Windowing helpers on ManifestState: `windowed_segments()`, `windowed_media_sequence()`, `windowed_iframe_segments()`, `windowed_parts()`, `windowed_ad_breaks()`, `is_dvr_active()`
-- Validation: `dvr_window_duration` must be positive when provided
-- New: `tests/dvr_window.rs` (25 integration tests)
-- Result: 1,154 tests total (at time of completion) (43 new tests)
+**[M3] HLS DVR windowed iterators for ad breaks and parts**
+- File: `src/manifest/hls.rs:232,263`
+- The HLS renderer iterates `&state.ad_breaks` and `&state.parts` instead of `state.windowed_ad_breaks()` and `state.windowed_parts()`. The DASH renderer already uses windowed versions correctly.
+- Fix: replace with windowed iterators to match DASH behavior.
+- Update tests in `hls.rs`, `dvr_window.rs`.
 
-### Phase 14: Content Steering & CDN Optimization — P2 ✅
-- Content steering directive injection in HLS master playlists (`#EXT-X-CONTENT-STEERING`) and DASH MPDs (`<ContentSteering>`)
-- Steering config on `RepackageRequest`: `server_uri`, `default_pathway_id`, `query_before_start`
-- DASH source pass-through: `<ContentSteering>` elements extracted from input MPDs and preserved in output
-- Override priority: request config takes precedence over source-extracted steering
-- New type: `ContentSteeringConfig` (server_uri, default_pathway_id, query_before_start)
-- `content_steering` field on `RepackageRequest` with validation (reject empty `server_uri`)
-- Pipeline threading in `execute()` path
-- HLS pass-through not applicable (edgepack parses media playlists; steering tag only in master playlists)
-- New: `tests/content_steering.rs` (20 integration tests)
-- Result: 1,290 tests total with `--features ts` (85 new phase tests + 18 output integrity tests)
-- Output integrity tests (`tests/output_integrity.rs`): structural validation of rewritten segments across all 4 encryption lanes (enc→enc, clear→enc, enc→clear, clear→clear), mdat/trun size consistency, encrypt-decrypt plaintext recovery roundtrip, I-frame BYTERANGE chunk validation, init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame)
-- Criterion benchmarks (`benches/jit_latency.rs`): segment rewrite latency (CBCS→CENC, clear→CENC, passthrough at 4/32/128 samples), init rewrite latency, manifest render/parse latency (HLS/DASH at varying segment counts)
+---
 
-### Phase 18: Binary Size Monitoring & Selective Feature Gating — P2
-The current binary (~628 KB base) is well within cold start budgets (<1 ms). Feature-gating pure Rust application logic (SCTE-35, validation, DASH rendering) yields only ~20–30 KB savings — not enough to justify the `#[cfg]` maintenance burden and test matrix explosion. The real binary size wins come from crate-level decisions (e.g., the lightweight `url.rs` saved ~200 KB vs the `url` crate).
+### Phase 26: Error Handling Hardening — P1
 
-**Policy:** Monitor binary size as new features land. Feature-gate only when a phase introduces a **heavy new dependency or parser** that meaningfully increases the binary (50+ KB). Existing examples of this approach:
-- `ts` feature (Phase 10): MPEG-TS demuxer + transmuxer adds a substantial new parser — feature-gated to keep it out of builds that don't need TS input
+Replace panicking code with fallible error handling for defense-in-depth.
 
-**Action items (reactive, not pre-emptive):**
+**[E1] Replace unwrap() with ok_or_else(?) in pipeline.rs**
+- Lines 178, 182, 205, 301, 324, 620, 624, 684 — `key_set.as_ref().unwrap()` and similar.
+- Logically safe due to preceding conditions, but should use `.ok_or_else(|| EdgepackError::Drm("...".into()))?` so that logic changes don't introduce panics.
+
+**[E2] Replace panic! with Result in public functions**
+- `container.rs:115` — `dash_profiles()` panics for `ContainerFormat::Ts`. Should return `Result`.
+- `sample_cryptor.rs:120,143` — `create_decryptor`/`create_encryptor` panic for `EncryptionScheme::None`. Should return `Result`.
+
+**[E3] Clamp parse_senc sample_count against data length**
+- `cmaf.rs:271` — `Vec::with_capacity(sample_count as usize)` where `sample_count` comes from untrusted ISOBMFF input. A crafted file with `sample_count = u32::MAX` causes OOM.
+- Fix: validate `sample_count * min_entry_size <= remaining_data_length` before allocating.
+
+---
+
+### Phase 27: Hot Path Performance Optimization — P2
+
+Performance improvements to the segment rewriting and manifest rendering hot paths.
+
+**[P1] SencEntry.iv inline representation**
+- File: `src/media/cmaf.rs` (SencEntry struct), consumed throughout `segment.rs`
+- `SencEntry.iv` is `Vec<u8>` but IVs are always 8 or 16 bytes. For a 128-sample segment, this causes 128 heap allocations during parse and 128 during rebuild.
+- Fix: change to `[u8; 16]` with a `u8` iv_len field. Eliminates heap allocation and makes IVs `Copy`. Also eliminates `.clone()` overhead on subsamples in the encrypt-to-encrypt path.
+- Impact: HIGH — innermost loop of the hottest path (per-sample crypto).
+
+**[P2] Fuse decrypt+encrypt loops in segment rewrite**
+- File: `src/media/segment.rs:104-155`
+- `rewrite_encrypted_to_encrypted` has separate decrypt (104-127) and re-encrypt (141-155) loops over the same samples. Fusing into a single pass halves iteration count and improves L1 cache locality.
+- Impact: MEDIUM — most impactful for large segments exceeding cache size.
+
+**[P3] Replace format!()+push_str() with write!() in manifest renderers**
+- Files: `src/manifest/hls.rs`, `src/manifest/dash.rs`
+- ~78 instances of `push_str(&format!(...))` creating temporary `String` allocations. `write!()` from `std::fmt::Write` writes directly into the target `String`.
+- Impact: MEDIUM — eliminates ~400+ temporary allocations for a 200-segment manifest.
+
+**[P4] Box-level copy in init segment rewriter**
+- File: `src/media/init.rs:307-329`
+- `rewrite_sample_entry()` copies non-sinf bytes one at a time with `push()`. Should read box headers and copy whole boxes with `extend_from_slice()`.
+- Impact: MEDIUM — called per track per init rewrite.
+
+**[P5] Minor allocation optimizations**
+- `extract_sample_sizes` intermediate `Vec<u32>` — access trun entries directly
+- `build_senc_box`/`build_pssh_box` double-allocate via intermediate Vec — compute size upfront
+- `rebuild_moof` children Vec not pre-sized — use `with_capacity`
+- `windowed_segments()` called multiple times per DASH render — cache or pass as parameter
+- Impact: LOW individually, cumulative improvement.
+
+---
+
+### Phase 28: DASH Manifest Polish — P2
+
+Low-severity DASH spec improvements.
+
+**[D1] SegmentTimeline repeat coalescing**
+- File: `src/manifest/dash.rs:351-357`
+- Consecutive `<S>` elements with equal duration are not coalesced with `@r` (repeat) attribute. A 1000-segment VOD with uniform 6s segments emits 1000 lines instead of `<S d="6000" r="999"/>`.
+- Fix: track previous duration, increment repeat counter, emit `r="N"` when duration changes.
+- Impact: Manifest size reduction only, not correctness.
+
+**[D2] ContentProtection value attribute**
+- File: `src/manifest/dash.rs:278-300`
+- DASH-IF IOP recommends `value="Widevine"` / `value="PlayReady"` on DRM-specific `<ContentProtection>`. Optional per ISO 23009-1 but recommended for interoperability.
+- Impact: Interoperability improvement only.
+
+---
+
+### Phase 18: Binary Size Monitoring — P2
+
+(Unchanged from previous roadmap)
+
+Monitor binary size as new features land. Feature-gate only when a phase introduces a heavy new dependency or parser that meaningfully increases the binary (50+ KB).
+
+**Policy:**
 - If the binary exceeds **800 KB** with all features enabled, audit the largest new modules and consider feature-gating the heaviest one
 - If a new crate dependency adds **50+ KB** to the WASM binary, it must be feature-gated
-- Per-feature binary size tests in `tests/wasm_binary_size.rs` enforce limits per build variant — a failing test triggers the conversation about what to gate
-- Prefer lightweight built-in implementations over crate dependencies (as with `url.rs`) when the crate adds disproportionate WASM size
+- Per-feature binary size tests in `tests/wasm_binary_size.rs` enforce limits per build variant
+- Prefer lightweight built-in implementations over crate dependencies (as with `url.rs`)
 
-### ~~Phase 19: Configurable Cache-Control Headers~~ ✅ Complete
-- Three-tier cache-control configuration: env var system defaults → per-request overrides → hardcoded safety invariants
-- `CacheControlConfig` struct: `segment_max_age`, `final_manifest_max_age`, `live_manifest_max_age`, `live_manifest_s_maxage`, `immutable` (all `Option`)
-- `CacheConfig` extended with `final_manifest_max_age` field + env var loading (`CACHE_MAX_AGE_SEGMENTS`, `CACHE_MAX_AGE_MANIFEST_LIVE`, `CACHE_MAX_AGE_MANIFEST_FINAL`)
-- `ManifestState.manifest_cache_header()` and `segment_cache_header()` methods — phase-based with per-request override → system default fallback
-- Per-request overrides apply to manifests only (segments use system defaults to avoid overhead per segment request)
-- Safety invariants: `AwaitingFirstSegment` → always `no-cache`, `public` prefix → always present
-- Separate immutable flag control (default: true)
-- Separate `max-age` and `s-maxage` for live manifests (CDN vs browser caching)
-- `CacheControlConfig` struct for per-request overrides
-- Pipeline threading: `RepackageRequest` → `execute()` → `ProgressiveOutput.set_cache_control()` → `ManifestState`
-- Request handlers simplified: inline phase-matching replaced with `state.manifest_cache_header(&ctx.config.cache)`
-- Sandbox UI: collapsible "Cache-Control Overrides" section with all 5 config fields
-- New: `tests/cache_control.rs` (43 integration tests), 3 new output integrity tests, 12 new unit tests
-- Result: 1,291 tests total (at time of completion) (80 new tests)
+---
 
-### ~~Phase 21: Generic HLS/DASH Pipeline (Dual-Format)~~ ✅ Complete
-- Changed `RepackageRequest.output_format` to `output_formats: Vec<OutputFormat>` with backward-compatible API
-- Format-agnostic segment cache keys: `ep:{id}:{scheme}:init` and `ep:{id}:{scheme}:seg:{n}` (no format prefix — segments are identical for HLS and DASH)
-- Per-format manifest state: `ep:{id}:{format}_{scheme}:manifest_state` stays format-qualified (manifests differ between HLS and DASH)
-- `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair
-- `output_formats: ["hls", "dash"]` for dual-format output on `RepackageRequest`
-- Dual-format + dual-scheme: `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs (HLS+CENC, HLS+CBCS, DASH+CENC, DASH+CBCS)
-- Result: 1,331 tests total (924 unit + 407 integration), including 25 new dual_format integration tests
+### Phase 29: Feature Gaps — P2
 
-### ~~Phase 16: Compatibility Validation & Hardening~~ ✅ Complete
-- Codec/scheme compatibility validation (`src/media/compat.rs`): VP9+CBCS error, HEVC+CENC subsample warning, AV1+CBCS warning, DV RPU warning, text track encryption error
-- HDR format detection (HDR10, HDR10+, Dolby Vision, HLG) from codec strings
-- Init segment structure validation (ftyp ordering, sinf/schm/tenc presence, PSSH well-formedness)
-- Media segment structure validation (moof/mdat presence, senc sample count, IV size)
-- `validate_repackage_request()` pre-flight check in pipeline entry (errors → reject, warnings → log)
-- Post-rewrite debug validation (init + segment structure checks)
-- New: `src/media/compat.rs` (28 unit tests), `tests/conformance.rs` (23 integration tests)
+Features present in competing JIT packagers (AWS MediaPackage, USP, Broadpeak) but missing from edgepack.
 
-### ~~Phase 17: CDN Provider Adapters & Binary Optimization~~ ✅ Simplified
-- External cache backends (Redis HTTP, Redis TCP, Cloudflare KV, HTTP KV) have been removed
-- Cache is now in-process `EncryptedCacheBackend<InMemoryCacheBackend>` with AES-128-CTR encryption for sensitive entries
-- No external state store dependencies — the CDN layer caches responses via HTTP headers
+**[F1] Full multi-period DASH**
+- edgepack creates new `<Period>` elements for key rotation but does not support arbitrary multi-period DASH manifests from source.
+- Competitors (USP, MediaPackage) support full multi-period pass-through.
+- Scope: DASH input parser + renderer multi-period support, period-aware segment numbering.
 
-### CDN Platform Deployment
+**[F2] Server-Side Ad Insertion (SSAI) — research phase**
+- SCTE-35 pass-through foundation is already in place (emsg extraction, HLS DATERANGE, DASH EventStream).
+- Basic ad conditioned manifest manipulation (e.g., signaling to an SSAI decision server) could be added without full ad content splicing.
+- This is the most commercially significant feature gap.
+- Scope: research SSAI integration patterns compatible with edge deployment, prototype manifest conditioning.
 
-edgepack compiles to a portable WASI P2 component — no CDN-specific APIs or external state stores needed.
+---
 
-Build commands:
-```bash
-cargo build --release                  # Base (no TS)
-cargo build --release --features ts    # With MPEG-TS input/output
-```
+### Phase 23: MoQ Ingest — P3
 
-### ~~Phase 22: TS Segment Output~~ ✅ Complete
-- CMAF-to-TS muxer (`src/media/ts_mux.rs`): extract samples from CMAF moof/mdat, convert AVCC→Annex B (H.264), raw AAC→ADTS, build PAT/PMT/PES, packetize into 188-byte TS packets
-- `ContainerFormat::Ts` variant behind `#[cfg(feature = "ts")]` — `.ts` extension, no init segment (PAT/PMT embedded in each segment), HLS-only (DASH+TS rejected at validation)
-- AES-128-CBC whole-segment encryption (`encrypt_ts_segment()`) — reverse of Phase 10's `decrypt_ts_segment()`
-- HLS manifest rendering: no `#EXT-X-MAP` tag, `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` instead of SAMPLE-AES/SAMPLE-AES-CTR, `#EXT-X-VERSION:3`, `.ts` segment URIs
-- Key delivery endpoint: `GET /repackage/{id}/{format}/key` serves raw 16-byte AES key for HLS-TS `#EXT-X-KEY` URI
-- Pipeline integration: `TsMuxConfig` extracted from init segment, segments muxed via `mux_to_ts()` then optionally encrypted
-- Validation: accepts `"ts"` as `container_format`, rejects TS+DASH combination
-- Sandbox UI: TS container format option, `.ts` output files, no `init.mp4` for TS
-- All code behind existing `#[cfg(feature = "ts")]` gate — zero impact on non-TS builds
-- New: `src/media/ts_mux.rs`, `tests/ts_output.rs` (46 integration tests), 4 new output integrity tests
-- Result: 1,603 tests total with `--features ts` (88 new TS output tests)
+(Unchanged from previous roadmap — feature-gated, requires research)
 
-### Phase 23: MoQ Ingest — P3 (feature-gated, requires research)
+Accept Media over QUIC (MoQ) streams from an upstream MoQ relay as a source input format, converting them to HLS/DASH output with encryption transforms.
 
-**Goal:** Accept Media over QUIC (MoQ) streams from an upstream MoQ relay as a source input format, converting them to HLS/DASH output with encryption transforms — analogous to how edgepack currently ingests HLS/DASH manifests and CMAF/fMP4/TS segments.
+**Architecture constraint:** MOQT runs over QUIC/WebTransport requiring UDP sockets and async runtime. WASI P2 only exposes `wasi:http` in CDN edge runtimes. The MOQT transport layer cannot run inside the WASM binary on current CDN runtimes.
 
-**Primary use case:** edgepack subscribes to a MoQ relay as a MOQT subscriber, receives media groups/objects, and produces repackaged HLS/DASH + CMAF/fMP4 output with configurable encryption (CBCS/CENC/clear). The MoQ relay handles fan-out from the publisher; edgepack handles the MoQ-to-HLS/DASH bridge at the edge.
+**Research required before implementation:**
+- Spec stability assessment (MOQT transport spec progression toward RFC)
+- Relay compatibility testing (moq-relay, Cloudflare relay infrastructure)
+- LOC vs CMAF packaging prevalence
+- Catalog format maturity
+- WASI P3 timeline (async support, CDN runtime adoption)
+- Binary size impact of `moq-lite` + `hang` + `quinn`
+- Sidecar vs embedded architecture decision
+- E2E encryption interop (MoQ Secure Objects / SFrame vs edgepack DRM)
+- Live-to-VOD mapping (MoQ groups → ManifestPhase state machine)
 
-**Feature gate:** `#[cfg(feature = "moq")]` — heavy dependency surface (QUIC stack, async runtime, WebTransport) must not impact non-MoQ builds.
+---
 
-#### Relevant Specifications
+## Priority Summary
 
-| Spec | Draft | Purpose |
-|------|-------|---------|
-| MOQT (Media over QUIC Transport) | `draft-ietf-moq-transport` (v16+) | Core pub/sub transport: tracks, groups, objects, subscriptions |
-| LOC (Low Overhead Container) | `draft-ietf-moq-loc` | Lightweight media container for MOQT objects |
-| MoQ Catalog Format | `draft-ietf-moq-catalogformat` | JSON catalog for track discovery and codec signaling |
-| MSF (MOQT Streaming Format) | `draft-ietf-moq-msf` | Media packaging over MOQT (successor to WARP) |
-| Secure Objects | `draft-jennings-moq-secure-objects` | E2E encryption (SFrame-based) for MOQT objects |
+| Priority | Phase | Name | Items |
+|----------|-------|------|-------|
+| **P0** | 24 | Spec Compliance Fixes | 2 items (tenc version, LL-HLS part ordering) |
+| **P1** | 25 | Manifest Correctness Fixes | 3 items (DASH DVR @t, DATERANGE 24h, HLS windowed iterators) |
+| **P1** | 26 | Error Handling Hardening | 3 items (unwrap→Result, panic→Result, OOM clamp) |
+| **P2** | 27 | Hot Path Performance | 5 items (SencEntry inline, fused loops, write!(), box copy, minor allocs) |
+| **P2** | 28 | DASH Manifest Polish | 2 items (SegmentTimeline @r, ContentProtection value) |
+| **P2** | 18 | Binary Size Monitoring | Policy — reactive monitoring |
+| **P2** | 29 | Feature Gaps | 2 items (multi-period DASH, SSAI research) |
+| **P3** | 23 | MoQ Ingest | Research phase — blocked on spec maturity + WASI P3 |
 
-**Note:** All specs are active IETF drafts — none have reached RFC status. Implementation should track the latest drafts and be prepared for breaking changes.
+## Unique Advantages (vs. AWS MediaPackage, USP, Broadpeak, Harmonic, Ateme, Wowza)
 
-#### Rust Ecosystem
-
-| Crate | Purpose | Notes |
-|-------|---------|-------|
-| `moq-lite` | Core MOQT pub/sub (broadcasts, tracks, groups, frames) | Active development (moq-dev/moq) |
-| `hang` | Media layer atop moq-lite (catalog, codecs, LOC) | Active development (moq-dev/moq) |
-| `moq-native` | Quinn QUIC + rustls endpoint config helpers | Active development |
-| `web-transport-quinn` | WebTransport over Quinn | Active development |
-| `quinn` | Async Rust QUIC implementation | Mature, widely used |
-| `wtransport` | Pure Rust async WebTransport (alternative) | Active development |
-
-All MoQ crates require `tokio` async runtime and native QUIC (UDP sockets).
-
-#### Architecture Constraint: WASI P2 and QUIC
-
-**The fundamental constraint:** MOQT runs over QUIC or WebTransport, both of which require UDP sockets and an async runtime. WASI P2 only exposes `wasi:http` in CDN edge runtimes (Cloudflare Workers, Fastly Compute, etc.) — `wasi:sockets/udp` is specified but not implemented by CDN providers. Additionally, edgepack uses synchronous blocking I/O, while MOQT requires persistent bidirectional async connections.
-
-**Implication:** The MOQT transport layer (QUIC subscriber, WebTransport session) cannot run inside the WASM binary on current CDN edge runtimes. Two architectural approaches:
-
-**Approach A — Native MoQ subscriber sidecar:**
-- A native binary (using `moq-native` + `moq-lite` + `hang`) runs alongside the WASM binary
-- The sidecar subscribes to the MoQ relay, reassembles groups, writes CMAF segments + catalog-derived metadata to the cache backend (Redis/KV)
-- The WASM binary reads from cache and applies encryption transforms + manifest generation as it does today for HLS/DASH sources
-- Catalog metadata is converted to `SourceManifest` format in the cache
-- Pro: cleanest separation, reuses existing edgepack pipeline unchanged
-- Con: requires deploying and managing a separate process
-
-**Approach B — Native binary with embedded pipeline (no WASM):**
-- A single native binary combines the MoQ subscriber and the edgepack repackaging pipeline
-- Uses `moq-native` for transport and links against edgepack as an `rlib`
-- Pro: single deployment unit, direct in-process data flow
-- Con: loses WASM portability, ties deployment to a specific platform
-
-**Future: WASI P3** may add native `async`, `stream<T>`, and `future<T>` types, potentially enabling a WASM-native QUIC stack if CDN runtimes also implement `wasi:sockets/udp`. This would unify the architecture but is not available today.
-
-#### Components
-
-**1. MoQ Catalog Parser** (`src/moq/catalog.rs`)
-- Parse JSON catalog format (`draft-ietf-moq-catalogformat`)
-- Extract track namespaces, names, codec parameters, selection properties (bitrate, resolution, framerate)
-- Handle `initData` (base64 codec config) and `initTrack` references
-- Support delta updates via JSON Patch
-- Convert to edgepack's `SourceManifest` / `VariantInfo` types
-- **This component is pure JSON parsing — could run in WASM**
-
-**2. LOC Container Parser** (`src/moq/loc.rs`)
-- Parse LOC header extensions (timestamp, timescale, video config, frame marking)
-- Extract raw codec bitstream from LOC payload
-- Map to existing codec handling (H.264/H.265/AAC/VP9/AV1)
-- Handle LOC encryption (Secure Objects) if present
-- **Pure byte manipulation — could run in WASM**
-
-**3. LOC-to-CMAF Transmuxer** (`src/moq/transmux.rs`)
-- Convert LOC-packaged media objects to CMAF moof+mdat segments
-- Similar pattern to existing TS-to-CMAF transmux (`media/transmux.rs`)
-- Synthesize init segments from LOC codec config
-- Build trun/mdat from LOC frame payloads
-- **Pure byte manipulation — could run in WASM**
-
-**4. CMAF-over-MoQ Passthrough**
-- When upstream MoQ content uses `packaging: "cmaf"` (objects are CMAF chunks)
-- Reuse existing ISOBMFF parser (`media/cmaf.rs`) directly
-- Most natural integration path — only transport changes, not container
-- **Already implemented for CMAF — just needs data flow wiring**
-
-**5. MOQT Subscriber** (`src/moq/subscriber.rs`)
-- MOQT session setup (SETUP message exchange, version negotiation)
-- SUBSCRIBE to video/audio tracks by namespace + name
-- Group/object reassembly (ordered by Group ID, Object ID)
-- Handle subgroup dependencies, join points (group boundaries = keyframes)
-- FETCH for past groups (DVR/catch-up)
-- Session lifecycle (GOAWAY, reconnection)
-- **Requires QUIC/WebTransport — must run as native code**
-
-**6. MoQ-to-HLS/DASH Bridge** (pipeline integration)
-- Convert reassembled MoQ groups into the segment processing pipeline
-- Map MoQ track metadata to `ManifestState` / `VariantInfo`
-- Generate progressive HLS/DASH manifests as groups arrive (live streaming)
-- Apply encryption transforms (CBCS/CENC) via existing pipeline
-- Thread `dvr_window_duration`, content steering, SCTE-35 (if signaled in catalog)
-
-#### Research Required Before Implementation
-
-This phase requires significant research and prototyping before implementation begins:
-
-- [ ] **Spec stability assessment:** Monitor MOQT transport spec progression toward RFC. Breaking changes between drafts may invalidate implementation work
-- [ ] **Relay compatibility testing:** Test against live MoQ relays (moq-relay, Cloudflare's relay infrastructure) to understand real-world protocol behavior
-- [ ] **LOC vs CMAF packaging prevalence:** Determine which packaging format is more common from MoQ publishers to prioritize parser implementation order
-- [ ] **Catalog format maturity:** The catalog spec is still evolving — assess whether the JSON schema is stable enough to build against
-- [ ] **WASI P3 timeline:** Track WASI P3 async support and CDN runtime adoption — this determines whether a WASM-native approach becomes viable
-- [ ] **Binary size impact:** Profile the dependency tree of `moq-lite` + `hang` + `quinn` to estimate WASM binary size impact (expected to be very large — likely requires native-only build)
-- [ ] **Sidecar vs embedded architecture decision:** Prototype both approaches to evaluate operational complexity, latency, and deployment patterns
-- [ ] **E2E encryption interop:** Understand how MoQ Secure Objects (SFrame) interacts with edgepack's DRM encryption — potential double-encryption or key management complexity
-- [ ] **Live-to-VOD with MoQ:** Design how MoQ's group-based delivery maps to edgepack's `ManifestPhase` state machine (AwaitingFirstSegment → Live → Complete)
-
-**All P0 and P1 items are complete.** No P0 or P1 phases remain in the roadmap. Remaining phase 18 is P2, Phase 23 is P3.
-
-Full roadmap plan: `.claude/plans/crystalline-singing-bee.md`
+1. **Real-time CBCS ↔ CENC re-encryption** — no other packager converts between encryption schemes at runtime
+2. **Dual-scheme simultaneous output** — CENC + CBCS from a single request
+3. **CDN edge deployment** — ~628 KB WASM binary, sub-1ms cold start (every competitor runs at origin)
+4. **Zero external state dependencies** — in-process encrypted cache only
+5. **Combinatorial output matrix** — formats × schemes = all permutations from one request
+6. **Clear lead, raw key mode, DRM systems override** — unique per-request DRM flexibility
+7. **Pre-flight compatibility validation** — rejects invalid combinations before processing
+8. **Encrypted in-process DRM key cache** — AES-128-CTR with minimum retention policies
