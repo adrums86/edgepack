@@ -473,7 +473,7 @@ flowchart TD
 - ftyp box rewriting in init segments for output container format
 - Dynamic segment extensions (`.cmfv`/`.cmfa` for CMAF, `.m4s` for fMP4, `.mp4` for ISO)
 - Dynamic DASH profile signaling (`cmaf:2019` for CMAF, `isoff-live:2011` for fMP4/ISO)
-- `container_format` threaded through `RepackageRequest` → `ManifestState` → `ProgressiveOutput`
+- `container_format` flows through `RepackageRequest` → `ManifestState` → `ProgressiveOutput`
 - Route handler accepts all 7 CMAF/ISOBMFF segment extensions
 
 ### ~~Phase 3: Unencrypted Input Support~~ ✅ Complete
@@ -610,7 +610,6 @@ graph TB
         Init["rewrite_init_segment()<br/>ftyp → build_ftyp(format)"]
         Prog["ProgressiveOutput<br/>segment URIs use<br/>format.video_segment_extension()"]
         Dash["DASH Renderer<br/>MPD @profiles =<br/>format.dash_profiles()"]
-        Cont["ContinuationParams<br/>.container_format"]
     end
 
     subgraph TS_Props["TS Properties"]
@@ -626,8 +625,7 @@ graph TB
     TS --> TS_Props
 
     Req --> Init
-    Req --> Cont
-    Cont --> Prog
+    Req --> Prog
     Prog --> Dash
 
     classDef enum fill:#1F2937,stroke:#F59E0B,color:#F9FAFB

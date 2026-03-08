@@ -29,14 +29,14 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 ### ~~Phase 2: Container Format Flexibility (CMAF + fMP4)~~ ✅ Complete
 - Created `src/media/container.rs` with `ContainerFormat` enum (`Cmaf`, `Fmp4`) — 22 tests
 - Added ftyp brand rewriting in `src/media/init.rs` — 3 new tests
-- Wired `container_format` through `RepackageRequest`, `WebhookPayload`, `ManifestState`, `ContinuationParams`, pipeline, progressive output, and manifest renderers
+- Wired `container_format` through `RepackageRequest`, `ManifestState`, pipeline, progressive output, and manifest renderers
 - Updated segment URI extensions dynamically, DASH profile signaling, and route handling for `.cmfv`/`.m4s`
 - Result: 541 tests total (466 unit + 75 integration), including binary size guard test
 
 ### ~~Phase 3: Unencrypted Input Support~~ ✅ Complete
 - Added `EncryptionScheme::None` variant with `is_encrypted()` method and all match arms in `scheme.rs`
 - Added panic arms in `sample_cryptor.rs` factory functions for None (should never be called)
-- Accepted `"none"` target_scheme in `webhook.rs`, enabled sandbox for clear content
+- Accepted `"none"` target_scheme, enabled sandbox for clear content
 - Added `create_protection_info()` in `init.rs` — inject sinf/schm/tenc/pssh into clear init segments (clear→encrypted)
 - Added `strip_protection_info()` in `init.rs` — remove sinf/pssh and restore original sample entries (encrypted→clear)
 - Added `rewrite_ftyp_only()` in `init.rs` — format-only conversion for clear→clear
@@ -47,14 +47,14 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 
 ### ~~Phase 4: Dual-Scheme Output~~ ✅ Complete
 - Result: 652 tests total (538 unit + 114 integration), including 22 new dual_scheme integration tests
-- Changed `RepackageRequest.target_scheme` to `target_schemes: Vec<EncryptionScheme>` with backward-compatible webhook API (`target_scheme` singular still accepted)
+- Changed `RepackageRequest.target_scheme` to `target_schemes: Vec<EncryptionScheme>` with backward-compatible API
 - Scheme-qualified cache keys using `{format}_{scheme}` pattern (e.g. `ep:{id}:hls_cenc:seg:{n}`)
 - Scheme-qualified URL routes (e.g. `/repackage/{id}/hls_cenc/manifest`)
 - Pipeline `execute()` returns `Vec<(EncryptionScheme, ProgressiveOutput)>` — one output per scheme
 - Source segments decrypted once, re-encrypted for each target scheme
 - `cleanup_sensitive_data()` accepts `&[EncryptionScheme]` and deletes per-scheme rewrite params
 - Sandbox UI supports "Both (Dual-Scheme)" option, writes output per scheme
-- Webhook response includes `manifest_urls: HashMap<String, String>` mapping scheme names to URLs
+- Scheme-qualified manifest URLs for each target scheme
 
 ### ~~Phase 5: Multi-Key DRM & Codec Awareness~~ ✅ Complete
 - Multi-key SPEKE requests for multiple KIDs in a single CPIX exchange
@@ -62,7 +62,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Multi-key PSSH v1 generation (grouped by system_id, all KIDs per system)
 - Codec string extraction from stsd (`avcC`, `hvcC`, `vpcC`, `av1C`, `esds` → codec strings)
 - Timescale parsing from `mdhd`
-- `TrackKeyMapping` threaded through pipeline, init rewriting, PSSH building, and ContinuationParams
+- `TrackKeyMapping` threaded through pipeline, init rewriting, and PSSH building
 - Codec strings populated into `VariantInfo` for HLS/DASH manifest signaling
 - New: `src/media/codec.rs` (34 unit tests), `tests/multi_key.rs` (12 integration tests)
 
@@ -76,7 +76,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - HLS CEA caption signaling (`#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,INSTREAM-ID=...`) with `CLOSED-CAPTIONS="cc"` on `EXT-X-STREAM-INF`
 - DASH subtitle `<AdaptationSet contentType="text">` with language attribute
 - DASH CEA `<Accessibility schemeIdUri="urn:scte:dash:cc:cea-608:2015">` descriptors inside video AdaptationSet
-- Result: 825 tests total with `--features jit,cloudflare` (18 new subtitle/caption tests)
+- Result: 825 tests total (at time of completion) (18 new subtitle/caption tests)
 
 ### ~~Phase 7: SCTE-35 Ad Markers & Multi-Period DASH~~ ✅ Complete
 - `emsg` box parsing (v0/v1) with SCTE-35 splice_info_section binary parser (`src/media/scte35.rs`)
@@ -86,7 +86,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - DASH `<EventStream>` with SCTE-35 scheme URI and `<Event>` elements
 - Source manifest parsing: `#EXT-X-DATERANGE` in HLS input, `<EventStream>` in DASH input
 - New: `src/media/scte35.rs`, `tests/scte35_integration.rs` (13 integration tests)
-- Result: 948 tests total with `--features jit,cloudflare`
+- Result: 948 tests total (at time of completion)
 
 ### ~~Phase 8: JIT Packaging (On-Demand GET)~~ ✅ Complete
 - Manifest-on-GET, Init-on-GET, Segment-on-GET (lazy repackaging on cache miss)
@@ -105,7 +105,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - HLS version bump to 9 when LL-HLS parts present
 - Pipeline integration: chunk detection after segment rewriting, source LL info threading
 - New: `src/media/chunk.rs`, `tests/ll_hls_dash.rs` (16 integration tests)
-- Result: 1,072 tests total with `--features jit,cloudflare` (63 new tests)
+- Result: 1,072 tests total (at time of completion) (63 new tests)
 
 ### ~~Phase 10: MPEG-TS Input~~ ✅ Complete
 - TS demuxer (PES/TS packets, PAT/PMT, H.264/H.265/AAC extraction)
@@ -115,17 +115,17 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - Pipeline integration: feature-gated `process_ts_segment()` — decrypt → demux → transmux → CMAF pipeline
 - All TS code behind `#[cfg(feature = "ts")]` — zero impact on non-ts builds
 - New: `src/media/ts.rs`, `src/media/transmux.rs`, `tests/ts_integration.rs` (30 integration tests)
-- Result: 1,151 tests total with `--features jit,cloudflare,ts` (79 new ts-gated tests)
+- Result: 1,151 tests total with `--features ts` (79 new ts-gated tests)
 
 ### ~~Phase 11: Advanced DRM~~ ✅ Complete
 - ClearKey DRM system ID (`e2719d58-a985-b3c9-781a-b030af78d30e`) with PSSH builder
-- Raw key mode: accept encryption keys directly via webhook (bypass SPEKE)
+- Raw key mode: accept encryption keys directly via `raw_keys` on request (bypass SPEKE)
 - Key rotation: per-period key rotation at configurable segment boundaries
 - Clear lead: first N segments unencrypted, then encrypted with manifest transition
 - DRM systems override: explicit selection of widevine/playready/fairplay/clearkey per request
 - HLS ClearKey KEY tag, DASH ClearKey ContentProtection element
 - New: `tests/advanced_drm.rs` (15 integration tests)
-- Result: 1,003 tests total with `--features jit,cloudflare` (55 new tests from baseline 948)
+- Result: 1,003 tests total (at time of completion) (55 new tests from baseline 948)
 
 ### ~~Phase 12: Trick Play & I-Frame Playlists~~ ✅ Complete
 - HLS `#EXT-X-I-FRAMES-ONLY` media playlists with `#EXT-X-BYTERANGE` (byte ranges into existing rewritten segments — no duplicate storage)
@@ -137,7 +137,7 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - DASH trick play embedded in regular MPD (no separate endpoint)
 - Sandbox writes `iframes.m3u8` alongside regular HLS output
 - New: `tests/trick_play.rs` (27 integration tests)
-- Result: 1,111 tests total with `--features jit,cloudflare` (39 new tests)
+- Result: 1,111 tests total (at time of completion) (39 new tests)
 
 ### Phase 13: DVR Window & Time-Shift — P2 ✅
 - DVR sliding window manifests for live streams (configurable `dvr_window_duration`)
@@ -146,21 +146,21 @@ The codebase is being generalized from a single-purpose CBCS→CENC converter in
 - DASH: `timeShiftBufferDepth` attribute, dynamic `startNumber` in SegmentTimeline, windowed ad break events
 - Complete phase ignores window — full VOD manifest with all segments
 - Windowing helpers on ManifestState: `windowed_segments()`, `windowed_media_sequence()`, `windowed_iframe_segments()`, `windowed_parts()`, `windowed_ad_breaks()`, `is_dvr_active()`
-- Webhook validation: `dvr_window_duration` must be positive when provided
+- Validation: `dvr_window_duration` must be positive when provided
 - New: `tests/dvr_window.rs` (25 integration tests)
-- Result: 1,154 tests total with `--features jit,cloudflare` (43 new tests)
+- Result: 1,154 tests total (at time of completion) (43 new tests)
 
 ### Phase 14: Content Steering & CDN Optimization — P2 ✅
 - Content steering directive injection in HLS master playlists (`#EXT-X-CONTENT-STEERING`) and DASH MPDs (`<ContentSteering>`)
-- Webhook-driven steering config: `server_uri`, `default_pathway_id`, `query_before_start`
+- Steering config on `RepackageRequest`: `server_uri`, `default_pathway_id`, `query_before_start`
 - DASH source pass-through: `<ContentSteering>` elements extracted from input MPDs and preserved in output
-- Override priority: webhook config takes precedence over source-extracted steering
+- Override priority: request config takes precedence over source-extracted steering
 - New type: `ContentSteeringConfig` (server_uri, default_pathway_id, query_before_start)
-- New webhook field: `content_steering` on `WebhookPayload` with validation (reject empty `server_uri`)
+- `content_steering` field on `RepackageRequest` with validation (reject empty `server_uri`)
 - Pipeline threading in `execute()` path
 - HLS pass-through not applicable (edgepack parses media playlists; steering tag only in master playlists)
 - New: `tests/content_steering.rs` (20 integration tests)
-- Result: 1,290 tests total with `--features jit,cloudflare,ts` (85 new phase tests + 18 output integrity tests)
+- Result: 1,290 tests total with `--features ts` (85 new phase tests + 18 output integrity tests)
 - Output integrity tests (`tests/output_integrity.rs`): structural validation of rewritten segments across all 4 encryption lanes (enc→enc, clear→enc, enc→clear, clear→clear), mdat/trun size consistency, encrypt-decrypt plaintext recovery roundtrip, I-frame BYTERANGE chunk validation, init rewrite roundtrip (clear→enc→clear), multi-KID PSSH verification, HLS/DASH manifest roundtrips (VOD, live, DVR, I-frame)
 - Criterion benchmarks (`benches/jit_latency.rs`): segment rewrite latency (CBCS→CENC, clear→CENC, passthrough at 4/32/128 samples), init rewrite latency, manifest render/parse latency (HLS/DASH at varying segment counts)
 
@@ -177,7 +177,7 @@ The current binary (~628 KB base) is well within cold start budgets (<1 ms). Fea
 - Prefer lightweight built-in implementations over crate dependencies (as with `url.rs`) when the crate adds disproportionate WASM size
 
 ### ~~Phase 19: Configurable Cache-Control Headers~~ ✅ Complete
-- Three-tier cache-control configuration: env var system defaults → per-request webhook overrides → hardcoded safety invariants
+- Three-tier cache-control configuration: env var system defaults → per-request overrides → hardcoded safety invariants
 - `CacheControlConfig` struct: `segment_max_age`, `final_manifest_max_age`, `live_manifest_max_age`, `live_manifest_s_maxage`, `immutable` (all `Option`)
 - `CacheConfig` extended with `final_manifest_max_age` field + env var loading (`CACHE_MAX_AGE_SEGMENTS`, `CACHE_MAX_AGE_MANIFEST_LIVE`, `CACHE_MAX_AGE_MANIFEST_FINAL`)
 - `ManifestState.manifest_cache_header()` and `segment_cache_header()` methods — phase-based with per-request override → system default fallback
@@ -185,19 +185,19 @@ The current binary (~628 KB base) is well within cold start budgets (<1 ms). Fea
 - Safety invariants: `AwaitingFirstSegment` → always `no-cache`, `public` prefix → always present
 - Separate immutable flag control (default: true)
 - Separate `max-age` and `s-maxage` for live manifests (CDN vs browser caching)
-- `CacheControlInput` webhook type (separate from internal `CacheControlConfig`)
+- `CacheControlConfig` struct for per-request overrides
 - Pipeline threading: `RepackageRequest` → `execute()` → `ProgressiveOutput.set_cache_control()` → `ManifestState`
 - Request handlers simplified: inline phase-matching replaced with `state.manifest_cache_header(&ctx.config.cache)`
 - Sandbox UI: collapsible "Cache-Control Overrides" section with all 5 config fields
-- New: `tests/cache_control.rs` (43 integration tests), 3 new output integrity tests, 12 new unit tests (webhook + progressive)
-- Result: 1,291 tests total with `--features jit,cloudflare` (80 new tests)
+- New: `tests/cache_control.rs` (43 integration tests), 3 new output integrity tests, 12 new unit tests
+- Result: 1,291 tests total (at time of completion) (80 new tests)
 
 ### ~~Phase 21: Generic HLS/DASH Pipeline (Dual-Format)~~ ✅ Complete
-- Changed `RepackageRequest.output_format` to `output_formats: Vec<OutputFormat>` with backward-compatible webhook API (`format` singular still accepted, `output_formats` array takes precedence)
+- Changed `RepackageRequest.output_format` to `output_formats: Vec<OutputFormat>` with backward-compatible API
 - Format-agnostic segment cache keys: `ep:{id}:{scheme}:init` and `ep:{id}:{scheme}:seg:{n}` (no format prefix — segments are identical for HLS and DASH)
 - Per-format manifest state: `ep:{id}:{format}_{scheme}:manifest_state` stays format-qualified (manifests differ between HLS and DASH)
 - `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair
-- Webhook API: `output_formats: ["hls", "dash"]` for dual-format, `format` (singular) for backward compat; `resolved_output_formats()` mirrors `resolved_target_schemes()` pattern
+- `output_formats: ["hls", "dash"]` for dual-format output on `RepackageRequest`
 - Dual-format + dual-scheme: `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs (HLS+CENC, HLS+CBCS, DASH+CENC, DASH+CBCS)
 - Result: 1,331 tests total (924 unit + 407 integration), including 25 new dual_format integration tests
 
@@ -232,11 +232,11 @@ cargo build --release --features ts    # With MPEG-TS input/output
 - HLS manifest rendering: no `#EXT-X-MAP` tag, `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` instead of SAMPLE-AES/SAMPLE-AES-CTR, `#EXT-X-VERSION:3`, `.ts` segment URIs
 - Key delivery endpoint: `GET /repackage/{id}/{format}/key` serves raw 16-byte AES key for HLS-TS `#EXT-X-KEY` URI
 - Pipeline integration: `TsMuxConfig` extracted from init segment, segments muxed via `mux_to_ts()` then optionally encrypted
-- Webhook validation: accepts `"ts"` as `container_format`, rejects TS+DASH combination
+- Validation: accepts `"ts"` as `container_format`, rejects TS+DASH combination
 - Sandbox UI: TS container format option, `.ts` output files, no `init.mp4` for TS
 - All code behind existing `#[cfg(feature = "ts")]` gate — zero impact on non-TS builds
 - New: `src/media/ts_mux.rs`, `tests/ts_output.rs` (46 integration tests), 4 new output integrity tests
-- Result: 1,603 tests total with `--features jit,cloudflare,ts` (88 new TS output tests)
+- Result: 1,603 tests total with `--features ts` (88 new TS output tests)
 
 ### Phase 23: MoQ Ingest — P3 (feature-gated, requires research)
 

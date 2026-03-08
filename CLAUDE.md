@@ -93,7 +93,7 @@ src/
 
 ## Architecture Diagrams
 
-Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md). The file contains 11 diagrams: system context, data flow, module architecture, split execution sequence, progressive output state machine, cache security model, cache key layout, CDN caching strategy, per-segment encryption transform, container format comparison, and I-frame detection & trick play flow. All diagrams are Mermaid syntax, portable to Confluence, Jira, and Lucidchart.
+Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md). The file contains 11 diagrams: system context, data flow, module architecture, JIT execution sequence, progressive output state machine, cache security model, cache key layout, CDN caching strategy, per-segment encryption transform, container format comparison, and I-frame detection & trick play flow. All diagrams are Mermaid syntax, portable to Confluence, Jira, and Lucidchart.
 
 ## Key Concepts
 
@@ -145,7 +145,7 @@ The output container format is configurable via `ContainerFormat` enum (`Cmaf`, 
 - **TS** (`ts` feature): MPEG-TS output (`.ts` extension), HLS-only (DASH+TS rejected at validation), no init segment (PAT/PMT embedded in each segment), AES-128-CBC whole-segment encryption via `#EXT-X-KEY:METHOD=AES-128`, `is_isobmff()` returns false
 - CMAF/fMP4/ISO formats use `.mp4` for init segments and `video/mp4`/`audio/mp4` MIME types
 - The `ftyp` box in init segments is rewritten to match the target format's brands (not applicable for TS)
-- `ContainerFormat` flows through `RepackageRequest` → `ContinuationParams` → `ManifestState` → `ProgressiveOutput`
+- `ContainerFormat` flows through `RepackageRequest` → `ManifestState` → `ProgressiveOutput`
 - Segment URIs are built dynamically using `container_format.video_segment_extension()`
 - DASH renderer uses `container_format.dash_profiles()` for MPD `@profiles` attribute (panics for TS — DASH not supported)
 - Route handler accepts all 7 CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions plus `.ts`: `.cmfv`, `.cmfa`, `.cmft`, `.cmfm`, `.m4s`, `.mp4`, `.m4a`, `.ts`
@@ -214,7 +214,7 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 ### Trick Play & I-Frame Playlists (Phase 12)
 
-**Opt-in:** Enabled via `enable_iframe_playlist: bool` on `RepackageRequest` and `WebhookPayload` (default false). When enabled, the pipeline detects I-frame byte ranges in rewritten segments and generates trick play manifests for fast-forward/rewind scrubbing.
+**Opt-in:** Enabled via `enable_iframe_playlist: bool` on `RepackageRequest` (default false). When enabled, the pipeline detects I-frame byte ranges in rewritten segments and generates trick play manifests for fast-forward/rewind scrubbing.
 
 **I-frame detection:** Reuses existing `chunk.rs` infrastructure. After segment rewriting, `detect_chunk_boundaries()` finds moof+mdat pairs. The first independent (IDR) chunk's byte offset and size are recorded as an `IFrameSegmentInfo`. CMAF segments always start with an IDR frame, so every segment contributes one I-frame entry. Chunk detection is consolidated — runs once per segment when either LL-HLS parts or I-frame playlists need it.
 
@@ -228,7 +228,7 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 ### DVR Sliding Window (Phase 13)
 
-**Configurable window:** Enabled via `dvr_window_duration: Option<f64>` on `RepackageRequest`, `WebhookPayload`, and `ManifestState`. When set, only the most recent N seconds of segments are rendered in live manifests. Older segments remain accessible by direct URL — they are not pruned from `ManifestState`.
+**Configurable window:** Enabled via `dvr_window_duration: Option<f64>` on `RepackageRequest` and `ManifestState`. When set, only the most recent N seconds of segments are rendered in live manifests. Older segments remain accessible by direct URL — they are not pruned from `ManifestState`.
 
 **Filter-during-rendering:** Segments are filtered at render time, not removed from state. This preserves full segment history for live-to-VOD transitions (Complete phase renders all segments regardless of window). Trade-off: ManifestState grows with stream length (~1.5 MB for 24h at 6s segments — acceptable for in-process memory).
 
@@ -256,9 +256,7 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **DASH source pass-through:** `dash_input.rs` parser extracts `<ContentSteering>` elements from source MPDs into `SourceManifest.content_steering`. HLS input parser does not extract steering (media playlists don't contain it).
 
-**Override priority:** Webhook `content_steering` config takes precedence over source-extracted steering: `request.content_steering.clone().or_else(|| source.content_steering.clone())`.
-
-**Webhook input:** `ContentSteeringInput` struct on `WebhookPayload` with validation (reject empty `server_uri`). Converted to `ContentSteeringConfig` before threading into pipeline.
+**Override priority:** Request `content_steering` config takes precedence over source-extracted steering: `request.content_steering.clone().or_else(|| source.content_steering.clone())`.
 
 ### MPEG-TS Input (Phase 10)
 
@@ -278,7 +276,7 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **TS muxer** (`media/ts_mux.rs`): Converts CMAF moof/mdat segments to 188-byte MPEG-TS packets. Extracts samples from trun/mdat, converts video AVCC→Annex B (prepends SPS/PPS before IDR frames), converts raw AAC→ADTS (7-byte headers), builds PAT/PMT tables, wraps in PES packets with PTS/DTS timestamps, and packetizes into TS packets with continuity counters and stuffing.
 
-**TsMuxConfig:** Extracted from the source init segment via `extract_mux_config()` — contains SPS/PPS, AAC config (profile, sample rate index, channel count), and timescales. Cached in `ContinuationParams` for split execution persistence.
+**TsMuxConfig:** Extracted from the source init segment via `extract_mux_config()` — contains SPS/PPS, AAC config (profile, sample rate index, channel count), and timescales.
 
 **AES-128 encryption:** `encrypt_ts_segment()` performs whole-segment AES-128-CBC encryption with PKCS7 padding — the reverse of `decrypt_ts_segment()` in ts.rs. IV is derived from segment number as a 128-bit big-endian integer.
 
@@ -294,7 +292,7 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **Core insight:** CMAF/fMP4 segments are format-agnostic — the same encrypted bytes serve both HLS and DASH. Only manifests differ between formats.
 
-**`RepackageRequest.output_formats: Vec<OutputFormat>`:** Replaces the old `output_format` (singular). Webhook API accepts `output_formats: ["hls", "dash"]` for dual-format output; legacy `format` field still accepted for backward compat. `resolved_output_formats()` mirrors the `resolved_target_schemes()` pattern. `primary_format()` returns the first format (fallback: `Hls`).
+**`RepackageRequest.output_formats: Vec<OutputFormat>`:** Replaces the old `output_format` (singular). Accepts `output_formats: ["hls", "dash"]` for dual-format output. `primary_format()` returns the first format (fallback: `Hls`).
 
 **Format-agnostic segment caching:** Init and media segments are cached with scheme-only keys (`ep:{id}:{scheme}:init`, `ep:{id}:{scheme}:seg:{n}`) — no format prefix. Manifest state remains per-(format, scheme) since HLS M3U8 and DASH MPD have entirely different structures.
 
@@ -321,7 +319,7 @@ All HTTP transport and request handling is fully implemented:
 
 ## Local Sandbox
 
-The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `(JobStatus, Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>)` — per-(format, scheme) output is written to disk directly from each `ProgressiveOutput` object to `sandbox/output/{content_id}/{format}_{scheme}/`, not round-tripped through cache.
+The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — per-(format, scheme) output is written to disk directly from each `ProgressiveOutput` object to `sandbox/output/{content_id}/{format}_{scheme}/`, not round-tripped through cache.
 
 ### Architecture
 
@@ -406,10 +404,10 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **SCTE-35 parsing**: `emsg` box parsing (v0/v1), SCTE-35 splice_info_section binary parsing (splice_insert, time_signal), scheme URI detection, emsg builder roundtrips
 - **Compatibility validation**: Codec/scheme compatibility checks (VP9+CBCS error, HEVC+CENC warning, etc.), HDR format detection (HDR10, Dolby Vision, HLG), init/media segment structure validation, repackage request pre-flight validation
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
-- **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through ContinuationParams, TrackKeyMapping construction and serialization, variant building from track metadata
+- **Pipeline DRM info**: Manifest DRM info building with CBCS/CENC target scheme (incl. multi-KID PSSH per system), FairPlay inclusion/exclusion, container format threading through pipeline, TrackKeyMapping construction and serialization, variant building from track metadata
 - **URL parsing**: Lightweight URL parser (parse, join, component access, serde roundtrips, authority extraction, relative path resolution)
 - **HTTP routing**: Path parsing, format validation, segment number extraction (all 8 extensions: .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a, .ts), all route dispatching
-- **Webhook validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_scheme/target_schemes parsing (cenc/cbcs/none, backward compat, duplicate rejection), output_formats parsing (hls/dash, backward compat, duplicate rejection), container_format parsing (cmaf/fmp4/iso/ts), enable_iframe_playlist parsing, invalid scheme/format rejection, serde roundtrips
+- **Source config validation**: Valid/invalid JSON, missing fields, bad formats, empty URLs, target_schemes parsing (cenc/cbcs/none), container_format parsing (cmaf/fmp4/iso/ts), serde roundtrips
 - **Error variants**: Display output for every EdgepackError variant
 
 To run a specific module's tests: `cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::cbcs`
@@ -520,6 +518,7 @@ Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mo
 | GET | `/repackage/{id}/{format}/iframes` | `request::handle_iframe_manifest_request` | Serve HLS I-frame playlist (DASH returns 404 — trick play embedded in MPD) |
 | GET | `/repackage/{id}/{format}/key` | `request::handle_key_request` | Serve raw AES-128 key for HLS-TS `#EXT-X-KEY` (TS container only) |
 | GET | `/repackage/{id}/{format}/segment_{n}.{ext}` | `request::handle_media_segment_request` | Serve repackaged media segment (accepts all 8 extensions incl. `.ts`) |
+| POST | `/config/source` | `webhook::handle_source_config` | Register per-content source config for JIT packaging |
 
 `{format}` is a plain format (`hls`, `dash`) or a scheme-qualified format (`hls_cenc`, `hls_cbcs`, `dash_cenc`, `dash_cbcs`, `hls_none`, `dash_none`). Scheme-qualified routes are produced by dual-scheme requests; plain routes still work for backward compatibility (single-scheme requests).
 
