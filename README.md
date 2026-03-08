@@ -1,4 +1,4 @@
-<img width="460" height="340" alt="edgepack_logo" src="edgepack.png" />
+<img alt="edgepack_logo" src="edgepack_logo.png" />
 
 # edgepack
 
