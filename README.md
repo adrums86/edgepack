@@ -144,6 +144,46 @@ All configuration is via environment variables.
 | `JIT_DEFAULT_CONTAINER_FORMAT` | `cmaf` | Default format: `cmaf` or `fmp4` |
 | `JIT_LOCK_TTL` | `30` | Processing lock TTL in seconds |
 
+### Runtime Policy Controls
+
+Restrict which encryption schemes, output formats, and container formats are available to end users. Uses a **fail-closed allowlist** — when a policy variable is set, only the listed values are permitted; everything else is denied with HTTP 403.
+
+| Variable | Default | Values | Description |
+|----------|---------|--------|-------------|
+| `POLICY_ALLOWED_SCHEMES` | *(unset = all allowed)* | `cenc`, `cbcs`, `none` | Comma-separated list of permitted encryption schemes |
+| `POLICY_ALLOWED_FORMATS` | *(unset = all allowed)* | `hls`, `dash` | Comma-separated list of permitted output formats |
+| `POLICY_ALLOWED_CONTAINERS` | *(unset = all allowed)* | `cmaf`, `fmp4`, `iso`, `ts` | Comma-separated list of permitted container formats |
+
+**Semantics:**
+- **Unset** (default) — no restriction, all values allowed. Zero-config backward compatible.
+- **Set to a list** (e.g., `cenc,cbcs`) — only the listed values are permitted. Any request for a value not in the list returns HTTP 403 Forbidden.
+- **Set to empty** (e.g., `POLICY_ALLOWED_FORMATS=`) — nothing is permitted (full lockdown). All content endpoints return 403.
+
+**Examples:**
+
+```bash
+# Only allow HLS output — DASH requests return 403
+POLICY_ALLOWED_FORMATS=hls
+
+# Only allow CENC and CBCS — clear content delivery is blocked
+POLICY_ALLOWED_SCHEMES=cenc,cbcs
+
+# Only allow CMAF containers — fMP4, ISO BMFF, and TS requests return 403
+POLICY_ALLOWED_CONTAINERS=cmaf
+
+# Full lockdown — all content endpoints return 403, only /health responds
+POLICY_ALLOWED_FORMATS=
+POLICY_ALLOWED_SCHEMES=
+POLICY_ALLOWED_CONTAINERS=
+```
+
+**Security guarantees:**
+- **Fail-closed**: Only explicitly listed values pass. No value can bypass the allowlist by default.
+- **Defense in depth**: Two enforcement layers — route-level (checks format and URL-visible scheme before any processing) and JIT-setup (checks resolved scheme and container format before pipeline execution).
+- **Non-bypassable**: Policy is checked on every request path — manifests, init segments, media segments, I-frame playlists, and key endpoints are all gated.
+- **Health check exempt**: `GET /health` always responds regardless of policy. Operators can verify the instance is running even under full lockdown.
+- **HTTP 403 Forbidden**: Denied requests return 403 with a descriptive message identifying which value was blocked, not 404 (which could be confused with missing content).
+
 ## API
 
 On a cache miss, the edge worker instantiates (<1 ms), fetches the source segment from origin, repackages it with the target DRM scheme, caches the result in-process with immutable headers, and serves it. Subsequent requests hit the CDN cache directly.

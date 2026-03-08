@@ -629,3 +629,90 @@ graph TB
     classDef enum fill:#1F2937,stroke:#F59E0B,color:#F9FAFB
     class CMAF,FMP4,TS enum
 ```
+
+---
+
+## 12. Runtime Policy Enforcement
+
+Shows the two-layer fail-closed policy enforcement flow. Route-level checks reject disallowed formats and URL-visible schemes before any processing begins. JIT-setup checks enforce resolved schemes (from JIT defaults) and container formats (from source config) before the pipeline executes.
+
+```mermaid
+flowchart TB
+    subgraph Request["Incoming GET Request"]
+        style Request fill:#1F2937,stroke:#6B7280,color:#F9FAFB
+        Req["GET /repackage/{id}/{format}/..."]
+    end
+
+    subgraph RouteLevel["Layer 1: Route-Level Enforcement"]
+        style RouteLevel fill:#7F1D1D,stroke:#EF4444,color:#F9FAFB
+        Parse["parse_and_check_policy()"]
+        FmtCheck{"Format in<br/>allowed_formats?"}
+        SchCheck{"Scheme in<br/>allowed_schemes?<br/>(if URL-explicit)"}
+    end
+
+    subgraph JitLevel["Layer 2: JIT-Setup Enforcement"]
+        style JitLevel fill:#7F1D1D,stroke:#F97316,color:#F9FAFB
+        Resolve["ensure_jit_setup()"]
+        SchResolve{"Resolved scheme in<br/>allowed_schemes?"}
+        CtrCheck{"Container format in<br/>allowed_containers?"}
+    end
+
+    subgraph Pipeline["Pipeline Execution"]
+        style Pipeline fill:#14532D,stroke:#22C55E,color:#F9FAFB
+        Exec["RepackagePipeline::execute()"]
+    end
+
+    Deny403["HTTP 403 Forbidden"]
+    style Deny403 fill:#991B1B,stroke:#EF4444,color:#F9FAFB
+
+    Req --> Parse
+    Parse --> FmtCheck
+    FmtCheck -->|"No"| Deny403
+    FmtCheck -->|"Yes"| SchCheck
+    SchCheck -->|"No"| Deny403
+    SchCheck -->|"Yes / N/A"| Resolve
+    Resolve --> SchResolve
+    SchResolve -->|"No"| Deny403
+    SchResolve -->|"Yes"| CtrCheck
+    CtrCheck -->|"No"| Deny403
+    CtrCheck -->|"Yes"| Exec
+```
+
+### Policy Allowlist Semantics
+
+```mermaid
+graph LR
+    subgraph Model["Option<Vec<T>> Allowlist Model"]
+        style Model fill:#1F2937,stroke:#6B7280,color:#F9FAFB
+        None["None<br/>(field unset)"]
+        SomeList["Some([Cenc, Cbcs])<br/>(field set)"]
+        SomeEmpty["Some([])<br/>(empty list)"]
+    end
+
+    NoneResult["All values allowed<br/>No restriction<br/>(backward compatible)"]
+    ListResult["Only listed values<br/>Everything else → 403"]
+    EmptyResult["Nothing allowed<br/>Full lockdown → 403"]
+
+    style NoneResult fill:#14532D,stroke:#22C55E,color:#F9FAFB
+    style ListResult fill:#78350F,stroke:#F59E0B,color:#F9FAFB
+    style EmptyResult fill:#991B1B,stroke:#EF4444,color:#F9FAFB
+
+    None --> NoneResult
+    SomeList --> ListResult
+    SomeEmpty --> EmptyResult
+```
+
+### What Gets Checked Where
+
+| Enforcement Layer | What's Checked | When | Source |
+|-------------------|---------------|------|--------|
+| **Route level** (`parse_and_check_policy`) | Output format (HLS/DASH) | Every request, before cache lookup | URL path `{format}` segment |
+| **Route level** (`parse_and_check_policy`) | Encryption scheme (CENC/CBCS/None) | When scheme is explicit in URL (e.g., `hls_cenc`) | URL path `{format}` segment |
+| **JIT setup** (`ensure_jit_setup`) | Encryption scheme | After resolving from JIT defaults | `JitConfig.default_target_scheme` |
+| **JIT setup** (`ensure_jit_setup`) | Container format (CMAF/fMP4/ISO/TS) | After resolving source config | `SourceConfig.container_format` |
+
+### Exempt Endpoints
+
+| Endpoint | Reason |
+|----------|--------|
+| `GET /health` | Operational monitoring must work under full lockdown |

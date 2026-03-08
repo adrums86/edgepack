@@ -92,7 +92,7 @@ src/
 
 ## Architecture Diagrams
 
-Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md). The file contains 11 diagrams: system context, data flow, module architecture, JIT execution sequence, progressive output state machine, cache security model, cache key layout, CDN caching strategy, per-segment encryption transform, container format comparison, and I-frame detection & trick play flow. All diagrams are Mermaid syntax, portable to Confluence, Jira, and Lucidchart.
+Detailed Mermaid diagrams are in [`docs/architecture.md`](docs/architecture.md). The file contains 13 diagrams: system context, data flow, module architecture, JIT execution sequence, progressive output state machine, cache security model, cache key layout, CDN caching strategy, per-segment encryption transform, container format comparison, I-frame detection & trick play flow, runtime policy enforcement flow, and policy allowlist semantics. All diagrams are Mermaid syntax, portable to Confluence, Jira, and Lucidchart.
 
 ## Key Concepts
 
