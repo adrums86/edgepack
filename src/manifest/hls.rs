@@ -255,10 +255,8 @@ pub fn render(state: &ManifestState) -> Result<String> {
                 m3u8.push('\n');
             }
         }
-        m3u8.push_str(&format!("#EXTINF:{:.6},\n", segment.duration));
-        m3u8.push_str(&format!("{}\n", segment.uri));
-
-        // LL-HLS: emit EXT-X-PART tags for parts belonging to this segment
+        // LL-HLS: emit EXT-X-PART tags before the parent segment's EXTINF
+        // per RFC 8216bis Section 4.4.4.9
         if is_ll_hls {
             for part in &state.parts {
                 if part.segment_number == segment.number {
@@ -273,6 +271,9 @@ pub fn render(state: &ManifestState) -> Result<String> {
                 }
             }
         }
+
+        m3u8.push_str(&format!("#EXTINF:{:.6},\n", segment.duration));
+        m3u8.push_str(&format!("{}\n", segment.uri));
     }
 
     // End list for completed manifests
@@ -913,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ll_hls_parts_after_segments() {
+    fn render_ll_hls_parts_before_extinf() {
         let mut state = make_live_state_with_segments(2);
         state.part_target_duration = Some(0.33334);
         state.parts.push(crate::manifest::types::PartInfo {
@@ -941,12 +942,20 @@ mod tests {
             byte_size: 5000,
         });
         let m3u8 = render(&state).unwrap();
-        // Parts should appear after their segment's URI
-        let seg0_pos = m3u8.find("/base/segment_0.cmfv").unwrap();
+        // RFC 8216bis 4.4.4.9: Parts MUST appear before the EXTINF of the parent segment
         let part00_pos = m3u8.find("/base/part_0.0.cmfv").unwrap();
         let part01_pos = m3u8.find("/base/part_0.1.cmfv").unwrap();
-        assert!(part00_pos > seg0_pos);
-        assert!(part01_pos > part00_pos);
+        let seg0_pos = m3u8.find("/base/segment_0.cmfv").unwrap();
+        let part10_pos = m3u8.find("/base/part_1.0.cmfv").unwrap();
+        let seg1_pos = m3u8.find("/base/segment_1.cmfv").unwrap();
+        // Segment 0's parts appear before segment 0's URI
+        assert!(part00_pos < seg0_pos, "part 0.0 must precede segment 0 URI");
+        assert!(part01_pos < seg0_pos, "part 0.1 must precede segment 0 URI");
+        assert!(part01_pos > part00_pos, "parts must be in order");
+        // Segment 1's part appears before segment 1's URI
+        assert!(part10_pos < seg1_pos, "part 1.0 must precede segment 1 URI");
+        // Segment 0's parts appear before segment 1's parts
+        assert!(part01_pos < part10_pos, "segment 0 parts before segment 1 parts");
         // Independent flag
         assert!(m3u8.contains("INDEPENDENT=YES"));
         // Part count

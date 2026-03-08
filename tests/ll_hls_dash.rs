@@ -185,6 +185,13 @@ fn hls_ll_rendering_with_parts() {
     assert!(m3u8.contains("#EXT-X-PART:DURATION="));
     assert!(m3u8.contains("INDEPENDENT=YES"));
     assert_eq!(m3u8.matches("#EXT-X-PART:").count(), 2);
+    // RFC 8216bis 4.4.4.9: EXT-X-PART tags MUST appear before the EXTINF of the parent segment
+    let part_pos = m3u8.find("#EXT-X-PART:DURATION=").unwrap();
+    let extinf_pos = m3u8.find("#EXTINF:").unwrap();
+    assert!(
+        part_pos < extinf_pos,
+        "EXT-X-PART must appear before EXTINF per RFC 8216bis"
+    );
 }
 
 // ─── DASH LL-DASH Parsing and Rendering Roundtrip ────────────────────

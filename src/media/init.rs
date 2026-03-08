@@ -438,9 +438,12 @@ fn build_tenc(kid: &[u8; 16], iv_size: u8, pattern: (u8, u8)) -> Vec<u8> {
     let total: u32 = 8 + 1 + 3 + 1 + 1 + 1 + 16;
     let mut output = Vec::with_capacity(total as usize);
     cmaf::write_box_header(&mut output, total, &box_type::TENC);
-    output.push(0); // version
+    // ISO/IEC 14496-12: version MUST be 1 when crypt/skip pattern is non-zero (CBCS).
+    // Version 0 treats byte 4 as reserved; version 1 uses it for crypt/skip fields.
+    let version: u8 = if pattern != (0, 0) { 1 } else { 0 };
+    output.push(version);
     output.extend_from_slice(&[0u8; 3]); // flags
-    // reserved byte encodes crypt_byte_block (upper nibble) + skip_byte_block (lower nibble)
+    // Byte 4: default_crypt_byte_block (upper nibble) + default_skip_byte_block (lower nibble)
     let crypt_skip = (pattern.0 << 4) | (pattern.1 & 0x0F);
     output.push(crypt_skip);
     output.push(1); // default_isProtected = 1
@@ -1187,6 +1190,8 @@ mod tests {
         let kid = [0x01; 16];
         let tenc = build_tenc(&kid, 8, (0, 0));
         assert_eq!(&tenc[4..8], b"tenc");
+        // CENC (0,0) pattern → version 0
+        assert_eq!(tenc[8], 0, "CENC tenc must be version 0");
         let version_flags_reserved_len = 4 + 1; // version(1)+flags(3)+reserved(1)
         let is_protected_offset = 8 + version_flags_reserved_len;
         assert_eq!(tenc[is_protected_offset], 1);
@@ -1201,6 +1206,8 @@ mod tests {
         let kid = [0x03; 16];
         let tenc = build_tenc(&kid, 16, (1, 9));
         assert_eq!(&tenc[4..8], b"tenc");
+        // CBCS (1,9) pattern → version 1 per ISO/IEC 14496-12
+        assert_eq!(tenc[8], 1, "CBCS tenc must be version 1 for non-zero pattern");
         // Check pattern byte: crypt=1 (upper nibble), skip=9 (lower nibble) = 0x19
         assert_eq!(tenc[8 + 4], 0x19);
         let is_protected_offset = 8 + 5;

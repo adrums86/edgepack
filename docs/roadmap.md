@@ -23,6 +23,7 @@
 | 19 | Configurable Cache-Control Headers | Done |
 | 21 | Generic HLS/DASH Pipeline (Dual-Format) | Done |
 | 22 | TS Segment Output (feature-gated) | Done |
+| 24 | Spec Compliance Fixes | Done |
 
 ---
 
@@ -32,21 +33,10 @@ Derived from the full audit conducted 2026-03-08 (see `edgepack-audit-2026-03-08
 
 ---
 
-### Phase 24: Spec Compliance Fixes — P0
+### ~~Phase 24: Spec Compliance Fixes — P0~~ Done
 
-Critical output correctness issues that must be fixed before production deployment.
-
-**[H1] tenc box version for CBCS pattern encryption**
-- File: `src/media/init.rs:441`
-- `build_tenc()` hardcodes version 0. Per ISO/IEC 14496-12, version MUST be 1 when `default_crypt_byte_block` and `default_skip_byte_block` are non-zero (CBCS 1:9 pattern). Strict ISOBMFF parsers may ignore the pattern fields in a v0 tenc box.
-- Fix: set version to 1 when `pattern != (0, 0)`, keep version 0 for CENC `(0, 0)`.
-- Update tests in `init.rs`, `output_integrity.rs`, `conformance.rs` to verify version byte.
-
-**[H2] LL-HLS EXT-X-PART tag ordering**
-- File: `src/manifest/hls.rs:258-275`
-- Parts are emitted *after* the `#EXTINF` + URI of their parent segment. RFC 8216bis Section 4.4.4.9 requires `#EXT-X-PART` tags *before* the `#EXTINF` of the parent segment. Current ordering will break conformant LL-HLS players.
-- Fix: move the parts loop before the `#EXTINF` line for each segment.
-- Update tests in `hls.rs`, `ll_hls_dash.rs`, `output_integrity.rs`.
+- **[H1]** `build_tenc()` now emits version 1 for CBCS (non-zero pattern), version 0 for CENC — per ISO/IEC 14496-12. Unit tests verify version byte for both schemes.
+- **[H2]** `#EXT-X-PART` tags now emitted before `#EXTINF` of the parent segment — per RFC 8216bis Section 4.4.4.9. Unit test renamed and assertions corrected; integration test ordering assertion added.
 
 ---
 
@@ -199,7 +189,7 @@ Accept Media over QUIC (MoQ) streams from an upstream MoQ relay as a source inpu
 
 | Priority | Phase | Name | Items |
 |----------|-------|------|-------|
-| **P0** | 24 | Spec Compliance Fixes | 2 items (tenc version, LL-HLS part ordering) |
+| ~~P0~~ | ~~24~~ | ~~Spec Compliance Fixes~~ | ~~Done~~ |
 | **P1** | 25 | Manifest Correctness Fixes | 3 items (DASH DVR @t, DATERANGE 24h, HLS windowed iterators) |
 | **P1** | 26 | Error Handling Hardening | 3 items (unwrap→Result, panic→Result, OOM clamp) |
 | **P2** | 27 | Hot Path Performance | 5 items (SencEntry inline, fused loops, write!(), box copy, minor allocs) |

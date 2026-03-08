@@ -579,4 +579,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, and 22 are complete (original feature phases). Active roadmap derived from 2026-03-08 audit: P0: Phase 24 (Spec Compliance Fixes). P1: Phases 25–26 (Manifest Correctness, Error Handling). P2: Phases 18, 27–29 (Binary Size, Performance, DASH Polish, Feature Gaps). P3: Phase 23 (MoQ Ingest).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, 22, and 24 are complete. Active roadmap derived from 2026-03-08 audit: P1: Phases 25–26 (Manifest Correctness, Error Handling). P2: Phases 18, 27–29 (Binary Size, Performance, DASH Polish, Feature Gaps). P3: Phase 23 (MoQ Ingest).
