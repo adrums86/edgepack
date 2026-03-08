@@ -349,11 +349,27 @@ fn build_segment_template(state: &ManifestState) -> String {
     xml.push_str(">\n");
 
     xml.push_str("        <SegmentTimeline>\n");
-    for segment in segments {
+    for (i, segment) in segments.iter().enumerate() {
         let duration_ms = (segment.duration * timescale as f64) as u64;
-        xml.push_str(&format!(
-            "          <S d=\"{duration_ms}\"/>\n"
-        ));
+        if i == 0 && start_number > 0 {
+            // Per ISO 23009-1: when DVR sliding window is active (startNumber > 0),
+            // the first <S> must have @t set to the cumulative duration of all
+            // segments before the window. Without @t, the implicit start time is 0,
+            // creating a mismatch with actual segment presentation times.
+            let t: u64 = state
+                .segments
+                .iter()
+                .take_while(|s| s.number < segment.number)
+                .map(|s| (s.duration * timescale as f64) as u64)
+                .sum();
+            xml.push_str(&format!(
+                "          <S t=\"{t}\" d=\"{duration_ms}\"/>\n"
+            ));
+        } else {
+            xml.push_str(&format!(
+                "          <S d=\"{duration_ms}\"/>\n"
+            ));
+        }
     }
     xml.push_str("        </SegmentTimeline>\n");
     xml.push_str("      </SegmentTemplate>\n");
@@ -1003,6 +1019,39 @@ mod tests {
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("queryBeforeStart=\"false\""));
+    }
+
+    // --- DVR SegmentTimeline @t tests ---
+
+    #[test]
+    fn render_dvr_first_s_has_t_attribute() {
+        let mut state = make_live_state_with_segments(10);
+        state.dvr_window_duration = Some(30.0); // 5 segments × 6.0s = 30s window
+        let mpd = render(&state).unwrap();
+        // Windowed segments start at index 5 (segments 5-9).
+        // Cumulative duration of segments 0-4 = 5 × 6000ms = 30000ms.
+        assert!(mpd.contains("startNumber=\"5\""));
+        assert!(mpd.contains("<S t=\"30000\" d=\"6000\"/>"), "first <S> must have @t for DVR");
+        // Subsequent <S> elements should not have @t
+        let s_count = mpd.matches("<S t=").count();
+        assert_eq!(s_count, 1, "only first <S> should have @t");
+    }
+
+    #[test]
+    fn render_no_dvr_no_t_attribute() {
+        let state = make_live_state_with_segments(3);
+        let mpd = render(&state).unwrap();
+        assert!(!mpd.contains("<S t="), "no @t when startNumber is 0");
+    }
+
+    #[test]
+    fn render_dvr_window_larger_than_total_no_t() {
+        let mut state = make_live_state_with_segments(3);
+        state.dvr_window_duration = Some(3600.0); // much larger than total
+        let mpd = render(&state).unwrap();
+        // All segments fit in window, startNumber=0
+        assert!(mpd.contains("startNumber=\"0\""));
+        assert!(!mpd.contains("<S t="), "no @t when all segments fit in window");
     }
 
     #[test]

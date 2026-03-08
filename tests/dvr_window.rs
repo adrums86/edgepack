@@ -179,8 +179,8 @@ fn dash_dvr_window_live_renders_windowed_segments() {
     let state = common::make_dash_dvr_manifest_state(10, ManifestPhase::Live, 30.0);
     let mpd = dash::render(&state).unwrap();
 
-    // Should only have 5 <S d="..."/> entries
-    let s_entries = mpd.matches("<S d=\"").count();
+    // Should only have 5 <S entries (first has @t, rest are d-only)
+    let s_entries = mpd.matches("<S ").count();
     assert_eq!(s_entries, 5);
 }
 
@@ -191,6 +191,29 @@ fn dash_dvr_window_live_start_number() {
 
     // startNumber should be 5 (first segment in the window)
     assert!(mpd.contains("startNumber=\"5\""));
+}
+
+#[test]
+fn dash_dvr_window_first_s_has_t_attribute() {
+    let state = common::make_dash_dvr_manifest_state(10, ManifestPhase::Live, 30.0);
+    let mpd = dash::render(&state).unwrap();
+
+    // DVR window: segments 5-9. Cumulative duration of segments 0-4 = 5 × 6000ms = 30000ms.
+    // Per ISO 23009-1, first <S> must have @t to avoid implicit t=0 mismatch.
+    assert!(
+        mpd.contains("<S t=\"30000\" d=\"6000\"/>"),
+        "first <S> must have @t for DVR windowed timeline"
+    );
+    // Only the first <S> should have @t
+    assert_eq!(mpd.matches("<S t=").count(), 1);
+}
+
+#[test]
+fn dash_dvr_window_complete_no_t_attribute() {
+    let state = common::make_dash_dvr_manifest_state(10, ManifestPhase::Complete, 30.0);
+    let mpd = dash::render(&state).unwrap();
+    // Complete phase: startNumber=0, no @t needed
+    assert!(!mpd.contains("<S t="), "Complete phase should not have @t");
 }
 
 #[test]
@@ -396,7 +419,8 @@ fn dash_dvr_window_with_trick_play() {
     // Trick play AdaptationSet should still appear
     assert!(mpd.contains("http://dashif.org/guidelines/trickmode"));
     // Main video timeline should only have 5 entries
-    let s_entries = mpd.matches("<S d=\"").count();
+    let s_entries = mpd.matches("<S ").count();
     // Two SegmentTemplates (main + trick) each with 5 entries = 10
+    // (first <S> in each has @t attribute due to DVR)
     assert_eq!(s_entries, 10);
 }

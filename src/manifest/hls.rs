@@ -228,8 +228,8 @@ pub fn render(state: &ManifestState) -> Result<String> {
             }
         }
 
-        // SCTE-35 ad break markers for this segment
-        for ab in &state.ad_breaks {
+        // SCTE-35 ad break markers for this segment (windowed for DVR)
+        for ab in state.windowed_ad_breaks() {
             if ab.segment_number == segment.number {
                 let mut daterange = format!(
                     "#EXT-X-DATERANGE:ID=\"splice-{}\"",
@@ -238,11 +238,14 @@ pub fn render(state: &ManifestState) -> Result<String> {
                 // ISO 8601 date from presentation time (epoch-relative)
                 let secs = ab.presentation_time as u64;
                 let frac = ab.presentation_time - secs as f64;
+                let days = secs / 86400;
+                let day_secs = secs % 86400;
                 daterange.push_str(&format!(
-                    ",START-DATE=\"1970-01-01T{:02}:{:02}:{:02}.{:03}Z\"",
-                    (secs / 3600) % 24,
-                    (secs / 60) % 60,
-                    secs % 60,
+                    ",START-DATE=\"1970-01-{:02}T{:02}:{:02}:{:02}.{:03}Z\"",
+                    days + 1, // day-of-month is 1-based
+                    day_secs / 3600,
+                    (day_secs / 60) % 60,
+                    day_secs % 60,
                     (frac * 1000.0) as u32
                 ));
                 if let Some(dur) = ab.duration {
@@ -258,7 +261,7 @@ pub fn render(state: &ManifestState) -> Result<String> {
         // LL-HLS: emit EXT-X-PART tags before the parent segment's EXTINF
         // per RFC 8216bis Section 4.4.4.9
         if is_ll_hls {
-            for part in &state.parts {
+            for part in state.windowed_parts() {
                 if part.segment_number == segment.number {
                     let mut part_attrs = format!(
                         "DURATION={:.5},URI=\"{}\"",
@@ -1132,6 +1135,99 @@ mod tests {
         });
         let m3u8 = render(&state).unwrap();
         assert!(!m3u8.contains("CONTENT-STEERING"));
+    }
+
+    // --- DATERANGE 24h fix tests ---
+
+    #[test]
+    fn render_ad_break_start_date_beyond_24h() {
+        let mut state = make_live_state_with_segments(1);
+        // presentation_time = 90061.5s = 25h1m1.5s → should be 1970-01-02T01:01:01.500Z
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 90061.5,
+            duration: None,
+            scte35_cmd: None,
+            segment_number: 0,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(
+            m3u8.contains("START-DATE=\"1970-01-02T01:01:01.500Z\""),
+            "START-DATE must not wrap at 24h: {}",
+            m3u8
+        );
+    }
+
+    #[test]
+    fn render_ad_break_start_date_within_24h() {
+        let mut state = make_live_state_with_segments(1);
+        // 12.0s = 0h0m12.0s → 1970-01-01T00:00:12.000Z (unchanged behavior)
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 12.0,
+            duration: None,
+            scte35_cmd: None,
+            segment_number: 0,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(m3u8.contains("START-DATE=\"1970-01-01T00:00:12.000Z\""));
+    }
+
+    // --- DVR windowed ad breaks + parts tests ---
+
+    #[test]
+    fn render_dvr_windowed_ad_breaks() {
+        let mut state = make_live_state_with_segments(10);
+        state.dvr_window_duration = Some(30.0); // 5 segments × 6.006s ≈ 30s → segments 5-9
+
+        // Ad break in segment 1 (outside window) — should NOT appear
+        state.ad_breaks.push(AdBreakInfo {
+            id: 1,
+            presentation_time: 6.0,
+            duration: Some(15.0),
+            scte35_cmd: None,
+            segment_number: 1,
+        });
+        // Ad break in segment 7 (inside window) — should appear
+        state.ad_breaks.push(AdBreakInfo {
+            id: 2,
+            presentation_time: 42.0,
+            duration: Some(30.0),
+            scte35_cmd: None,
+            segment_number: 7,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(!m3u8.contains("splice-1"), "ad break outside DVR window should be excluded");
+        assert!(m3u8.contains("splice-2"), "ad break inside DVR window should be included");
+    }
+
+    #[test]
+    fn render_dvr_windowed_parts() {
+        let mut state = make_live_state_with_segments(10);
+        state.dvr_window_duration = Some(30.0); // segments 5-9 in window
+        state.part_target_duration = Some(1.0); // enable LL-HLS
+
+        // Part in segment 1 (outside window)
+        state.parts.push(PartInfo {
+            segment_number: 1,
+            part_index: 0,
+            duration: 1.0,
+            independent: true,
+            uri: "part_1_0.cmfv".into(),
+            byte_size: 512,
+        });
+        // Part in segment 7 (inside window)
+        state.parts.push(PartInfo {
+            segment_number: 7,
+            part_index: 0,
+            duration: 1.0,
+            independent: true,
+            uri: "part_7_0.cmfv".into(),
+            byte_size: 512,
+        });
+        let m3u8 = render(&state).unwrap();
+        assert!(!m3u8.contains("part_1_0.cmfv"), "part outside DVR window should be excluded");
+        assert!(m3u8.contains("part_7_0.cmfv"), "part inside DVR window should be included");
     }
 }
 

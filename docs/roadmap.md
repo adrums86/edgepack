@@ -24,6 +24,7 @@
 | 21 | Generic HLS/DASH Pipeline (Dual-Format) | Done |
 | 22 | TS Segment Output (feature-gated) | Done |
 | 24 | Spec Compliance Fixes | Done |
+| 25 | Manifest Correctness Fixes | Done |
 
 ---
 
@@ -40,27 +41,11 @@ Derived from the full audit conducted 2026-03-08 (see `edgepack-audit-2026-03-08
 
 ---
 
-### Phase 25: Manifest Correctness Fixes — P1
+### ~~Phase 25: Manifest Correctness Fixes — P1~~ Done
 
-Medium-severity spec compliance and correctness issues.
-
-**[M1] DASH SegmentTimeline missing @t for DVR**
-- File: `src/manifest/dash.rs:351-357`
-- When DVR sliding window is active (`startNumber > 0`), the first `<S>` element lacks a `@t` attribute. Per ISO 23009-1, the implicit start time is 0, creating a mismatch with actual segment presentation times.
-- Fix: compute `t = sum(durations of all segments before window)` and set `@t` on the first `<S>`.
-- Update tests in `dash.rs`, `dvr_window.rs`.
-
-**[M2] HLS EXT-X-DATERANGE wraps at 24 hours**
-- File: `src/manifest/hls.rs:239-247`
-- `START-DATE` calculation uses `(secs / 3600) % 24`, wrapping the date after 24 hours. Streams longer than 24h produce invalid ISO 8601 timestamps.
-- Fix: compute full days and format as `1970-01-{day}T{hh}:{mm}:{ss}.{ms}Z` or use a proper epoch-to-ISO-8601 conversion.
-- Update tests in `hls.rs`, `scte35_integration.rs`.
-
-**[M3] HLS DVR windowed iterators for ad breaks and parts**
-- File: `src/manifest/hls.rs:232,263`
-- The HLS renderer iterates `&state.ad_breaks` and `&state.parts` instead of `state.windowed_ad_breaks()` and `state.windowed_parts()`. The DASH renderer already uses windowed versions correctly.
-- Fix: replace with windowed iterators to match DASH behavior.
-- Update tests in `hls.rs`, `dvr_window.rs`.
+- **[M1]** DASH `<SegmentTimeline>` first `<S>` now includes `@t` attribute when DVR window is active (`startNumber > 0`) — per ISO 23009-1. Computes cumulative duration of all segments before the window. Unit and integration tests added in `dash.rs`, `dvr_window.rs`.
+- **[M2]** HLS `#EXT-X-DATERANGE` `START-DATE` no longer wraps at 24 hours. Properly computes full days for streams longer than 24h. Unit tests in `hls.rs`, integration test in `scte35_integration.rs`.
+- **[M3]** HLS renderer now uses `windowed_ad_breaks()` and `windowed_parts()` for DVR — matching DASH renderer behavior. Unit tests for DVR windowed ad breaks and parts added in `hls.rs`.
 
 ---
 
@@ -190,7 +175,7 @@ Accept Media over QUIC (MoQ) streams from an upstream MoQ relay as a source inpu
 | Priority | Phase | Name | Items |
 |----------|-------|------|-------|
 | ~~P0~~ | ~~24~~ | ~~Spec Compliance Fixes~~ | ~~Done~~ |
-| **P1** | 25 | Manifest Correctness Fixes | 3 items (DASH DVR @t, DATERANGE 24h, HLS windowed iterators) |
+| ~~P1~~ | ~~25~~ | ~~Manifest Correctness Fixes~~ | ~~Done~~ |
 | **P1** | 26 | Error Handling Hardening | 3 items (unwrap→Result, panic→Result, OOM clamp) |
 | **P2** | 27 | Hot Path Performance | 5 items (SencEntry inline, fused loops, write!(), box copy, minor allocs) |
 | **P2** | 28 | DASH Manifest Polish | 2 items (SegmentTimeline @r, ContentProtection value) |

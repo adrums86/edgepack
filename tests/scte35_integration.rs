@@ -209,6 +209,24 @@ fn hls_manifest_no_ad_breaks_no_daterange() {
     assert!(!text.contains("#EXT-X-DATERANGE:"));
 }
 
+#[test]
+fn hls_daterange_start_date_beyond_24h() {
+    let mut state = make_hls_manifest_state(1, ManifestPhase::Complete);
+    // 90061.5s = 25h 1m 1.5s → should produce 1970-01-02T01:01:01.500Z (not wrap)
+    state.ad_breaks.push(AdBreakInfo {
+        id: 1,
+        presentation_time: 90061.5,
+        duration: None,
+        scte35_cmd: None,
+        segment_number: 0,
+    });
+    let text = manifest::render_manifest(&state).unwrap();
+    assert!(
+        text.contains("START-DATE=\"1970-01-02T01:01:01.500Z\""),
+        "START-DATE must not wrap at 24 hours: {text}"
+    );
+}
+
 // ─── DASH Ad Break Manifest Rendering ────────────────────────────────
 
 #[test]

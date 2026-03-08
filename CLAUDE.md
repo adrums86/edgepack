@@ -375,7 +375,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,290 tests** without optional features. With `--features ts`: **1,452 tests**. All run on the native host target.
+The project has **1,300 tests** without optional features. With `--features ts`: **1,462 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -579,4 +579,4 @@ ClearKey is used for testing and development — its PSSH data is built locally 
 
 ## Roadmap
 
-See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, 22, and 24 are complete. Active roadmap derived from 2026-03-08 audit: P1: Phases 25–26 (Manifest Correctness, Error Handling). P2: Phases 18, 27–29 (Binary Size, Performance, DASH Polish, Feature Gaps). P3: Phase 23 (MoQ Ingest).
+See [`docs/roadmap.md`](docs/roadmap.md) for the full roadmap. Phases 1–14, 16, 17, 19, 21, 22, 24, and 25 are complete. Active roadmap derived from 2026-03-08 audit: P1: Phase 26 (Error Handling). P2: Phases 18, 27–29 (Binary Size, Performance, DASH Polish, Feature Gaps). P3: Phase 23 (MoQ Ingest).
