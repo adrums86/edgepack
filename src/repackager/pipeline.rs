@@ -25,6 +25,33 @@ pub struct JitSetupResult {
     pub init_segment_data: Vec<u8>,
 }
 
+/// Progress event emitted during pipeline execution via `execute_progressive()`.
+///
+/// Enables true progressive output: callers can write segments and manifests
+/// as they become available, enabling playback before all segments are processed.
+pub enum PipelineEvent<'a> {
+    /// Init segment(s) rewritten and ready for all outputs.
+    InitReady {
+        inits: Vec<(OutputFormat, EncryptionScheme, &'a [u8])>,
+    },
+    /// A segment has been processed and distributed to all outputs.
+    SegmentProcessed {
+        segment_number: u32,
+        segment_count: usize,
+        outputs: Vec<SegmentProgressData<'a>>,
+    },
+}
+
+/// Per-(format, scheme) segment data emitted with each `SegmentProcessed` event.
+pub struct SegmentProgressData<'a> {
+    pub format: OutputFormat,
+    pub scheme: EncryptionScheme,
+    pub segment_number: u32,
+    pub segment_data: &'a [u8],
+    /// The current manifest string (Live phase). `None` only during `AwaitingFirstSegment`.
+    pub manifest: Option<String>,
+}
+
 /// The main repackaging pipeline.
 ///
 /// Orchestrates: fetch source -> get DRM keys -> repackage init segment ->
@@ -43,10 +70,22 @@ impl RepackagePipeline {
         }
     }
 
-    /// Execute the full repackaging pipeline (processes all segments in one invocation).
+    /// Execute the full repackaging pipeline.
     ///
     /// Produces one `ProgressiveOutput` per (format, scheme) combination.
     pub fn execute(&self, request: &RepackageRequest) -> Result<Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>> {
+        self.execute_progressive(request, |_| {})
+    }
+
+    /// Execute the pipeline with a progress callback.
+    ///
+    /// Identical to `execute()` but invokes `on_progress` at key stages so
+    /// callers can write output incrementally. The callback receives borrowed
+    /// data (zero-copy) — clone only what you need to persist.
+    pub fn execute_progressive<F>(&self, request: &RepackageRequest, mut on_progress: F) -> Result<Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>>
+    where
+        F: FnMut(PipelineEvent<'_>),
+    {
         let content_id = &request.content_id;
         let target_schemes = &request.target_schemes;
         let container_format = request.container_format;
@@ -251,6 +290,13 @@ impl RepackagePipeline {
             }
         }
 
+        // Notify: init segments ready
+        on_progress(PipelineEvent::InitReady {
+            inits: outputs.iter().map(|(fmt, scheme, prog)| {
+                (*fmt, *scheme, prog.init_segment_data().unwrap_or(&[]))
+            }).collect(),
+        });
+
         // Step 6: Process each media segment
         let source_iv_size = protection_info.as_ref()
             .map(|info| info.tenc.default_per_sample_iv_size)
@@ -414,6 +460,21 @@ impl RepackagePipeline {
                     progressive.finalize();
                 }
             }
+
+            // Notify: segment processed
+            on_progress(PipelineEvent::SegmentProcessed {
+                segment_number: i as u32,
+                segment_count: source.segment_urls.len(),
+                outputs: outputs.iter().map(|(fmt, scheme, prog)| {
+                    SegmentProgressData {
+                        format: *fmt,
+                        scheme: *scheme,
+                        segment_number: i as u32,
+                        segment_data: prog.segment_data(i as u32).unwrap_or(&[]),
+                        manifest: prog.current_manifest(),
+                    }
+                }).collect(),
+            });
 
         }
 

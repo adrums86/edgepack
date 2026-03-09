@@ -1,6 +1,8 @@
 pub mod pipeline;
 pub mod progressive;
 
+pub use pipeline::{PipelineEvent, SegmentProgressData};
+
 use crate::drm::scheme::EncryptionScheme;
 use crate::manifest::types::OutputFormat;
 use crate::media::container::ContainerFormat;

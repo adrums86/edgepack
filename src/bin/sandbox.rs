@@ -30,6 +30,7 @@ use edgepack::media::codec;
 use edgepack::media::TrackType;
 use edgepack::repackager::pipeline::RepackagePipeline;
 use edgepack::repackager::progressive::ProgressiveOutput;
+use edgepack::repackager::PipelineEvent;
 use edgepack::repackager::RepackageRequest;
 use edgepack::repackager::SourceConfig;
 
@@ -112,6 +113,8 @@ struct StatusResponse {
     validation: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timing: Option<serde_json::Value>,
+    #[serde(default)]
+    playback_ready: bool,
 }
 
 #[derive(Serialize)]
@@ -361,49 +364,124 @@ async fn handle_repackage(
         // Clone config for audio pipeline if we have a separate audio rendition
         let audio_config = audio_source.as_ref().map(|_| config.clone());
         let pipeline = RepackagePipeline::new(config);
-        match pipeline.execute(&request) {
-            Ok(outputs) => {
-                let pipeline_elapsed = pipeline_start.elapsed();
-                eprintln!(
-                    "  Pipeline complete: {}/{} — {} output(s) in {:.1}s",
-                    cid,
-                    fmt_str,
-                    outputs.len(),
-                    pipeline_elapsed.as_secs_f64()
-                );
+        // --- Progressive pipeline execution ---
+        // Uses execute_progressive() so segments and manifests are written
+        // to disk as they're produced. This enables HLS.js/DASH.js to start
+        // playback before all segments have been processed.
+        let container_fmt = request.container_format;
+        let mut scheme_list: Vec<String> = Vec::new();
+        let mut segments_total_count = 0usize;
 
-                let mut total_segments = 0u32;
-                let mut scheme_list = Vec::new();
-                let mut validation_results = Vec::new();
-
-                // Write output per (format, scheme) pair
-                for (out_format, scheme, output) in &outputs {
-                    let scheme_str = scheme.scheme_type_str();
-                    scheme_list.push(scheme_str.to_string());
-                    let seg_count = output.manifest_state().segments.len() as u32;
-                    total_segments = total_segments.max(seg_count);
-
-                    // Clean previous output before writing
-                    let out_dir = PathBuf::from(format!(
-                        "sandbox/output/{cid}/{}_{scheme_str}",
-                        match out_format {
-                            OutputFormat::Hls => "hls",
-                            OutputFormat::Dash => "dash",
+        match pipeline.execute_progressive(&request, |event| {
+            match event {
+                PipelineEvent::InitReady { inits } => {
+                    for (out_format, scheme, init_data) in &inits {
+                        let scheme_str = scheme.scheme_type_str();
+                        if !scheme_list.contains(&scheme_str.to_string()) {
+                            scheme_list.push(scheme_str.to_string());
                         }
-                    ));
-                    if out_dir.exists() {
-                        let _ = std::fs::remove_dir_all(&out_dir);
-                    }
-
-                    if let Err(e) = write_output_to_disk(&cid, *out_format, scheme_str, output, false) {
                         let fmt_label = match out_format {
                             OutputFormat::Hls => "hls",
                             OutputFormat::Dash => "dash",
                         };
-                        eprintln!("  Warning: failed to write {fmt_label}_{scheme_str} output to disk: {e}");
+                        let out_dir = PathBuf::from(format!(
+                            "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
+                        ));
+                        if out_dir.exists() {
+                            let _ = std::fs::remove_dir_all(&out_dir);
+                        }
+                        let _ = std::fs::create_dir_all(&out_dir);
+
+                        if !init_data.is_empty() {
+                            let _ = std::fs::write(out_dir.join("init.mp4"), init_data);
+                            eprintln!("  Wrote {}/init.mp4 ({} bytes)", out_dir.display(), init_data.len());
+                        }
+                    }
+                }
+                PipelineEvent::SegmentProcessed {
+                    segment_number,
+                    segment_count,
+                    outputs: seg_outputs,
+                } => {
+                    segments_total_count = segment_count;
+                    for seg in &seg_outputs {
+                        let scheme_str = seg.scheme.scheme_type_str();
+                        let fmt_label = match seg.format {
+                            OutputFormat::Hls => "hls",
+                            OutputFormat::Dash => "dash",
+                        };
+                        let out_dir = PathBuf::from(format!(
+                            "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
+                        ));
+
+                        // Write segment to disk as soon as it's processed
+                        let seg_ext = container_fmt.video_segment_extension();
+                        let _ = std::fs::write(
+                            out_dir.join(format!("segment_{segment_number}{seg_ext}")),
+                            seg.segment_data,
+                        );
+
+                        // Write current manifest (live phase — no ENDLIST / dynamic type)
+                        if let Some(ref manifest_str) = seg.manifest {
+                            let ext = seg.format.manifest_extension();
+                            let _ = std::fs::write(
+                                out_dir.join(format!("manifest.{ext}")),
+                                manifest_str,
+                            );
+                        }
                     }
 
-                    // Run compliance validation (includes audio track detection)
+                    // Update cache status — playback can start after first segment
+                    let progress_state = serde_json::json!({
+                        "state": "Processing",
+                        "segments_completed": segment_number + 1,
+                        "segments_total": segment_count,
+                        "schemes": &scheme_list,
+                        "playback_ready": true,
+                    });
+                    let _ = cache.set(
+                        &state_key,
+                        &serde_json::to_vec(&progress_state).unwrap(),
+                        3600,
+                    );
+                }
+            }
+        }) {
+            Ok(outputs) => {
+                let pipeline_elapsed = pipeline_start.elapsed();
+                let total_segments = segments_total_count as u32;
+                eprintln!(
+                    "  Pipeline complete: {}/{} — {} output(s) in {:.1}s",
+                    cid, fmt_str, outputs.len(), pipeline_elapsed.as_secs_f64()
+                );
+
+                let mut validation_results = Vec::new();
+
+                // Write final manifests (Complete phase — ENDLIST / static) and I-frame playlists
+                for (out_format, scheme, output) in &outputs {
+                    let scheme_str = scheme.scheme_type_str();
+                    let fmt_label = match out_format {
+                        OutputFormat::Hls => "hls",
+                        OutputFormat::Dash => "dash",
+                    };
+                    let out_dir = PathBuf::from(format!(
+                        "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
+                    ));
+
+                    // Overwrite manifest with finalized version
+                    if let Ok(rendered) = manifest::render_manifest(output.manifest_state()) {
+                        let ext = out_format.manifest_extension();
+                        let _ = std::fs::write(out_dir.join(format!("manifest.{ext}")), rendered);
+                    }
+
+                    // I-frame playlist (HLS only)
+                    if let Ok(Some(iframe_playlist)) = manifest::render_iframe_manifest(output.manifest_state()) {
+                        let _ = std::fs::write(out_dir.join("iframes.m3u8"), iframe_playlist);
+                    }
+
+                    eprintln!("  Wrote {} segments to {}", total_segments, out_dir.display());
+
+                    // Run compliance validation
                     let validation = validate_output(&cid, *out_format, scheme_str, output);
                     validation_results.push(validation);
                 }
@@ -578,7 +656,8 @@ async fn handle_status(
                 });
                 let validation = status.get("validation").cloned();
                 let timing = status.get("timing").cloned();
-                let output_dir = if state_str == "Complete" {
+                let playback_ready = status.get("playback_ready").and_then(|v| v.as_bool()).unwrap_or(false);
+                let output_dir = if state_str == "Complete" || playback_ready {
                     Some(format!("sandbox/output/{content_id}/{fmt}_*/"))
                 } else {
                     None
@@ -594,6 +673,7 @@ async fn handle_status(
                         schemes,
                         validation,
                         timing,
+                        playback_ready,
                     }),
                 )
                     .into_response()
@@ -654,6 +734,7 @@ async fn handle_output(
     let content_type = match path.extension().and_then(|e| e.to_str()) {
         Some("m3u8") => "application/vnd.apple.mpegurl",
         Some("mpd") => "application/dash+xml",
+        Some("ts") => "video/mp2t",
         _ => "video/mp4",
     };
 
@@ -1580,6 +1661,40 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
     color: var(--warning);
     margin-left: 1.3rem;
   }
+  #player-panel { display: none; }
+  #player-panel video {
+    width: 100%;
+    border-radius: 0.5rem;
+    background: #000;
+    max-height: 360px;
+  }
+  .player-status {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.5rem;
+  }
+  .player-status .live-badge {
+    display: inline-block;
+    font-size: 0.6rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 0.25rem;
+    background: rgba(239,68,68,0.2);
+    color: var(--error);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .player-status .vod-badge {
+    display: inline-block;
+    font-size: 0.6rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 0.25rem;
+    background: rgba(34,197,94,0.2);
+    color: var(--success);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
 </style>
 </head>
 <body>
@@ -1721,6 +1836,15 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
 
     <button id="submit-btn" onclick="startRepackage()">Repackage</button>
   </div>
+  
+  <div id="player-panel" class="card">
+    <h3 style="font-size:0.9rem;font-weight:600;margin-bottom:0.75rem;">Progressive Playback</h3>
+    <video id="player-video" controls playsinline></video>
+    <div class="player-status">
+      <span id="player-badge"></span>
+      <span id="player-info"></span>
+    </div>
+  </div>
 
   <div id="status-panel" class="card">
     <div class="status-text">
@@ -1826,8 +1950,117 @@ document.querySelectorAll('input[name="target-scheme"]').forEach(radio => {
 });
 
 let pollTimer = null;
+let playerInitialized = false;
+let hlsPlayer = null;
+let dashPlayer = null;
+
+// Lazy-load a script from CDN (deduplicates)
+const loadedScripts = {};
+function loadScript(src) {
+  if (loadedScripts[src]) return loadedScripts[src];
+  loadedScripts[src] = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return loadedScripts[src];
+}
+
+function destroyPlayer() {
+  if (hlsPlayer) { hlsPlayer.destroy(); hlsPlayer = null; }
+  if (dashPlayer) { dashPlayer.reset(); dashPlayer = null; }
+  const video = document.getElementById('player-video');
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  playerInitialized = false;
+  document.getElementById('player-panel').style.display = 'none';
+  document.getElementById('player-badge').innerHTML = '';
+  document.getElementById('player-info').textContent = '';
+}
+
+async function initPlayer(contentId, format, scheme, containerFormat) {
+  if (playerInitialized) return;
+  playerInitialized = true;
+
+  const panel = document.getElementById('player-panel');
+  const video = document.getElementById('player-video');
+  const badge = document.getElementById('player-badge');
+  const info = document.getElementById('player-info');
+  panel.style.display = 'block';
+
+  // Encrypted content cannot play without a license server
+  if (scheme !== 'none') {
+    badge.innerHTML = '';
+    info.textContent = 'Encrypted (' + scheme.toUpperCase() + ') \u2014 playback requires a license server';
+    video.style.display = 'none';
+    return;
+  }
+  video.style.display = 'block';
+
+  const fmtScheme = format + '_' + scheme;
+  const ext = format === 'hls' ? 'm3u8' : 'mpd';
+  const manifestUrl = '/api/output/' + contentId + '/' + fmtScheme + '/manifest.' + ext;
+
+  badge.innerHTML = '<span class="live-badge">LIVE</span>';
+  info.textContent = ' Playing progressive stream \u2014 segments arriving...';
+
+  try {
+    if (format === 'hls') {
+      await loadScript('https://cdn.jsdelivr.net/npm/hls.js@latest');
+      if (!Hls.isSupported()) {
+        // Safari native HLS
+        video.src = manifestUrl;
+        video.play().catch(function(){});
+        return;
+      }
+      hlsPlayer = new Hls({
+        liveSyncDurationCount: 1,
+        manifestLoadingMaxRetry: 60,
+        manifestLoadingRetryDelay: 500,
+        levelLoadingMaxRetry: 60,
+        levelLoadingRetryDelay: 500,
+        fragLoadingMaxRetry: 10,
+      });
+      hlsPlayer.loadSource(manifestUrl);
+      hlsPlayer.attachMedia(video);
+      hlsPlayer.on(Hls.Events.MANIFEST_PARSED, function() {
+        video.play().catch(function(){});
+      });
+    } else {
+      await loadScript('https://cdn.dashjs.org/latest/dash.all.min.js');
+      dashPlayer = dashjs.MediaPlayer().create();
+      dashPlayer.initialize(video, manifestUrl, true);
+      dashPlayer.updateSettings({
+        streaming: {
+          delay: { liveDelay: 2 },
+          retryAttempts: { MPD: 60, MediaSegment: 10 },
+          retryIntervals: { MPD: 500, MediaSegment: 500 },
+        }
+      });
+    }
+  } catch (e) {
+    info.textContent = 'Player error: ' + e.message;
+  }
+}
+
+function updatePlayerBadge(isComplete) {
+  const badge = document.getElementById('player-badge');
+  const info = document.getElementById('player-info');
+  if (!playerInitialized) return;
+  // Only update for clear content (encrypted shows its own message)
+  const video = document.getElementById('player-video');
+  if (video.style.display === 'none') return;
+  if (isComplete) {
+    badge.innerHTML = '<span class="vod-badge">VOD</span>';
+    info.textContent = ' All segments processed \u2014 playback complete';
+  }
+}
 
 function resetPanels() {
+  destroyPlayer();
   document.getElementById('status-panel').style.display = 'block';
   document.getElementById('status-state').textContent = 'Processing';
   document.getElementById('status-state').className = 'state';
@@ -1935,6 +2168,13 @@ async function pollStatus(contentId, format, containerFormat, targetSchemes) {
       fill.style.width = pct + '%';
     }
 
+    // Start player as soon as playback is ready (init + first segment on disk)
+    if (data.playback_ready && !playerInitialized && data.schemes && data.schemes.length > 0) {
+      // Prefer 'none' scheme for playback (clear content plays without DRM)
+      const playScheme = data.schemes.includes('none') ? 'none' : data.schemes[0];
+      initPlayer(contentId, format, playScheme, containerFormat);
+    }
+
     if (data.state === 'Complete') {
       stateEl.classList.add('complete');
       fill.classList.add('complete');
@@ -1945,6 +2185,13 @@ async function pollStatus(contentId, format, containerFormat, targetSchemes) {
       const btn = document.getElementById('submit-btn');
       btn.disabled = false;
       btn.textContent = 'Repackage';
+
+      // Initialize player on Complete if it wasn't started during processing
+      if (!playerInitialized && data.schemes && data.schemes.length > 0) {
+        const playScheme = data.schemes.includes('none') ? 'none' : data.schemes[0];
+        initPlayer(contentId, format, playScheme, containerFormat);
+      }
+      updatePlayerBadge(true);
 
       // Show output links
       if (data.output_dir) {
