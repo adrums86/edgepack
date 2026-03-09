@@ -53,6 +53,8 @@ pub mod box_type {
     pub const TREX: FourCC = *b"trex";
     pub const EDTS: FourCC = *b"edts";
     pub const EMSG: FourCC = *b"emsg";
+    pub const SIDX: FourCC = *b"sidx";
+    pub const STYP: FourCC = *b"styp";
 }
 
 /// Track types as identified by the handler type in hdlr box.

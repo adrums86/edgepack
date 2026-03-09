@@ -12,7 +12,7 @@ These two priorities govern all development decisions:
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~628 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, config override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~628 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, config override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection), and **DASH SegmentBase input** (on-demand profile with sidx-based byte-range indexing, HTTP Range fetching). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
 
 ## Build Commands
 
@@ -63,7 +63,7 @@ src/
 │   └── cenc.rs         AES-128-CTR encryption + decryption (CENC scheme)
 ├── media/              ISOBMFF/CMAF/fMP4 container handling
 │   ├── mod.rs          FourCC type, box_type constants, TrackType enum
-│   ├── cmaf.rs         Zero-copy MP4 box parser, builders, iterators
+│   ├── cmaf.rs         Zero-copy MP4 box parser, builders, iterators, sidx parser
 │   ├── chunk.rs        CMAF chunk boundary detection for LL-HLS parts
 │   ├── codec.rs        Codec string extraction, track metadata parsing, TrackKeyMapping
 │   ├── compat.rs       Codec/scheme compatibility validation, HDR detection, init/segment structure checks
@@ -80,7 +80,7 @@ src/
 │   ├── hls.rs          HLS M3U8 renderer (media + master playlists)
 │   ├── dash.rs         DASH MPD renderer (SegmentTemplate + SegmentTimeline)
 │   ├── hls_input.rs    HLS M3U8 input parser (source manifest extraction)
-│   └── dash_input.rs   DASH MPD input parser (source manifest extraction)
+│   └── dash_input.rs   DASH MPD input parser (SegmentTemplate + SegmentBase, source manifest extraction)
 ├── repackager/         Orchestration layer
 │   ├── mod.rs          RepackageRequest, SourceConfig types
 │   ├── pipeline.rs     RepackagePipeline — fetch→decrypt→re-encrypt→output flow
@@ -287,6 +287,18 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **Validation:** `ContainerFormat::Ts` + `OutputFormat::Dash` is rejected at validation — DASH does not support TS segments.
 
+### DASH SegmentBase Input (On-Demand Profile)
+
+**Two DASH addressing modes:** The DASH input parser supports both `<SegmentTemplate>` (live/dynamic profile — segment URL templates with `$Number$`/`$Time$` substitution) and `<SegmentBase>` (on-demand profile — single file per Representation with byte-range indexing via sidx box).
+
+**SegmentBase parsing** (`manifest/dash_input.rs`): Extracts per-Representation `<BaseURL>`, `<SegmentBase indexRange="N-M" timescale="T">`, and `<Initialization range="0-N"/>`. Tracks `AdaptationSet` context (`contentType`/`mimeType`) to select the first video Representation. Falls back to audio if no video is found. SegmentTemplate is preferred when both are present.
+
+**sidx parser** (`media/cmaf.rs`): `parse_sidx()` finds and parses the Segment Index box (ISO 14496-12 §8.16.3). Returns `SidxBox` with `timescale`, `first_offset`, and `Vec<SidxReference>` (each with `referenced_size`, `subsegment_duration`, `starts_with_sap`). Supports both v0 (32-bit offsets) and v1 (64-bit offsets).
+
+**Two-phase resolution** (`repackager/pipeline.rs`): After parsing the MPD, `resolve_segment_base()` fetches the sidx box via HTTP Range request (`Range: bytes=start-end`), parses it, and populates `SourceManifest.segment_urls`, `segment_durations`, and `segment_byte_ranges` from the sidx references. Init segment and media segments are fetched with byte-range headers via `fetch_segment_with_range()`.
+
+**Key types:** `SegmentBaseSource` (file_url, init_range, index_range, timescale) on `SourceManifest`. `SidxBox`/`SidxReference` in `media/cmaf.rs`. `SourceManifest` extended with `init_byte_range: Option<(u64, u64)>`, `segment_byte_ranges: Vec<(u64, u64)>`, `segment_base: Option<SegmentBaseSource>` (all `#[serde(default)]` for backward compat).
+
 ### Dual-Format Output (Phase 21)
 
 **Core insight:** CMAF/fMP4 segments are format-agnostic — the same encrypted bytes serve both HLS and DASH. Only manifests differ between formats.
@@ -311,8 +323,8 @@ All HTTP transport and request handling is fully implemented:
 2. **`wasi_handler.rs`**: WASI incoming handler bridge implementing `wasi:http/incoming-handler::Guest`. Converts WASI types ↔ library types and maps errors to HTTP status codes.
 3. **`cache/mod.rs` → `global_cache()`**: Returns a clone of the global `EncryptedCacheBackend<InMemoryCacheBackend>` singleton (cheap — shares underlying `Arc`). Sensitive key patterns are encrypted transparently with a per-process AES-128-CTR key. Used by handlers and pipeline for DRM key caching and JIT state.
 4. **`drm/speke.rs` → `post_cpix()`**: Uses `http_client::post()` to POST CPIX XML to license server with auth headers.
-5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses. `fetch_segment()` fetches binary data. `execute()` processes all segments synchronously and returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` with per-(format, scheme) output data in memory. Decrypts source segments once and re-encrypts for each target scheme, then distributes to all output formats.
-6. **`manifest/hls_input.rs` + `dash_input.rs`**: Source manifest input parsers extracting segment URLs, durations, init segment references, and live/VOD detection.
+5. **`repackager/pipeline.rs`**: `fetch_source_manifest()` auto-detects HLS vs DASH and parses; for DASH SegmentBase sources, `resolve_segment_base()` fetches the sidx box via byte-range request and populates segment URLs/byte ranges. `fetch_segment()` and `fetch_segment_with_range()` fetch binary data (the latter supports HTTP `Range` headers for on-demand profile). `execute()` processes all segments synchronously and returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` with per-(format, scheme) output data in memory. Decrypts source segments once and re-encrypts for each target scheme, then distributes to all output formats.
+6. **`manifest/hls_input.rs` + `dash_input.rs`**: Source manifest input parsers extracting segment URLs, durations, init segment references, and live/VOD detection. DASH parser supports both SegmentTemplate and SegmentBase addressing modes.
 7. **`handler/request.rs`**: GET handlers use `cache::global_cache()` for DRM key and JIT state lookups. On cache miss, JIT fallback triggers source fetching and repackaging on demand.
 
 ## Local Sandbox
@@ -373,7 +385,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,346 tests** without optional features. With `--features ts`: **1,508 tests**. All run on the native host target.
+The project has **1,358 tests** without optional features. With `--features ts`: **1,520 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -398,7 +410,8 @@ Inlined as `#[cfg(test)] mod tests` blocks in every source file. They cover:
 - **Codec string extraction**: RFC 6381 codec strings from stsd config boxes (avcC, hvcC, esds, vpcC, av1C, wvtt, stpp), track metadata parsing (hdlr handler type, mdhd timescale + language, tkhd track_id, sinf/tenc default_kid), TrackKeyMapping construction and serde roundtrips
 - **Segment rewriting**: Four-way dispatch (encrypted↔encrypted, clear→encrypted, encrypted→clear, clear→clear pass-through), scheme-aware decrypt/re-encrypt with optional source/target keys
 - **Manifest rendering**: HLS M3U8 and DASH MPD output for every lifecycle phase, dynamic DRM scheme signaling (SAMPLE-AES/SAMPLE-AES-CTR for HLS, cbcs/cenc value for DASH), FairPlay key URI rendering, subtitle rendition groups (HLS `TYPE=SUBTITLES`, DASH text AdaptationSet), CEA-608/708 closed caption signaling (HLS `TYPE=CLOSED-CAPTIONS` with `INSTREAM-ID`, DASH `Accessibility` descriptors), I-frame playlist rendering (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE), master playlist I-frame stream signaling (`#EXT-X-I-FRAME-STREAM-INF`), DASH trick play AdaptationSet with EssentialProperty trickmode, DVR sliding window (windowed segments/media sequence/playlist type for HLS, timeShiftBufferDepth/startNumber for DASH, live-to-VOD transitions)
-- **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements, `#EXT-X-DATERANGE` SCTE-35 ad break extraction, DASH `<EventStream>` SCTE-35 event parsing
+- **Source manifest parsing**: HLS M3U8 and DASH MPD input parsing including source scheme detection from `#EXT-X-KEY` METHOD and `<ContentProtection>` elements, `#EXT-X-DATERANGE` SCTE-35 ad break extraction, DASH `<EventStream>` SCTE-35 event parsing, DASH SegmentBase parsing (byte-range extraction, BaseURL capture, SegmentTemplate preference)
+- **sidx box parsing**: Segment Index box v0/v1 parsing, reference extraction, offset calculation, roundtrip validation
 - **SCTE-35 parsing**: `emsg` box parsing (v0/v1), SCTE-35 splice_info_section binary parsing (splice_insert, time_signal), scheme URI detection, emsg builder roundtrips
 - **Compatibility validation**: Codec/scheme compatibility checks (VP9+CBCS error, HEVC+CENC warning, etc.), HDR format detection (HDR10, Dolby Vision, HLG), init/media segment structure validation, repackage request pre-flight validation
 - **Progressive output state machine**: Phase transitions, cache-control header generation, dynamic segment URI formatting per container format
@@ -568,7 +581,8 @@ The parser handles these box types (defined in `media::box_type`):
 - **Fragment**: `trun`, `mdat`
 - **Grouping**: `sbgp`, `sgpd`
 - **Event**: `emsg`
-- **Top-level**: `ftyp`
+- **Index**: `sidx`
+- **Top-level**: `ftyp`, `styp`
 
 ## DRM System IDs
 

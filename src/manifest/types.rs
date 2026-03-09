@@ -542,6 +542,36 @@ pub struct SourceManifest {
     /// HLS: not applicable (media playlists only). DASH: `<ContentSteering>` element.
     #[serde(default)]
     pub content_steering: Option<ContentSteeringConfig>,
+    /// Optional byte range for the init segment (start, end inclusive).
+    /// Used by DASH SegmentBase (on-demand profile) where the init is a byte range within a file.
+    #[serde(default)]
+    pub init_byte_range: Option<(u64, u64)>,
+    /// Optional byte ranges for media segments (parallel to `segment_urls`).
+    /// Each entry is (start, end inclusive). Empty when segments are full-resource fetches.
+    #[serde(default)]
+    pub segment_byte_ranges: Vec<(u64, u64)>,
+    /// SegmentBase info for on-demand DASH profiles that needs sidx resolution.
+    /// When present, the pipeline must fetch the sidx box and resolve segment URLs/durations
+    /// before processing. After resolution, this field is cleared and `segment_urls`,
+    /// `segment_durations`, and `segment_byte_ranges` are populated.
+    #[serde(default)]
+    pub segment_base: Option<SegmentBaseSource>,
+}
+
+/// SegmentBase metadata for DASH on-demand profiles.
+///
+/// Contains the information needed to fetch and parse the sidx (Segment Index) box
+/// to resolve individual segment byte ranges and durations within a single MP4 file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentBaseSource {
+    /// Full URL of the representation MP4 file.
+    pub file_url: String,
+    /// Byte range for the initialization data (start, end inclusive).
+    pub init_range: (u64, u64),
+    /// Byte range for the sidx (Segment Index) box (start, end inclusive).
+    pub index_range: (u64, u64),
+    /// Timescale for converting sidx durations to seconds.
+    pub timescale: u64,
 }
 
 #[cfg(test)]
@@ -1034,6 +1064,9 @@ mod tests {
             aes128_iv: Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
             content_steering: None,
+            init_byte_range: None,
+            segment_byte_ranges: Vec::new(),
+            segment_base: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: SourceManifest = serde_json::from_str(&json).unwrap();
@@ -1413,6 +1446,9 @@ mod tests {
                 default_pathway_id: Some("loc-1".into()),
                 query_before_start: Some(false),
             }),
+            init_byte_range: None,
+            segment_byte_ranges: Vec::new(),
+            segment_base: None,
         };
         let json = serde_json::to_string(&source).unwrap();
         let parsed: SourceManifest = serde_json::from_str(&json).unwrap();

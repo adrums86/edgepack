@@ -158,6 +158,9 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         aes128_key_url,
         aes128_iv,
         content_steering: None,
+        init_byte_range: None,
+        segment_byte_ranges: Vec::new(),
+        segment_base: None,
     })
 }
 

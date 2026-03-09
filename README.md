@@ -250,8 +250,8 @@ After processing completes, `cleanup_sensitive_data()` explicitly deletes raw DR
                     │                  │  Pipeline        │   │
                     │                  │    ↓       ↓     │   │
                     │                  │  Media   DRM     │   │
-                    │                  │ (CMAF/  (SPEKE) │   │
-                    │                  │  fMP4)          │   │
+                    │                  │ (CMAF/  (SPEKE)  │   │
+                    │                  │  fMP4)           │   │
                     │                  │    ↓       ↓     │   │
                     │                  │  Manifest Cache  │   │
                     │                  │         (in-proc)│   │

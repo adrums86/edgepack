@@ -6,7 +6,9 @@
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
-use crate::manifest::types::{AdBreakInfo, ContentSteeringConfig, LowLatencyDashInfo, SourceManifest};
+use crate::manifest::types::{
+    AdBreakInfo, ContentSteeringConfig, LowLatencyDashInfo, SegmentBaseSource, SourceManifest,
+};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use crate::url::Url;
@@ -16,6 +18,11 @@ use crate::url::Url;
 /// Supports the most common CMAF DASH patterns:
 /// - `<SegmentTemplate>` with `<SegmentTimeline>` and `$Number$` substitution
 /// - `<SegmentTemplate>` with `duration` attribute (uniform segments)
+/// - `<SegmentBase>` with `<BaseURL>` and byte-range indexing (on-demand profile)
+///
+/// For `SegmentBase` manifests, the returned `SourceManifest` will have a populated
+/// `segment_base` field containing sidx resolution metadata. The caller (pipeline)
+/// must fetch the sidx box and resolve segment byte ranges before processing.
 ///
 /// The `manifest_url` is used as the base for resolving relative segment URIs.
 pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<SourceManifest> {
@@ -26,6 +33,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     let mut reader = Reader::from_str(manifest_text);
     reader.config_mut().trim_text(true);
 
+    // --- MPD-level state ---
     let mut is_live = false;
     let mut source_scheme: Option<EncryptionScheme> = None;
     let mut init_template: Option<String> = None;
@@ -34,15 +42,30 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     let mut start_number: u32 = 0;
     let mut timeline_entries: Vec<(u64, u32)> = Vec::new(); // (duration_ticks, repeat_count)
     let mut uniform_duration: Option<u64> = None; // for SegmentTemplate@duration
-    let mut base_url_override: Option<String> = None;
+    let mut base_url_override: Option<String> = None; // absolute BaseURL at MPD/Period level
     let mut ll_dash_info: Option<LowLatencyDashInfo> = None;
     let mut total_duration_secs: Option<f64> = None;
     let mut dash_content_steering: Option<ContentSteeringConfig> = None;
     let mut ad_breaks: Vec<AdBreakInfo> = Vec::new();
     let mut in_scte35_event_stream = false;
     let mut event_stream_timescale: u64 = 90000;
-    // Pending Event attributes (collected on Start, resolved on End/text)
     let mut pending_event: Option<PendingDashEvent> = None;
+
+    // --- SegmentBase support (on-demand profile) ---
+    // We track AdaptationSet and Representation context to collect per-Representation
+    // BaseURL + SegmentBase data. We pick the first video representation found.
+    let mut in_adaptation_set = false;
+    let mut adaptation_set_is_video = false;
+    let mut in_representation = false;
+    let mut awaiting_base_url_text = false; // true after Start("BaseURL"), cleared after Text
+    // Per-Representation accumulator (reset on Representation start)
+    let mut current_rep_base_url: Option<String> = None;
+    let mut current_seg_base_index_range: Option<(u64, u64)> = None;
+    let mut current_seg_base_timescale: u64 = 0;
+    let mut current_seg_base_init_range: Option<(u64, u64)> = None;
+    let mut in_segment_base = false;
+    // Collected SegmentBase representation (first video one wins)
+    let mut segment_base_rep: Option<SegmentBaseRepresentation> = None;
 
     let mut buf = Vec::new();
     loop {
@@ -69,8 +92,78 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                             }
                         }
                     }
+                    b"AdaptationSet" => {
+                        in_adaptation_set = true;
+                        adaptation_set_is_video = false;
+                        // Check contentType or mimeType to determine video/audio
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"contentType" => {
+                                    let val = String::from_utf8_lossy(&attr.value);
+                                    adaptation_set_is_video = val == "video";
+                                }
+                                b"mimeType" => {
+                                    let val = String::from_utf8_lossy(&attr.value);
+                                    if val.starts_with("video/") {
+                                        adaptation_set_is_video = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"Representation" if in_adaptation_set => {
+                        in_representation = true;
+                        // Reset per-Representation accumulators
+                        current_rep_base_url = None;
+                        current_seg_base_index_range = None;
+                        current_seg_base_timescale = 0;
+                        current_seg_base_init_range = None;
+
+                        // Check mimeType on Representation as fallback for video detection
+                        if !adaptation_set_is_video {
+                            for attr in e.attributes().flatten() {
+                                if attr.key.as_ref() == b"mimeType" {
+                                    let val = String::from_utf8_lossy(&attr.value);
+                                    if val.starts_with("video/") {
+                                        adaptation_set_is_video = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     b"BaseURL" => {
-                        // BaseURL content comes in a Text event; we'll read it next
+                        // BaseURL content comes in a Text event; flag to capture it
+                        awaiting_base_url_text = true;
+                    }
+                    b"SegmentBase" => {
+                        in_segment_base = true;
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"indexRange" => {
+                                    let val = String::from_utf8_lossy(&attr.value);
+                                    current_seg_base_index_range = parse_byte_range(&val);
+                                }
+                                b"timescale" => {
+                                    current_seg_base_timescale =
+                                        String::from_utf8_lossy(&attr.value)
+                                            .parse()
+                                            .unwrap_or(0);
+                                }
+                                _ => {}
+                            }
+                        }
+                        if is_empty {
+                            in_segment_base = false;
+                        }
+                    }
+                    b"Initialization" if in_segment_base => {
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"range" {
+                                let val = String::from_utf8_lossy(&attr.value);
+                                current_seg_base_init_range = parse_byte_range(&val);
+                            }
+                        }
                     }
                     b"SegmentTemplate" => {
                         let mut ato: Option<f64> = None;
@@ -176,9 +269,6 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                         }
                     }
                     b"ContentProtection" => {
-                        // Detect source encryption scheme from ContentProtection elements.
-                        // Look for the MPEG-DASH mp4protection scheme which carries the
-                        // encryption scheme in its value attribute.
                         let mut scheme_uri: Option<String> = None;
                         let mut value: Option<String> = None;
                         for attr in e.attributes().flatten() {
@@ -196,7 +286,6 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                                 _ => {}
                             }
                         }
-                        // The mp4protection scheme signals which encryption scheme is in use
                         if scheme_uri.as_deref() == Some("urn:mpeg:dash:mp4protection:2011") {
                             if let Some(val) = value {
                                 match val.as_str() {
@@ -208,7 +297,6 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                         }
                     }
                     b"EventStream" => {
-                        // Check if this is a SCTE-35 event stream
                         let mut scheme_uri = String::new();
                         let mut ts: u64 = 90000;
                         for attr in e.attributes().flatten() {
@@ -253,7 +341,6 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                         }
 
                         if is_empty {
-                            // Self-closing <Event .../> — finalize immediately
                             let presentation_time_secs = pt as f64 / event_stream_timescale as f64;
                             let duration_secs = dur.map(|d| d as f64 / event_stream_timescale as f64);
                             ad_breaks.push(AdBreakInfo {
@@ -264,7 +351,6 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                                 segment_number: 0,
                             });
                         } else {
-                            // Start tag — collect text content until End
                             pending_event = Some(PendingDashEvent {
                                 id: evt_id,
                                 presentation_time: pt,
@@ -287,17 +373,56 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                     }
                 }
 
-                // Check if we're inside a <BaseURL> element
-                // quick-xml delivers text after Start("BaseURL")
-                if !text_trimmed.is_empty() && base_url_override.is_none() {
-                    // Only capture first BaseURL
-                    if text_trimmed.starts_with("http://") || text_trimmed.starts_with("https://") {
-                        base_url_override = Some(text_trimmed.to_string());
+                // Capture BaseURL text content
+                if awaiting_base_url_text && !text_trimmed.is_empty() {
+                    if in_representation {
+                        // Per-Representation BaseURL (may be relative)
+                        current_rep_base_url = Some(text_trimmed.to_string());
+                    } else if base_url_override.is_none() {
+                        // MPD/Period-level BaseURL (only absolute URLs)
+                        if text_trimmed.starts_with("http://") || text_trimmed.starts_with("https://") {
+                            base_url_override = Some(text_trimmed.to_string());
+                        }
                     }
+                    awaiting_base_url_text = false;
                 }
             }
             Ok(Event::End(ref e)) => {
                 match e.local_name().as_ref() {
+                    b"AdaptationSet" => {
+                        in_adaptation_set = false;
+                        adaptation_set_is_video = false;
+                    }
+                    b"Representation" => {
+                        // If this Representation had SegmentBase data, collect it
+                        // (prefer video; take first one found)
+                        if in_representation
+                            && segment_base_rep.is_none()
+                            && current_seg_base_index_range.is_some()
+                            && current_seg_base_init_range.is_some()
+                            && current_rep_base_url.is_some()
+                            && (adaptation_set_is_video || true) // take any, prefer video
+                        {
+                            segment_base_rep = Some(SegmentBaseRepresentation {
+                                base_url: current_rep_base_url.take().unwrap(),
+                                init_range: current_seg_base_init_range.unwrap(),
+                                index_range: current_seg_base_index_range.unwrap(),
+                                timescale: current_seg_base_timescale,
+                                is_video: adaptation_set_is_video,
+                            });
+                        }
+                        in_representation = false;
+                        current_rep_base_url = None;
+                        current_seg_base_index_range = None;
+                        current_seg_base_timescale = 0;
+                        current_seg_base_init_range = None;
+                    }
+                    b"SegmentBase" => {
+                        in_segment_base = false;
+                    }
+                    b"BaseURL" => {
+                        awaiting_base_url_text = false;
+                    }
                     b"EventStream" => {
                         in_scte35_event_stream = false;
                     }
@@ -335,76 +460,129 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
         buf.clear();
     }
 
-    // Determine the effective base URL
+    // Determine the effective base URL for resolving relative URIs
     let effective_base = if let Some(ref override_url) = base_url_override {
         Url::parse(override_url).unwrap_or(base_url.clone())
     } else {
-        base_url
+        base_url.clone()
     };
 
-    // Build segment list
-    let media_pattern = media_template.ok_or_else(|| {
-        EdgepackError::Manifest("DASH MPD missing SegmentTemplate@media".into())
-    })?;
+    // --- Path A: SegmentTemplate-based manifests ---
+    if media_template.is_some() {
+        let media_pattern = media_template.unwrap();
 
-    let mut segment_urls = Vec::new();
-    let mut segment_durations = Vec::new();
+        let mut segment_urls = Vec::new();
+        let mut segment_durations = Vec::new();
 
-    if !timeline_entries.is_empty() {
-        // SegmentTimeline mode
-        let mut number = start_number;
-        for (d, r) in &timeline_entries {
-            let duration_secs = *d as f64 / timescale as f64;
-            // r+1 segments with this duration (r=0 means 1 segment)
-            for _ in 0..=*r {
-                let url = media_pattern.replace("$Number$", &number.to_string());
-                segment_urls.push(resolve_url(&effective_base, &url)?);
-                segment_durations.push(duration_secs);
-                number += 1;
+        if !timeline_entries.is_empty() {
+            // SegmentTimeline mode
+            let mut number = start_number;
+            for (d, r) in &timeline_entries {
+                let duration_secs = *d as f64 / timescale as f64;
+                for _ in 0..=*r {
+                    let url = media_pattern.replace("$Number$", &number.to_string());
+                    segment_urls.push(resolve_url(&effective_base, &url)?);
+                    segment_durations.push(duration_secs);
+                    number += 1;
+                }
+            }
+        } else if let Some(dur) = uniform_duration {
+            // Uniform duration mode
+            let duration_secs = dur as f64 / timescale as f64;
+            if let Some(total_secs) = total_duration_secs {
+                let segment_count = (total_secs / duration_secs).ceil() as u32;
+                for i in 0..segment_count {
+                    let number = start_number + i;
+                    let url = media_pattern.replace("$Number$", &number.to_string());
+                    segment_urls.push(resolve_url(&effective_base, &url)?);
+                    let remaining = total_secs - (i as f64 * duration_secs);
+                    segment_durations.push(remaining.min(duration_secs));
+                }
             }
         }
-    } else if let Some(dur) = uniform_duration {
-        // Uniform duration mode — need total_duration to compute segment count
-        let duration_secs = dur as f64 / timescale as f64;
-        if let Some(total_secs) = total_duration_secs {
-            let segment_count = (total_secs / duration_secs).ceil() as u32;
-            for i in 0..segment_count {
-                let number = start_number + i;
-                let url = media_pattern.replace("$Number$", &number.to_string());
-                segment_urls.push(resolve_url(&effective_base, &url)?);
-                // Last segment may be shorter
-                let remaining = total_secs - (i as f64 * duration_secs);
-                segment_durations.push(remaining.min(duration_secs));
-            }
-        }
+
+        let init_url = init_template
+            .map(|t| resolve_url(&effective_base, &t))
+            .transpose()?
+            .ok_or_else(|| {
+                EdgepackError::Manifest(
+                    "DASH MPD missing SegmentTemplate@initialization".into(),
+                )
+            })?;
+
+        return Ok(SourceManifest {
+            init_segment_url: init_url,
+            segment_urls,
+            segment_durations,
+            is_live,
+            source_scheme,
+            ad_breaks,
+            parts: Vec::new(),
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info,
+            is_ts_source: false,
+            aes128_key_url: None,
+            aes128_iv: None,
+            content_steering: dash_content_steering,
+            init_byte_range: None,
+            segment_byte_ranges: Vec::new(),
+            segment_base: None,
+        });
     }
 
-    // Build init segment URL
-    let init_url = init_template
-        .map(|t| resolve_url(&effective_base, &t))
-        .transpose()?
-        .ok_or_else(|| {
-            EdgepackError::Manifest(
-                "DASH MPD missing SegmentTemplate@initialization".into(),
-            )
-        })?;
+    // --- Path B: SegmentBase-based manifests (on-demand profile) ---
+    if let Some(rep) = segment_base_rep {
+        // Resolve the representation's BaseURL against the manifest base
+        let file_url = resolve_url(&effective_base, &rep.base_url)?;
 
-    Ok(SourceManifest {
-        init_segment_url: init_url,
-        segment_urls,
-        segment_durations,
-        is_live,
-        source_scheme,
-        ad_breaks,
-        parts: Vec::new(),
-        part_target_duration: None,
-        server_control: None,
-        ll_dash_info,
-        is_ts_source: false,
-        aes128_key_url: None,
-        aes128_iv: None,
-        content_steering: dash_content_steering,
-    })
+        return Ok(SourceManifest {
+            // The init URL is the same file — the pipeline will use byte range to fetch
+            init_segment_url: file_url.clone(),
+            // Segments will be populated after sidx resolution by the pipeline
+            segment_urls: Vec::new(),
+            segment_durations: Vec::new(),
+            is_live,
+            source_scheme,
+            ad_breaks,
+            parts: Vec::new(),
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info,
+            is_ts_source: false,
+            aes128_key_url: None,
+            aes128_iv: None,
+            content_steering: dash_content_steering,
+            init_byte_range: Some(rep.init_range),
+            segment_byte_ranges: Vec::new(),
+            segment_base: Some(SegmentBaseSource {
+                file_url,
+                init_range: rep.init_range,
+                index_range: rep.index_range,
+                timescale: rep.timescale,
+            }),
+        });
+    }
+
+    // --- Neither SegmentTemplate nor SegmentBase found ---
+    Err(EdgepackError::Manifest(
+        "DASH MPD missing both SegmentTemplate and SegmentBase — unsupported manifest format".into(),
+    ))
+}
+
+/// Per-Representation SegmentBase data collected during parsing.
+struct SegmentBaseRepresentation {
+    /// BaseURL text content (may be relative to manifest URL).
+    base_url: String,
+    /// Initialization byte range (start, end inclusive).
+    init_range: (u64, u64),
+    /// Sidx (Segment Index) byte range (start, end inclusive).
+    index_range: (u64, u64),
+    /// Timescale from `<SegmentBase>` for duration conversion.
+    timescale: u64,
+    /// Whether this representation is in a video AdaptationSet.
+    #[allow(dead_code)]
+    is_video: bool,
 }
 
 /// Temporary state for collecting a DASH `<Event>` element's attributes and text content.
@@ -413,6 +591,18 @@ struct PendingDashEvent {
     presentation_time: u64,
     duration: Option<u64>,
     text_content: String,
+}
+
+/// Parse a byte range string like "0-822" into (start, end) tuple.
+fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() == 2 {
+        let start: u64 = parts[0].parse().ok()?;
+        let end: u64 = parts[1].parse().ok()?;
+        Some((start, end))
+    } else {
+        None
+    }
 }
 
 /// Resolve a possibly-relative URI against a base URL.
@@ -585,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_missing_segment_template_returns_error() {
+    fn parse_missing_segment_template_and_base_returns_error() {
         let mpd = r#"<?xml version="1.0"?>
 <MPD type="static">
   <Period>
@@ -597,7 +787,8 @@ mod tests {
         let result = parse_dash_manifest(mpd, BASE_URL);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("SegmentTemplate@media"));
+        assert!(err.contains("SegmentTemplate"));
+        assert!(err.contains("SegmentBase"));
     }
 
     #[test]
@@ -932,5 +1123,159 @@ mod tests {
     fn parse_no_content_steering_backward_compat() {
         let result = parse_dash_manifest(&minimal_static_mpd(), BASE_URL).unwrap();
         assert!(result.content_steering.is_none());
+    }
+
+    // --- SegmentBase (on-demand profile) tests ---
+
+    #[test]
+    fn parse_segment_base_basic() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT10M34.533S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="0" bandwidth="120158" codecs="avc1.42c01e" mimeType="video/mp4" width="256" height="144">
+        <BaseURL>v-0144p-0100k-libx264.mp4</BaseURL>
+        <SegmentBase indexRange="823-1982" timescale="15360">
+          <Initialization range="0-822"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+
+        // Should have SegmentBase info for sidx resolution
+        assert!(result.segment_base.is_some());
+        let sb = result.segment_base.unwrap();
+        assert_eq!(sb.file_url, "https://cdn.example.com/content/v-0144p-0100k-libx264.mp4");
+        assert_eq!(sb.init_range, (0, 822));
+        assert_eq!(sb.index_range, (823, 1982));
+        assert_eq!(sb.timescale, 15360);
+
+        // Init byte range should be set
+        assert_eq!(result.init_byte_range, Some((0, 822)));
+
+        // Init URL points to the same file
+        assert_eq!(result.init_segment_url, sb.file_url);
+
+        // Segments are empty — need sidx resolution
+        assert!(result.segment_urls.is_empty());
+        assert!(result.segment_durations.is_empty());
+    }
+
+    #[test]
+    fn parse_segment_base_with_absolute_base_url() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT60S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="1" bandwidth="500000">
+        <BaseURL>https://other-cdn.example.com/video.mp4</BaseURL>
+        <SegmentBase indexRange="1000-2000" timescale="90000">
+          <Initialization range="0-999"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        let sb = result.segment_base.unwrap();
+        assert_eq!(sb.file_url, "https://other-cdn.example.com/video.mp4");
+        assert_eq!(sb.init_range, (0, 999));
+        assert_eq!(sb.index_range, (1000, 2000));
+    }
+
+    #[test]
+    fn parse_segment_base_multiple_representations_picks_first() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT60S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="0" bandwidth="100000">
+        <BaseURL>low.mp4</BaseURL>
+        <SegmentBase indexRange="100-200" timescale="10000">
+          <Initialization range="0-99"/>
+        </SegmentBase>
+      </Representation>
+      <Representation id="1" bandwidth="500000">
+        <BaseURL>high.mp4</BaseURL>
+        <SegmentBase indexRange="500-1000" timescale="10000">
+          <Initialization range="0-499"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        let sb = result.segment_base.unwrap();
+        // Should pick the first representation
+        assert!(sb.file_url.contains("low.mp4"));
+        assert_eq!(sb.index_range, (100, 200));
+    }
+
+    #[test]
+    fn parse_segment_base_backward_compat_fields() {
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT60S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="0" bandwidth="100000">
+        <BaseURL>video.mp4</BaseURL>
+        <SegmentBase indexRange="100-200" timescale="10000">
+          <Initialization range="0-99"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Standard fields should have sensible defaults
+        assert!(!result.is_live);
+        assert!(result.source_scheme.is_none());
+        assert!(result.ad_breaks.is_empty());
+        assert!(!result.is_ts_source);
+    }
+
+    #[test]
+    fn parse_segment_template_preferred_over_segment_base() {
+        // If a manifest has both SegmentTemplate and SegmentBase,
+        // SegmentTemplate should win (it's the more common pattern)
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate initialization="init.mp4" media="seg_$Number$.cmfv" timescale="1000" startNumber="0">
+        <SegmentTimeline>
+          <S d="6000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="0" bandwidth="100000">
+        <BaseURL>video.mp4</BaseURL>
+        <SegmentBase indexRange="100-200" timescale="10000">
+          <Initialization range="0-99"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Should use SegmentTemplate path, not SegmentBase
+        assert!(result.segment_base.is_none());
+        assert_eq!(result.segment_urls.len(), 2);
+    }
+
+    #[test]
+    fn parse_byte_range_valid() {
+        assert_eq!(parse_byte_range("0-822"), Some((0, 822)));
+        assert_eq!(parse_byte_range("823-1982"), Some((823, 1982)));
+        assert_eq!(parse_byte_range("0-0"), Some((0, 0)));
+    }
+
+    #[test]
+    fn parse_byte_range_invalid() {
+        assert_eq!(parse_byte_range("invalid"), None);
+        assert_eq!(parse_byte_range(""), None);
+        assert_eq!(parse_byte_range("0"), None);
+        assert_eq!(parse_byte_range("0-abc"), None);
     }
 }

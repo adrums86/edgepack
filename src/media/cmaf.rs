@@ -779,6 +779,161 @@ pub fn build_emsg_box(emsg: &EmsgBox) -> Vec<u8> {
     output
 }
 
+/// A single reference entry from a parsed sidx (Segment Index) box.
+#[derive(Debug, Clone)]
+pub struct SidxReference {
+    /// Whether this references another sidx (true) or a media subsegment (false).
+    pub reference_type: bool,
+    /// Size of the referenced data in bytes.
+    pub referenced_size: u32,
+    /// Duration of the subsegment in timescale units.
+    pub subsegment_duration: u32,
+    /// Whether this subsegment starts with a Stream Access Point (SAP).
+    pub starts_with_sap: bool,
+}
+
+/// Parsed sidx (Segment Index) box result.
+#[derive(Debug, Clone)]
+pub struct SidxBox {
+    /// Timescale for duration conversion.
+    pub timescale: u32,
+    /// Offset of the first referenced data relative to the end of this sidx box.
+    pub first_offset: u64,
+    /// Individual segment references.
+    pub references: Vec<SidxReference>,
+}
+
+/// Parse a sidx (Segment Index) box payload.
+///
+/// The `data` should be the raw bytes of the sidx box (including the box header).
+/// Returns the parsed sidx with subsegment references that can be used to
+/// calculate byte ranges for individual segments.
+pub fn parse_sidx(data: &[u8]) -> Result<SidxBox> {
+    // Find the sidx box in the data (it might be preceded by other boxes)
+    for result in iterate_boxes(data) {
+        let header = result?;
+        if header.box_type == crate::media::box_type::SIDX {
+            let payload_start = header.payload_offset() as usize;
+            let payload_end = (header.offset + header.size) as usize;
+            if payload_end > data.len() {
+                return Err(EdgepackError::MediaParse("sidx box extends beyond data".into()));
+            }
+            let payload = &data[payload_start..payload_end];
+            return parse_sidx_payload(payload);
+        }
+    }
+    Err(EdgepackError::MediaParse("no sidx box found in data".into()))
+}
+
+/// Parse the payload of a sidx box (after box header).
+fn parse_sidx_payload(payload: &[u8]) -> Result<SidxBox> {
+    if payload.len() < 4 {
+        return Err(EdgepackError::MediaParse("sidx payload too short".into()));
+    }
+
+    let version = payload[0];
+    // bytes 1-3 are flags
+
+    let mut offset = 4;
+
+    // reference_ID (4 bytes)
+    if offset + 4 > payload.len() {
+        return Err(EdgepackError::MediaParse("sidx: truncated reference_ID".into()));
+    }
+    offset += 4; // skip reference_ID
+
+    // timescale (4 bytes)
+    if offset + 4 > payload.len() {
+        return Err(EdgepackError::MediaParse("sidx: truncated timescale".into()));
+    }
+    let timescale = u32::from_be_bytes([
+        payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+    ]);
+    offset += 4;
+
+    // earliest_presentation_time and first_offset
+    let first_offset = if version == 0 {
+        if offset + 8 > payload.len() {
+            return Err(EdgepackError::MediaParse("sidx: truncated v0 times".into()));
+        }
+        let _ept = u32::from_be_bytes([
+            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+        ]);
+        offset += 4;
+        let fo = u32::from_be_bytes([
+            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+        ]);
+        offset += 4;
+        fo as u64
+    } else {
+        if offset + 16 > payload.len() {
+            return Err(EdgepackError::MediaParse("sidx: truncated v1 times".into()));
+        }
+        let _ept = u64::from_be_bytes([
+            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+            payload[offset + 4], payload[offset + 5], payload[offset + 6], payload[offset + 7],
+        ]);
+        offset += 8;
+        let fo = u64::from_be_bytes([
+            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+            payload[offset + 4], payload[offset + 5], payload[offset + 6], payload[offset + 7],
+        ]);
+        offset += 8;
+        fo
+    };
+
+    // reserved (2 bytes) + reference_count (2 bytes)
+    if offset + 4 > payload.len() {
+        return Err(EdgepackError::MediaParse("sidx: truncated reference count".into()));
+    }
+    offset += 2; // skip reserved
+    let reference_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+
+    // Each reference is 12 bytes
+    let needed = reference_count * 12;
+    if offset + needed > payload.len() {
+        return Err(EdgepackError::MediaParse(format!(
+            "sidx: {} references need {} bytes but only {} remain",
+            reference_count, needed, payload.len() - offset
+        )));
+    }
+
+    let mut references = Vec::with_capacity(reference_count);
+    for _ in 0..reference_count {
+        let word1 = u32::from_be_bytes([
+            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+        ]);
+        let reference_type = (word1 >> 31) != 0;
+        let referenced_size = word1 & 0x7FFF_FFFF;
+        offset += 4;
+
+        let subsegment_duration = u32::from_be_bytes([
+            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+        ]);
+        offset += 4;
+
+        let word3 = u32::from_be_bytes([
+            payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3],
+        ]);
+        let starts_with_sap = (word3 >> 31) != 0;
+        offset += 4;
+
+        references.push(SidxReference {
+            reference_type,
+            referenced_size,
+            subsegment_duration,
+            starts_with_sap,
+        });
+    }
+
+    Ok(SidxBox {
+        timescale,
+        first_offset,
+        references,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,5 +1483,106 @@ mod tests {
         let payload = &built[header.header_size as usize..];
         let parsed = parse_emsg(payload).unwrap();
         assert!(parsed.message_data.is_empty());
+    }
+
+    // --- sidx parsing tests ---
+
+    /// Build a synthetic sidx box for testing.
+    fn build_test_sidx(version: u8, timescale: u32, first_offset: u64, refs: &[(u32, u32)]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        // Version + flags
+        inner.push(version);
+        inner.extend_from_slice(&[0, 0, 0]); // flags
+        // reference_ID
+        inner.extend_from_slice(&1u32.to_be_bytes());
+        // timescale
+        inner.extend_from_slice(&timescale.to_be_bytes());
+        // earliest_presentation_time + first_offset
+        if version == 0 {
+            inner.extend_from_slice(&0u32.to_be_bytes()); // ept
+            inner.extend_from_slice(&(first_offset as u32).to_be_bytes());
+        } else {
+            inner.extend_from_slice(&0u64.to_be_bytes()); // ept
+            inner.extend_from_slice(&first_offset.to_be_bytes());
+        }
+        // reserved (2 bytes) + reference_count (2 bytes)
+        inner.extend_from_slice(&[0, 0]);
+        inner.extend_from_slice(&(refs.len() as u16).to_be_bytes());
+        // references
+        for (size, duration) in refs {
+            // reference_type=0 (media) | referenced_size
+            inner.extend_from_slice(&size.to_be_bytes());
+            // subsegment_duration
+            inner.extend_from_slice(&duration.to_be_bytes());
+            // starts_with_SAP=1, SAP_type=1, SAP_delta_time=0
+            inner.extend_from_slice(&0x9000_0000u32.to_be_bytes());
+        }
+
+        let total_size = 8 + inner.len() as u32;
+        let mut output = Vec::with_capacity(total_size as usize);
+        write_box_header(&mut output, total_size, &crate::media::box_type::SIDX);
+        output.extend_from_slice(&inner);
+        output
+    }
+
+    #[test]
+    fn parse_sidx_v0_basic() {
+        let data = build_test_sidx(0, 1000, 0, &[
+            (50000, 2000),
+            (60000, 2000),
+            (40000, 1000),
+        ]);
+        let result = parse_sidx(&data).unwrap();
+        assert_eq!(result.timescale, 1000);
+        assert_eq!(result.first_offset, 0);
+        assert_eq!(result.references.len(), 3);
+        assert_eq!(result.references[0].referenced_size, 50000);
+        assert_eq!(result.references[0].subsegment_duration, 2000);
+        assert!(!result.references[0].reference_type);
+        assert_eq!(result.references[1].referenced_size, 60000);
+        assert_eq!(result.references[2].referenced_size, 40000);
+        assert_eq!(result.references[2].subsegment_duration, 1000);
+    }
+
+    #[test]
+    fn parse_sidx_v1_with_first_offset() {
+        let data = build_test_sidx(1, 90000, 512, &[
+            (100000, 360000),
+            (80000, 360000),
+        ]);
+        let result = parse_sidx(&data).unwrap();
+        assert_eq!(result.timescale, 90000);
+        assert_eq!(result.first_offset, 512);
+        assert_eq!(result.references.len(), 2);
+        assert_eq!(result.references[0].referenced_size, 100000);
+        assert_eq!(result.references[0].subsegment_duration, 360000);
+    }
+
+    #[test]
+    fn parse_sidx_empty_references() {
+        let data = build_test_sidx(0, 1000, 0, &[]);
+        let result = parse_sidx(&data).unwrap();
+        assert_eq!(result.references.len(), 0);
+    }
+
+    #[test]
+    fn parse_sidx_no_sidx_box_returns_error() {
+        // Just an ftyp box, no sidx
+        let mut data = Vec::new();
+        write_box_header(&mut data, 12, &crate::media::box_type::FTYP);
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        let result = parse_sidx(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no sidx"));
+    }
+
+    #[test]
+    fn parse_sidx_duration_to_seconds() {
+        let data = build_test_sidx(0, 15360, 0, &[
+            (50000, 61440), // 61440 / 15360 = 4.0 seconds
+        ]);
+        let result = parse_sidx(&data).unwrap();
+        let duration_secs = result.references[0].subsegment_duration as f64 / result.timescale as f64;
+        assert!((duration_secs - 4.0).abs() < 0.001);
     }
 }

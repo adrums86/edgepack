@@ -86,7 +86,7 @@ impl RepackagePipeline {
                 ));
             }
         } else {
-            self.fetch_segment(&source.init_segment_url)?
+            self.fetch_segment_with_range(&source.init_segment_url, source.init_byte_range)?
         };
         let protection_info = init::parse_protection_info(&init_data)?;
 
@@ -283,7 +283,8 @@ impl RepackagePipeline {
                     ));
                 }
             } else {
-                self.fetch_segment(segment_url)?
+                let byte_range = source.segment_byte_ranges.get(i).copied();
+                self.fetch_segment_with_range(segment_url, byte_range)?
             };
             let duration = source.segment_durations.get(i).copied().unwrap_or(6.0);
             let is_last = i == source.segment_urls.len() - 1 && !source.is_live;
@@ -442,17 +443,93 @@ impl RepackagePipeline {
         })?;
 
         // Auto-detect format: HLS if URL ends in .m3u8 or content starts with #EXTM3U
-        if url.contains(".m3u8") || text.starts_with("#EXTM3U") {
-            crate::manifest::hls_input::parse_hls_manifest(&text, url)
+        let mut source = if url.contains(".m3u8") || text.starts_with("#EXTM3U") {
+            crate::manifest::hls_input::parse_hls_manifest(&text, url)?
         } else {
-            crate::manifest::dash_input::parse_dash_manifest(&text, url)
+            crate::manifest::dash_input::parse_dash_manifest(&text, url)?
+        };
+
+        // Resolve SegmentBase (on-demand DASH) by fetching sidx and populating segments
+        if source.segment_base.is_some() {
+            source = self.resolve_segment_base(source)?;
         }
+
+        Ok(source)
+    }
+
+    /// Resolve a DASH SegmentBase manifest by fetching the sidx (Segment Index) box.
+    ///
+    /// For on-demand DASH profiles, the manifest specifies a single file per representation
+    /// with byte ranges for the init segment and sidx box. This method fetches the sidx,
+    /// parses it to discover subsegment byte ranges and durations, and populates the
+    /// `segment_urls`, `segment_durations`, and `segment_byte_ranges` fields.
+    fn resolve_segment_base(&self, mut source: SourceManifest) -> Result<SourceManifest> {
+        let sb = match source.segment_base.take() {
+            Some(sb) => sb,
+            None => return Ok(source),
+        };
+
+        // Fetch the sidx box using a byte-range request
+        let sidx_data = self.fetch_segment_with_range(&sb.file_url, Some(sb.index_range))?;
+
+        // Parse the sidx box
+        let sidx = crate::media::cmaf::parse_sidx(&sidx_data)?;
+
+        // Use the sidx timescale if available, falling back to the SegmentBase timescale
+        let effective_timescale = if sidx.timescale > 0 {
+            sidx.timescale as u64
+        } else if sb.timescale > 0 {
+            sb.timescale
+        } else {
+            1
+        };
+
+        // Calculate byte offsets for each subsegment.
+        // The first subsegment starts at: end_of_sidx_box + first_offset
+        // where end_of_sidx_box = index_range.end + 1
+        let mut offset = sb.index_range.1 + 1 + sidx.first_offset;
+        for reference in &sidx.references {
+            if reference.reference_type {
+                // This references another sidx box — skip (hierarchical sidx not yet supported)
+                continue;
+            }
+            let end = offset + reference.referenced_size as u64 - 1;
+            source.segment_urls.push(sb.file_url.clone());
+            source.segment_byte_ranges.push((offset, end));
+            source.segment_durations.push(
+                reference.subsegment_duration as f64 / effective_timescale as f64,
+            );
+            offset = end + 1;
+        }
+
+        log::info!(
+            "resolved SegmentBase: {} subsegments from sidx ({} references)",
+            source.segment_urls.len(),
+            sidx.references.len(),
+        );
+
+        Ok(source)
     }
 
     /// Fetch a single segment (init or media) from origin.
     fn fetch_segment(&self, url: &str) -> Result<Vec<u8>> {
-        let response = crate::http_client::get(url, &[])?;
+        self.fetch_segment_with_range(url, None)
+    }
 
+    /// Fetch a segment with an optional byte range.
+    ///
+    /// When `byte_range` is `Some((start, end))`, sends an HTTP Range header
+    /// to fetch only the specified byte range (inclusive).
+    fn fetch_segment_with_range(&self, url: &str, byte_range: Option<(u64, u64)>) -> Result<Vec<u8>> {
+        let headers = if let Some((start, end)) = byte_range {
+            vec![("Range".to_string(), format!("bytes={start}-{end}"))]
+        } else {
+            vec![]
+        };
+
+        let response = crate::http_client::get(url, &headers)?;
+
+        // Accept both 200 (full) and 206 (partial content) as success
         if response.status >= 400 {
             return Err(EdgepackError::Http {
                 status: response.status,
