@@ -43,6 +43,8 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     let mut timeline_entries: Vec<(u64, u32)> = Vec::new(); // (duration_ticks, repeat_count)
     let mut uniform_duration: Option<u64> = None; // for SegmentTemplate@duration
     let mut base_url_override: Option<String> = None; // absolute BaseURL at MPD/Period level
+    let mut found_video_segment_template = false; // whether we've locked in on a video SegmentTemplate
+    let mut capturing_current_template = false; // whether current AdaptationSet's template is being captured
     let mut ll_dash_info: Option<LowLatencyDashInfo> = None;
     let mut total_duration_secs: Option<f64> = None;
     let mut dash_content_steering: Option<ContentSteeringConfig> = None;
@@ -166,75 +168,96 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                         }
                     }
                     b"SegmentTemplate" => {
-                        let mut ato: Option<f64> = None;
-                        let mut atc: Option<bool> = None;
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"initialization" => {
-                                    init_template = Some(
-                                        String::from_utf8_lossy(&attr.value).to_string(),
-                                    );
-                                }
-                                b"media" => {
-                                    media_template = Some(
-                                        String::from_utf8_lossy(&attr.value).to_string(),
-                                    );
-                                }
-                                b"timescale" => {
-                                    timescale = String::from_utf8_lossy(&attr.value)
-                                        .parse()
-                                        .unwrap_or(1);
-                                }
-                                b"startNumber" => {
-                                    start_number = String::from_utf8_lossy(&attr.value)
-                                        .parse()
-                                        .unwrap_or(0);
-                                }
-                                b"duration" => {
-                                    uniform_duration = String::from_utf8_lossy(&attr.value)
-                                        .parse()
-                                        .ok();
-                                }
-                                b"availabilityTimeOffset" => {
-                                    ato = String::from_utf8_lossy(&attr.value)
-                                        .parse::<f64>()
-                                        .ok();
-                                }
-                                b"availabilityTimeComplete" => {
-                                    let val = String::from_utf8_lossy(&attr.value);
-                                    atc = Some(val == "true");
-                                }
-                                _ => {}
+                        // Only capture SegmentTemplate data from the first video
+                        // AdaptationSet. If no video has been seen yet, capture from
+                        // any AdaptationSet as a fallback (will be replaced when a
+                        // video AdaptationSet is found later). Once a video template
+                        // is locked in, skip all subsequent AdaptationSets.
+                        let should_capture = !found_video_segment_template;
+                        capturing_current_template = should_capture;
+                        if should_capture {
+                            // If this is a video AdaptationSet and we previously captured
+                            // non-video data, clear it first and lock in on video.
+                            if adaptation_set_is_video {
+                                timeline_entries.clear();
+                                uniform_duration = None;
+                                found_video_segment_template = true;
                             }
-                        }
-                        // Detect LL-DASH parameters
-                        if let Some(offset) = ato {
-                            ll_dash_info = Some(LowLatencyDashInfo {
-                                availability_time_offset: offset,
-                                availability_time_complete: atc.unwrap_or(true),
-                            });
+                            let mut ato: Option<f64> = None;
+                            let mut atc: Option<bool> = None;
+                            for attr in e.attributes().flatten() {
+                                match attr.key.as_ref() {
+                                    b"initialization" => {
+                                        init_template = Some(
+                                            String::from_utf8_lossy(&attr.value).to_string(),
+                                        );
+                                    }
+                                    b"media" => {
+                                        media_template = Some(
+                                            String::from_utf8_lossy(&attr.value).to_string(),
+                                        );
+                                    }
+                                    b"timescale" => {
+                                        timescale = String::from_utf8_lossy(&attr.value)
+                                            .parse()
+                                            .unwrap_or(1);
+                                    }
+                                    b"startNumber" => {
+                                        start_number = String::from_utf8_lossy(&attr.value)
+                                            .parse()
+                                            .unwrap_or(0);
+                                    }
+                                    b"duration" => {
+                                        uniform_duration = String::from_utf8_lossy(&attr.value)
+                                            .parse()
+                                            .ok();
+                                    }
+                                    b"availabilityTimeOffset" => {
+                                        ato = String::from_utf8_lossy(&attr.value)
+                                            .parse::<f64>()
+                                            .ok();
+                                    }
+                                    b"availabilityTimeComplete" => {
+                                        let val = String::from_utf8_lossy(&attr.value);
+                                        atc = Some(val == "true");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Detect LL-DASH parameters
+                            if let Some(offset) = ato {
+                                ll_dash_info = Some(LowLatencyDashInfo {
+                                    availability_time_offset: offset,
+                                    availability_time_complete: atc.unwrap_or(true),
+                                });
+                            }
                         }
                     }
                     b"S" => {
-                        let mut d = 0u64;
-                        let mut r = 0u32;
-                        for attr in e.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"d" => {
-                                    d = String::from_utf8_lossy(&attr.value)
-                                        .parse()
-                                        .unwrap_or(0);
+                        // Only capture timeline entries from the AdaptationSet
+                        // whose SegmentTemplate we are currently capturing.
+                        let should_capture = capturing_current_template;
+                        if should_capture {
+                            let mut d = 0u64;
+                            let mut r = 0u32;
+                            for attr in e.attributes().flatten() {
+                                match attr.key.as_ref() {
+                                    b"d" => {
+                                        d = String::from_utf8_lossy(&attr.value)
+                                            .parse()
+                                            .unwrap_or(0);
+                                    }
+                                    b"r" => {
+                                        r = String::from_utf8_lossy(&attr.value)
+                                            .parse()
+                                            .unwrap_or(0);
+                                    }
+                                    _ => {}
                                 }
-                                b"r" => {
-                                    r = String::from_utf8_lossy(&attr.value)
-                                        .parse()
-                                        .unwrap_or(0);
-                                }
-                                _ => {}
                             }
-                        }
-                        if d > 0 {
-                            timeline_entries.push((d, r));
+                            if d > 0 {
+                                timeline_entries.push((d, r));
+                            }
                         }
                     }
                     b"ContentSteering" => {
@@ -392,16 +415,26 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                     b"AdaptationSet" => {
                         in_adaptation_set = false;
                         adaptation_set_is_video = false;
+                        capturing_current_template = false;
                     }
                     b"Representation" => {
                         // If this Representation had SegmentBase data, collect it
                         // (prefer video; take first one found)
+                        // Prefer video Representation for SegmentBase. Take the
+                        // first video one, or the first non-video one as fallback
+                        // (will be replaced if a video Representation is found later).
+                        let take_segment_base = if segment_base_rep.is_none() {
+                            true // nothing captured yet — take any
+                        } else if adaptation_set_is_video && !segment_base_rep.as_ref().unwrap().is_video {
+                            true // upgrade from non-video to video
+                        } else {
+                            false
+                        };
                         if in_representation
-                            && segment_base_rep.is_none()
+                            && take_segment_base
                             && current_seg_base_index_range.is_some()
                             && current_seg_base_init_range.is_some()
                             && current_rep_base_url.is_some()
-                            && (adaptation_set_is_video || true) // take any, prefer video
                         {
                             segment_base_rep = Some(SegmentBaseRepresentation {
                                 base_url: current_rep_base_url.take().unwrap(),
@@ -1277,5 +1310,229 @@ mod tests {
         assert_eq!(parse_byte_range(""), None);
         assert_eq!(parse_byte_range("0"), None);
         assert_eq!(parse_byte_range("0-abc"), None);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Video-preference tests: ensure the parser selects the video
+    // AdaptationSet's SegmentTemplate data, not audio, regardless of
+    // element ordering in the MPD.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_video_first_audio_second_selects_video_template() {
+        // Video AdaptationSet appears before audio — should use video templates
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate initialization="video_init.mp4" media="video_$Number$.cmfv" timescale="1000" startNumber="0">
+        <SegmentTimeline>
+          <S d="6000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v0" bandwidth="2000000"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4">
+      <SegmentTemplate initialization="audio_init.mp4" media="audio_$Number$.m4a" timescale="48000" startNumber="0">
+        <SegmentTimeline>
+          <S d="240000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="a0" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Should use video init and media templates
+        assert!(result.init_segment_url.contains("video_init"));
+        assert!(result.segment_urls[0].contains("video_0"));
+        assert_eq!(result.segment_urls.len(), 2);
+        // Duration should be from video timeline: 6000/1000 = 6.0s
+        assert!((result.segment_durations[0] - 6.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_audio_first_video_second_selects_video_template() {
+        // Audio AdaptationSet appears BEFORE video — should still use video templates
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4">
+      <SegmentTemplate initialization="audio_init.mp4" media="audio_$Number$.m4a" timescale="48000" startNumber="0">
+        <SegmentTimeline>
+          <S d="240000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="a0" bandwidth="128000"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate initialization="video_init.mp4" media="video_$Number$.cmfv" timescale="1000" startNumber="0">
+        <SegmentTimeline>
+          <S d="6000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v0" bandwidth="2000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Even though audio appears first, should use video init and media templates
+        assert!(result.init_segment_url.contains("video_init"));
+        assert!(result.segment_urls[0].contains("video_0"));
+        assert_eq!(result.segment_urls.len(), 2);
+        // Duration should be from video timeline: 6000/1000 = 6.0s (not 240000/48000 = 5.0s)
+        assert!((result.segment_durations[0] - 6.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_no_content_type_fallback_to_mime_type() {
+        // AdaptationSet without contentType, only mimeType on Representation
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT18S">
+  <Period>
+    <AdaptationSet segmentAlignment="true">
+      <Representation mimeType="audio/mp4" bandwidth="128000">
+        <SegmentTemplate initialization="audio_init.mp4" media="audio_$Number$.m4a" timescale="48000" startNumber="0">
+          <SegmentTimeline>
+            <S d="240000" r="2"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet segmentAlignment="true">
+      <Representation mimeType="video/mp4" bandwidth="2000000">
+        <SegmentTemplate initialization="video_init.mp4" media="video_$Number$.cmfv" timescale="1000" startNumber="0">
+          <SegmentTimeline>
+            <S d="6000" r="2"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Should prefer video by detecting mimeType="video/mp4" on Representation
+        assert!(result.init_segment_url.contains("video_init"));
+        assert!(result.segment_urls[0].contains("video_0"));
+    }
+
+    #[test]
+    fn parse_audio_only_mpd_uses_audio_template() {
+        // When there's only audio (no video), should use the audio template
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT10S">
+  <Period>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4">
+      <SegmentTemplate initialization="audio_init.mp4" media="audio_$Number$.m4a" timescale="48000" startNumber="0">
+        <SegmentTimeline>
+          <S d="240000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="a0" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Should use audio template since it's the only one available
+        assert!(result.init_segment_url.contains("audio_init"));
+        assert!(result.segment_urls[0].contains("audio_0"));
+        assert_eq!(result.segment_urls.len(), 2);
+    }
+
+    #[test]
+    fn parse_segment_base_prefers_video_over_audio() {
+        // SegmentBase with audio first, then video — should prefer video
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT60S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+  <Period>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4">
+      <Representation id="a0" bandwidth="128000" codecs="mp4a.40.2">
+        <BaseURL>audio.mp4</BaseURL>
+        <SegmentBase indexRange="822-1981" timescale="48000">
+          <Initialization range="0-821"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="v0" bandwidth="2000000" codecs="avc1.64001f">
+        <BaseURL>video.mp4</BaseURL>
+        <SegmentBase indexRange="823-1982" timescale="15360">
+          <Initialization range="0-822"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Should have SegmentBase data from the video Representation
+        assert!(result.segment_base.is_some());
+        let sb = result.segment_base.as_ref().unwrap();
+        assert!(sb.file_url.contains("video.mp4"), "Expected video.mp4 but got {}", sb.file_url);
+        assert_eq!(sb.timescale, 15360);
+    }
+
+    #[test]
+    fn parse_three_adaptation_sets_video_audio_webm_selects_mp4_video() {
+        // Multiple AdaptationSets: video/mp4, audio/mp4, video/webm
+        // Should select the video/mp4 SegmentTemplate
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate initialization="mp4_video_init.mp4" media="mp4_video_$Number$.cmfv" timescale="1000" startNumber="0">
+        <SegmentTimeline>
+          <S d="6000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v0" bandwidth="2000000"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4">
+      <SegmentTemplate initialization="mp4_audio_init.mp4" media="mp4_audio_$Number$.m4a" timescale="48000" startNumber="0">
+        <SegmentTimeline>
+          <S d="240000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="a0" bandwidth="128000"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="video" mimeType="video/webm">
+      <SegmentTemplate initialization="webm_video_init.webm" media="webm_video_$Number$.webm" timescale="1000" startNumber="0">
+        <SegmentTimeline>
+          <S d="6000" r="1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v1" bandwidth="1500000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Should use the first video/mp4 template (not audio or webm)
+        assert!(result.init_segment_url.contains("mp4_video_init"));
+        assert!(result.segment_urls[0].contains("mp4_video_0"));
+    }
+
+    #[test]
+    fn parse_uniform_duration_audio_then_video_selects_video() {
+        // Uniform duration mode (no SegmentTimeline) with audio first
+        let mpd = r#"<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4">
+      <Representation>
+        <SegmentTemplate initialization="audio_init.mp4" media="audio_$Number$.m4a" duration="240000" timescale="48000" startNumber="0"/>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation>
+        <SegmentTemplate initialization="video_init.mp4" media="video_$Number$.cmfv" duration="6000" timescale="1000" startNumber="0"/>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+        let result = parse_dash_manifest(mpd, BASE_URL).unwrap();
+        // Should use video init and media templates
+        assert!(result.init_segment_url.contains("video_init"));
+        assert!(result.segment_urls[0].contains("video_0"));
+        // Duration should be from video: 6000/1000 = 6.0s
+        assert!((result.segment_durations[0] - 6.0).abs() < 0.001);
     }
 }
