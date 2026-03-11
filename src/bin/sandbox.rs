@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use axum::extract::{Path, State};
@@ -33,6 +34,22 @@ use edgepack::repackager::progressive::ProgressiveOutput;
 use edgepack::repackager::PipelineEvent;
 use edgepack::repackager::RepackageRequest;
 use edgepack::repackager::SourceConfig;
+
+// ─── Shared HTTP Client ────────────────────────────────────────────────
+
+/// Shared reqwest::blocking::Client singleton for the sandbox.
+/// Prevents connection exhaustion when 20+ concurrent threads make HTTP requests.
+fn shared_reqwest_client() -> &'static reqwest::blocking::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .pool_max_idle_per_host(32)
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
+}
 
 // ─── Application State ─────────────────────────────────────────────────
 
@@ -115,6 +132,9 @@ struct StatusResponse {
     timing: Option<serde_json::Value>,
     #[serde(default)]
     playback_ready: bool,
+    /// Variants that were detected in the source but skipped (unsupported container/codec).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_variants: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -122,10 +142,268 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Metadata for a resolved video variant.
+#[derive(Clone)]
+struct VideoVariantInfo {
+    url: String,
+    bandwidth: u64,
+    width: Option<u32>,
+    height: Option<u32>,
+    codecs: Option<String>,
+    frame_rate: Option<String>,
+    /// Original index from the source manifest (used for file naming: v{idx}_video.m3u8).
+    /// Only set after filtering — defaults to the position in the variants Vec.
+    original_index: Option<usize>,
+}
+
+/// A variant that was detected in the source but skipped due to unsupported container/codec.
+#[derive(Clone, Serialize)]
+struct SkippedVariant {
+    /// Why this variant was skipped (e.g., "WebM container not supported — ISOBMFF only")
+    reason: String,
+    /// Bandwidth from source manifest
+    bandwidth: u64,
+    /// Resolution from source manifest
+    width: Option<u32>,
+    height: Option<u32>,
+    /// Codec string from source manifest
+    codecs: Option<String>,
+    /// Container format (e.g., "video/webm", "audio/webm")
+    mime_type: Option<String>,
+}
+
 /// Result of resolving a master playlist to media playlist(s).
 struct ResolvedSource {
     video_url: String,
     audio_url: Option<String>,
+    text_tracks: Vec<TextTrackInfo>,
+    video_variants: Vec<VideoVariantInfo>,
+    /// Variants that were detected but skipped (unsupported container/codec).
+    skipped_variants: Vec<SkippedVariant>,
+}
+
+/// Information about a text/subtitle track resolved from a master playlist.
+struct TextTrackInfo {
+    url: String,
+    name: String,
+    language: Option<String>,
+    is_raw_vtt: bool,
+}
+
+/// Shared state for progressive manifest updates during parallel processing.
+/// All track processing threads hold a reference to this and update it as
+/// segments arrive. After each update, the combined manifest is rebuilt on disk
+/// so a player can begin playback before all tracks finish.
+struct ProgressiveManifestContext {
+    /// Content ID for output directory paths.
+    content_id: String,
+    /// Output formats being produced (HLS, DASH, or both).
+    output_formats: Vec<OutputFormat>,
+    /// Target encryption schemes.
+    target_schemes: Vec<EncryptionScheme>,
+    /// Container format for segment extensions.
+    container_format: edgepack::media::container::ContainerFormat,
+    /// Video variant metadata (for master manifest rendering).
+    video_variants: Vec<VideoVariantInfo>,
+    /// Text track source info (for subtitle rendition groups).
+    text_source_tracks: Vec<TextTrackInfo>,
+    /// Whether there are multiple video variants.
+    is_multi_variant: bool,
+    /// Number of expected video variants (for "all ready" check).
+    expected_video_variants: usize,
+    /// Whether audio is expected.
+    expects_audio: bool,
+    /// Set of variant indices that have produced at least one manifest.
+    video_variants_ready: std::collections::HashSet<usize>,
+    /// Whether audio manifest is available on disk.
+    audio_manifest_available: bool,
+    /// Set of text track indices with manifests available on disk.
+    text_manifests_available: std::collections::HashSet<usize>,
+    /// Whether the first combined manifest has been written.
+    /// We wait until all variants + audio have at least one segment
+    /// so the player gets a fully playable manifest on first load.
+    first_manifest_written: bool,
+}
+
+impl ProgressiveManifestContext {
+    /// Check if all required tracks are ready for initial playback.
+    /// We wait until every video variant + audio (if expected) has produced
+    /// at least one media manifest before writing the combined manifest.
+    fn all_tracks_ready(&self) -> bool {
+        let video_ready = self.video_variants_ready.len() >= self.expected_video_variants;
+        let audio_ready = !self.expects_audio || self.audio_manifest_available;
+        video_ready && audio_ready
+    }
+
+    /// Rebuild the combined manifest for all (format, scheme) pairs,
+    /// incorporating whatever track manifests are currently on disk.
+    /// Defers the first write until all variants + audio are playable.
+    fn rebuild_combined_manifests(&mut self) {
+        // Don't write until all tracks have at least one playable segment,
+        // unless we've already started (subsequent updates are always written).
+        if !self.first_manifest_written && !self.all_tracks_ready() {
+            return;
+        }
+        self.first_manifest_written = true;
+
+        for scheme in &self.target_schemes {
+            let scheme_str = scheme.scheme_type_str();
+            for out_format in &self.output_formats {
+                let fmt_label = match out_format {
+                    OutputFormat::Hls => "hls",
+                    OutputFormat::Dash => "dash",
+                };
+                let out_dir = PathBuf::from(format!(
+                    "sandbox/output/{}/{fmt_label}_{scheme_str}",
+                    self.content_id
+                ));
+
+                // Read current per-track manifests from disk
+                let ext = out_format.manifest_extension();
+
+                let video_manifest = if self.is_multi_variant && *out_format == OutputFormat::Hls {
+                    // For multi-variant HLS, the master manifest references per-variant
+                    // media playlists (v0_video.m3u8, v1_video.m3u8, etc.) — we don't
+                    // need the video manifest content in the master, just metadata.
+                    String::new()
+                } else if self.is_multi_variant && *out_format == OutputFormat::Dash {
+                    // For multi-variant DASH, read the first ready variant's MPD from disk
+                    // and use it as the base to build a multi-Representation MPD.
+                    let ready_sorted: Vec<usize> = {
+                        let mut v: Vec<usize> = self.video_variants_ready.iter().copied().collect();
+                        v.sort();
+                        v
+                    };
+                    if let Some(&first_vid) = ready_sorted.first() {
+                        let first_oidx = self.video_variants.get(first_vid)
+                            .and_then(|v| v.original_index)
+                            .unwrap_or(first_vid);
+                        std::fs::read_to_string(out_dir.join(format!("v{first_oidx}_video.{ext}"))).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    std::fs::read_to_string(out_dir.join(format!("video.{ext}"))).unwrap_or_default()
+                };
+
+                let audio_manifest = if self.audio_manifest_available {
+                    std::fs::read_to_string(out_dir.join(format!("audio.{ext}"))).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                // Collect text track infos for tracks that have manifests on disk
+                let text_manifest_infos: Vec<TextManifestInfo> = self.text_source_tracks.iter()
+                    .enumerate()
+                    .filter(|(idx, tt)| self.text_manifests_available.contains(idx) || tt.is_raw_vtt)
+                    .map(|(idx, tt)| TextManifestInfo {
+                        index: idx,
+                        name: tt.name.clone(),
+                        language: tt.language.clone(),
+                    })
+                    .collect();
+
+                // Only include variants that have produced manifests.
+                // Preserve original_index so filenames match (v{idx}_video.m3u8).
+                let ready_variants: Vec<VideoVariantInfo> = if self.is_multi_variant {
+                    self.video_variants.iter()
+                        .enumerate()
+                        .filter(|(idx, _)| self.video_variants_ready.contains(idx))
+                        .map(|(idx, v)| VideoVariantInfo {
+                            url: String::new(),
+                            bandwidth: v.bandwidth,
+                            width: v.width,
+                            height: v.height,
+                            codecs: v.codecs.clone(),
+                            frame_rate: v.frame_rate.clone(),
+                            original_index: v.original_index.or(Some(idx)),
+                        })
+                        .collect()
+                } else {
+                    self.video_variants.iter()
+                        .map(|v| VideoVariantInfo {
+                            url: String::new(),
+                            bandwidth: v.bandwidth,
+                            width: v.width,
+                            height: v.height,
+                            codecs: v.codecs.clone(),
+                            frame_rate: v.frame_rate.clone(),
+                            original_index: v.original_index,
+                        })
+                        .collect()
+                };
+
+                let combined = build_progressive_combined_manifest(
+                    *out_format,
+                    &video_manifest,
+                    &audio_manifest,
+                    &self.content_id,
+                    scheme,
+                    self.container_format,
+                    &text_manifest_infos,
+                    &ready_variants,
+                    false, // not complete — progressive processing
+                );
+
+                let final_manifest = if *out_format == OutputFormat::Dash {
+                    fixup_dash_progressive(&combined)
+                } else {
+                    combined
+                };
+                let _ = std::fs::write(out_dir.join(format!("manifest.{ext}")), &final_manifest);
+            }
+        }
+    }
+
+    /// Signal that a video variant has produced its first manifest.
+    /// `variant_idx` is the original variant index from the source.
+    fn signal_video_manifest(&mut self, variant_idx: usize) {
+        self.video_variants_ready.insert(variant_idx);
+        self.rebuild_combined_manifests();
+    }
+
+    /// Signal that a video variant has failed and will never produce output.
+    /// Decrements expected count so we don't wait indefinitely.
+    fn signal_video_failed(&mut self) {
+        if self.expected_video_variants > 0 {
+            self.expected_video_variants -= 1;
+        }
+        // May now be ready if all remaining variants have completed
+        self.rebuild_combined_manifests();
+    }
+
+    /// Signal that audio has failed and will never produce output.
+    fn signal_audio_failed(&mut self) {
+        self.expects_audio = false;
+        self.rebuild_combined_manifests();
+    }
+
+    /// Signal that audio manifest has been updated on disk.
+    fn signal_audio_manifest(&mut self) {
+        if !self.audio_manifest_available {
+            self.audio_manifest_available = true;
+            self.rebuild_combined_manifests();
+        }
+    }
+
+    /// Signal that a text track's manifest has been updated on disk.
+    fn signal_text_manifest(&mut self, text_idx: usize) {
+        if self.text_manifests_available.insert(text_idx) {
+            // New text track — rebuild combined if we've already started
+            self.rebuild_combined_manifests();
+        }
+    }
+
+    /// Update the variant list to only include successful variants.
+    /// Called after Phase 1 completes to produce a final manifest without
+    /// references to variants that failed processing.
+    fn finalize_with_successful_variants(&mut self, successful: Vec<VideoVariantInfo>) {
+        self.video_variants = successful;
+        self.expected_video_variants = self.video_variants.len();
+        self.video_variants_ready = (0..self.video_variants.len()).collect();
+        self.first_manifest_written = true;
+        self.rebuild_combined_manifests();
+    }
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────
@@ -189,7 +467,7 @@ async fn handle_repackage(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: "container_format must be 'cmaf', 'fmp4', or 'iso'".into(),
+                    error: "container_format must be 'cmaf', 'fmp4', 'iso', or 'ts'".into(),
                 }),
             )
                 .into_response();
@@ -291,6 +569,9 @@ async fn handle_repackage(
     };
     let source_url = resolved.video_url;
     let audio_source_url = resolved.audio_url;
+    let text_tracks = resolved.text_tracks;
+    let video_variants = resolved.video_variants;
+    let skipped_variants = resolved.skipped_variants;
 
     // Build config
     let config = AppConfig {
@@ -344,15 +625,23 @@ async fn handle_repackage(
     let cid = content_id.clone();
     let _fmt = output_format;
     let audio_source = audio_source_url;
+    let text_source_tracks = text_tracks;
+    let video_variants_for_task = video_variants;
     tokio::task::spawn_blocking(move || {
         let cache = edgepack::cache::global_cache();
         let state_key = CacheKeys::job_state(&cid, fmt_str);
 
-        // Write initial "Processing" state
+        // Write initial "Processing" state (include skipped variants if any)
+        let skipped_init_json: serde_json::Value = if skipped_variants.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::to_value(&skipped_variants).unwrap_or(serde_json::Value::Null)
+        };
         let initial_state = serde_json::json!({
             "state": "Processing",
             "segments_completed": 0,
             "segments_total": null,
+            "skipped_variants": skipped_init_json,
         });
         let _ = cache.set(
             &state_key,
@@ -362,330 +651,990 @@ async fn handle_repackage(
 
         let pipeline_start = Instant::now();
         let container_fmt = request.container_format;
+        let has_audio = audio_source.is_some();
+        let has_text = !text_source_tracks.is_empty();
 
         // ──────────────────────────────────────────────────────────────
-        // Step A: Pre-process the audio rendition BEFORE the video pipeline.
-        // This ensures audio files are on disk and audio manifests are available
-        // so that progressive manifests can reference audio from the very first
-        // segment — enabling immediate playback with sound.
+        // Phase 0: Write master manifest immediately from variant metadata.
+        // No segments needed — just metadata (bandwidth, resolution, codecs).
+        // Set up shared progressive manifest context for Phase 1 updates.
         // ──────────────────────────────────────────────────────────────
-        let audio_data: Option<PreprocessedAudio> = if let Some(ref audio_src) = audio_source {
-            eprintln!("  Pre-processing separate audio rendition: {}", audio_src);
-            let audio_cfg = config.clone();
-            let audio_request = RepackageRequest {
-                content_id: format!("{cid}_audio"),
-                source_url: audio_src.clone(),
-                output_formats: request.output_formats.clone(),
-                target_schemes: request.target_schemes.clone(),
-                container_format: request.container_format,
-                key_ids: vec![],
-                raw_keys: vec![],
-                key_rotation: None,
-                clear_lead_segments: None,
-                drm_systems: vec![],
-                enable_iframe_playlist: false,
-                dvr_window_duration: None,
-                content_steering: None,
-                cache_control: None,
-            };
-            let audio_pipeline = RepackagePipeline::new(audio_cfg);
-            match audio_pipeline.execute(&audio_request) {
-                Ok(audio_outputs) => {
-                    // Write audio init segments + media segments to disk NOW
-                    for (out_format, scheme, audio_output) in &audio_outputs {
-                        let scheme_str = scheme.scheme_type_str();
-                        let fmt_label = match out_format {
-                            OutputFormat::Hls => "hls",
-                            OutputFormat::Dash => "dash",
-                        };
-                        let out_dir = PathBuf::from(format!(
-                            "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
-                        ));
-                        let _ = std::fs::create_dir_all(&out_dir);
-
-                        if let Err(e) = write_output_to_disk(&cid, *out_format, scheme_str, audio_output, true) {
-                            eprintln!("  Warning: failed to write audio output: {e}");
-                        }
-                    }
-                    let audio_seg_count = audio_outputs.first()
-                        .map(|(_, _, o)| o.manifest_state().segments.len())
-                        .unwrap_or(0);
-                    eprintln!("  Audio pre-processing complete: {} audio segments", audio_seg_count);
-                    Some(PreprocessedAudio { outputs: audio_outputs })
-                }
-                Err(e) => {
-                    eprintln!("  Warning: audio pipeline failed: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // ──────────────────────────────────────────────────────────────
-        // Step B: Run the video pipeline with progressive output.
-        // At each step, write combined manifests that include both
-        // video and pre-processed audio.
-        // ──────────────────────────────────────────────────────────────
-        let pipeline = RepackagePipeline::new(config);
+        let is_multi_variant = video_variants_for_task.len() > 1;
         let mut scheme_list: Vec<String> = Vec::new();
-        let mut segments_total_count = 0usize;
-        let mut first_segment_ms: Option<u64> = None;
-        let mut per_segment_ms: Vec<u64> = Vec::new();
-        let mut last_segment_time = pipeline_start;
 
-        match pipeline.execute_progressive(&request, |event| {
-            match event {
-                PipelineEvent::InitReady { inits } => {
-                    for (out_format, scheme, init_data) in &inits {
-                        let scheme_str = scheme.scheme_type_str();
-                        if !scheme_list.contains(&scheme_str.to_string()) {
-                            scheme_list.push(scheme_str.to_string());
-                        }
-                        let fmt_label = match out_format {
-                            OutputFormat::Hls => "hls",
-                            OutputFormat::Dash => "dash",
-                        };
-                        let out_dir = PathBuf::from(format!(
-                            "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
-                        ));
-                        // Only clean+recreate if audio hasn't already created this dir
-                        if audio_data.is_none() {
-                            if out_dir.exists() {
-                                let _ = std::fs::remove_dir_all(&out_dir);
-                            }
-                        }
-                        let _ = std::fs::create_dir_all(&out_dir);
-
-                        if !init_data.is_empty() {
-                            let _ = std::fs::write(out_dir.join("init.mp4"), init_data);
-                            eprintln!("  Wrote {}/init.mp4 ({} bytes)", out_dir.display(), init_data.len());
-                        }
-                    }
+        // Create output directories and write initial master manifest
+        for scheme in &target_schemes {
+            let scheme_str = scheme.scheme_type_str();
+            for out_format in &request.output_formats {
+                let fmt_label = match out_format {
+                    OutputFormat::Hls => "hls",
+                    OutputFormat::Dash => "dash",
+                };
+                let out_dir = PathBuf::from(format!(
+                    "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
+                ));
+                if out_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&out_dir);
                 }
-                PipelineEvent::SegmentProcessed {
-                    segment_number,
-                    segment_count,
-                    outputs: seg_outputs,
-                } => {
-                    segments_total_count = segment_count;
-                    let now = Instant::now();
-                    let segment_elapsed_ms = now.duration_since(last_segment_time).as_millis() as u64;
-                    per_segment_ms.push(segment_elapsed_ms);
-                    last_segment_time = now;
-                    if first_segment_ms.is_none() {
-                        first_segment_ms = Some(pipeline_start.elapsed().as_millis() as u64);
-                    }
-                    for seg in &seg_outputs {
-                        let scheme_str = seg.scheme.scheme_type_str();
-                        let fmt_label = match seg.format {
-                            OutputFormat::Hls => "hls",
-                            OutputFormat::Dash => "dash",
-                        };
-                        let out_dir = PathBuf::from(format!(
-                            "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
-                        ));
-
-                        // Write segment to disk as soon as it's processed
-                        let seg_ext = container_fmt.video_segment_extension();
-                        let _ = std::fs::write(
-                            out_dir.join(format!("segment_{segment_number}{seg_ext}")),
-                            seg.segment_data,
-                        );
-
-                        // Write combined manifest (video + audio) for progressive playback.
-                        // For muxed sources (no separate audio), write the video manifest directly.
-                        // For demuxed sources, build a master/merged manifest referencing both.
-                        if let Some(ref manifest_str) = seg.manifest {
-                            let ext = seg.format.manifest_extension();
-                            // Always write the video-only manifest as video.{ext}
-                            let _ = std::fs::write(
-                                out_dir.join(format!("video.{ext}")),
-                                manifest_str,
-                            );
-
-                            // Build combined manifest if we have pre-processed audio
-                            let combined = if let Some(ref audio) = audio_data {
-                                build_combined_manifest(
-                                    seg.format,
-                                    &seg.scheme,
-                                    manifest_str,
-                                    audio,
-                                    container_fmt,
-                                )
-                            } else {
-                                None
-                            };
-
-                            let manifest_to_write = combined.as_deref().unwrap_or(manifest_str);
-                            // For DASH: fix progressive manifests for sandbox playback.
-                            // Convert type="dynamic" to type="static" so DASH.js treats
-                            // segments as immediately available (since they're on local disk).
-                            let final_manifest = if seg.format == OutputFormat::Dash {
-                                fixup_dash_for_sandbox(manifest_to_write)
-                            } else {
-                                manifest_to_write.to_string()
-                            };
-                            let _ = std::fs::write(
-                                out_dir.join(format!("manifest.{ext}")),
-                                &final_manifest,
-                            );
-                        }
-                    }
-
-                    // Update cache status — playback can start after first segment
-                    let progress_state = serde_json::json!({
-                        "state": "Processing",
-                        "segments_completed": segment_number + 1,
-                        "segments_total": segment_count,
-                        "schemes": &scheme_list,
-                        "playback_ready": true,
-                    });
-                    let _ = cache.set(
-                        &state_key,
-                        &serde_json::to_vec(&progress_state).unwrap(),
-                        3600,
-                    );
-                }
-            }
-        }) {
-            Ok(outputs) => {
-                let pipeline_elapsed = pipeline_start.elapsed();
-                let total_segments = segments_total_count as u32;
-                eprintln!(
-                    "  Pipeline complete: {}/{} — {} output(s) in {:.1}s",
-                    cid, fmt_str, outputs.len(), pipeline_elapsed.as_secs_f64()
-                );
-
-                let mut validation_results = Vec::new();
-
-                // Write final manifests (Complete phase — ENDLIST / static)
-                for (out_format, scheme, output) in &outputs {
-                    let scheme_str = scheme.scheme_type_str();
-                    let fmt_label = match out_format {
-                        OutputFormat::Hls => "hls",
-                        OutputFormat::Dash => "dash",
-                    };
-                    let out_dir = PathBuf::from(format!(
-                        "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
-                    ));
-
-                    // Overwrite manifest with finalized version
-                    if let Ok(rendered) = manifest::render_manifest(output.manifest_state()) {
-                        let ext = out_format.manifest_extension();
-                        // Write video-only manifest
-                        let _ = std::fs::write(out_dir.join(format!("video.{ext}")), &rendered);
-
-                        // Build final combined manifest with audio if available
-                        let combined = if let Some(ref audio) = audio_data {
-                            build_combined_manifest(
-                                *out_format,
-                                scheme,
-                                &rendered,
-                                audio,
-                                container_fmt,
-                            )
-                        } else {
-                            None
-                        };
-                        let final_manifest = combined.as_deref().unwrap_or(&rendered);
-                        let _ = std::fs::write(out_dir.join(format!("manifest.{ext}")), final_manifest);
-                    }
-
-                    // I-frame playlist (HLS only)
-                    if let Ok(Some(iframe_playlist)) = manifest::render_iframe_manifest(output.manifest_state()) {
-                        let _ = std::fs::write(out_dir.join("iframes.m3u8"), iframe_playlist);
-                    }
-
-                    eprintln!("  Wrote {} segments to {}", total_segments, out_dir.display());
-
-                    // Run compliance validation
-                    let validation = validate_output(&cid, *out_format, scheme_str, output);
-                    validation_results.push(validation);
+                let _ = std::fs::create_dir_all(&out_dir);
+                if !scheme_list.contains(&scheme_str.to_string()) {
+                    scheme_list.push(scheme_str.to_string());
                 }
 
-                // Validate audio output if present
-                if let Some(ref audio) = audio_data {
-                    for (out_format, scheme, audio_output) in &audio.outputs {
-                        let scheme_str = scheme.scheme_type_str();
-                        let mut audio_validation = validate_output(&cid, *out_format, scheme_str, audio_output);
-                        if let Some(obj) = audio_validation.as_object_mut() {
-                            let label = obj.get("output").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            obj.insert("output".to_string(), serde_json::json!(format!("{label} (audio)")));
-                        }
-                        validation_results.push(audio_validation);
-                    }
-                }
-
-                // Calculate total output bytes
-                let total_bytes: u64 = outputs
-                    .iter()
-                    .map(|(_, _, output)| {
-                        let init_bytes = output.init_segment_data().map(|d| d.len() as u64).unwrap_or(0);
-                        let seg_bytes: u64 = output
-                            .manifest_state()
-                            .segments
-                            .iter()
-                            .filter_map(|s| output.segment_data(s.number).map(|d| d.len() as u64))
-                            .sum();
-                        init_bytes + seg_bytes
-                    })
-                    .sum();
-
-                // Estimate WASM cold start from binary size on disk
-                let wasm_binary_size = std::fs::metadata("target/wasm32-wasip2/release/edgepack.wasm")
-                    .map(|m| m.len())
-                    .unwrap_or(628_000); // fallback: known ~628KB
-                // Empirical: ~0.5ms per 500KB on modern runtimes (wasmtime, V8)
-                let cold_start_us = (wasm_binary_size as f64 / 500_000.0 * 500.0) as u64;
-
-                // Write "Complete" state with segment count, validation, and timing
-                let complete_state = serde_json::json!({
-                    "state": "Complete",
-                    "segments_completed": total_segments,
-                    "segments_total": total_segments,
-                    "schemes": scheme_list,
-                    "validation": validation_results,
-                    "timing": {
-                        "total_pipeline_ms": pipeline_elapsed.as_millis() as u64,
-                        "first_segment_ms": first_segment_ms.unwrap_or(0),
-                        "per_segment_ms": per_segment_ms,
-                        "cold_start_us": cold_start_us,
-                        "wasm_binary_kb": wasm_binary_size / 1024,
-                        "total_segments": total_segments,
-                        "total_bytes": total_bytes,
-                        "avg_segment_ms": if total_segments > 0 {
-                            pipeline_elapsed.as_millis() as f64 / total_segments as f64
-                        } else { 0.0 },
-                        "throughput_mbps": if pipeline_elapsed.as_secs_f64() > 0.0 {
-                            (total_bytes as f64 * 8.0) / (pipeline_elapsed.as_secs_f64() * 1_000_000.0)
-                        } else { 0.0 },
-                    },
-                });
-                let _ = cache.set(
-                    &state_key,
-                    &serde_json::to_vec(&complete_state).unwrap(),
-                    3600,
-                );
-            }
-            Err(e) => {
-                let pipeline_elapsed = pipeline_start.elapsed();
-                eprintln!("  Pipeline failed after {:.1}s: {e}", pipeline_elapsed.as_secs_f64());
-
-                // Write "Failed" state with error
-                let failed_state = serde_json::json!({
-                    "state": "Failed",
-                    "segments_completed": 0,
-                    "segments_total": null,
-                    "error": format!("{e}"),
-                });
-                let _ = cache.set(
-                    &state_key,
-                    &serde_json::to_vec(&failed_state).unwrap(),
-                    3600,
-                );
+                // Master manifest is NOT written here — it's deferred until all
+                // variants + audio have produced at least one playable segment.
+                // The ProgressiveManifestContext handles this automatically.
             }
         }
+
+        // Build shared progressive manifest context for Phase 1 updates.
+        // Cloned text track info (we need the metadata but not the URLs).
+        let progressive_text_tracks: Vec<TextTrackInfo> = text_source_tracks.iter()
+            .map(|tt| TextTrackInfo {
+                url: String::new(), // not needed for manifest building
+                name: tt.name.clone(),
+                language: tt.language.clone(),
+                is_raw_vtt: tt.is_raw_vtt,
+            })
+            .collect();
+        let progressive_variants: Vec<VideoVariantInfo> = video_variants_for_task.iter()
+            .enumerate()
+            .map(|(idx, v)| VideoVariantInfo {
+                url: String::new(), // not needed for manifest building
+                bandwidth: v.bandwidth,
+                width: v.width,
+                height: v.height,
+                codecs: v.codecs.clone(),
+                frame_rate: v.frame_rate.clone(),
+                original_index: Some(idx),
+            })
+            .collect();
+        let manifest_ctx = Arc::new(Mutex::new(ProgressiveManifestContext {
+            content_id: cid.clone(),
+            output_formats: request.output_formats.clone(),
+            target_schemes: target_schemes.clone(),
+            container_format: container_fmt,
+            video_variants: progressive_variants,
+            text_source_tracks: progressive_text_tracks,
+            is_multi_variant,
+            expected_video_variants: video_variants_for_task.len(),
+            expects_audio: has_audio,
+            video_variants_ready: std::collections::HashSet::new(),
+            audio_manifest_available: false,
+            text_manifests_available: std::collections::HashSet::new(),
+            first_manifest_written: false,
+        }));
+
+        // ──────────────────────────────────────────────────────────────
+        // Phase 1: Process ALL tracks in parallel — video variants,
+        // audio, and text tracks run concurrently via std::thread::scope.
+        // Each track writes its own segments/inits to disk independently.
+        // ──────────────────────────────────────────────────────────────
+        let text_count_str = if has_text {
+            format!(" + {} text track(s)", text_source_tracks.len())
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "  Processing all tracks in parallel: {} video variant(s){}{}",
+            video_variants_for_task.len(),
+            if has_audio { " + audio" } else { "" },
+            text_count_str,
+        );
+
+        type TrackResult = Result<Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>, String>;
+
+        // All results collected after parallel processing
+        let video_outputs: Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>;
+        // (variant_index, pipeline_outputs) — tracks which variants succeeded
+        let mut all_variant_outputs: Vec<(usize, Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>)> = Vec::new();
+        let mut audio_outputs_final: Option<Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>> = None;
+        let mut text_outputs_final: Vec<Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>> = Vec::new();
+        let mut segments_total_count = 0usize;
+
+        // Shared progress counters — updated atomically from segment callbacks
+        let progress_segments = Arc::new(AtomicU32::new(0));
+        let progress_playback_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Background thread to flush progress to cache periodically
+        let progress_segments_bg = progress_segments.clone();
+        let progress_ready_bg = progress_playback_ready.clone();
+        let state_key_bg = state_key.clone();
+        let skipped_bg = skipped_init_json.clone();
+        let schemes_bg = scheme_list.clone();
+        let progress_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress_stop_bg = progress_stop.clone();
+        let _progress_flusher = std::thread::spawn(move || {
+            let cache = edgepack::cache::global_cache();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if progress_stop_bg.load(Ordering::Relaxed) {
+                    break;
+                }
+                let completed = progress_segments_bg.load(Ordering::Relaxed);
+                let ready = progress_ready_bg.load(Ordering::Relaxed);
+                let state = serde_json::json!({
+                    "state": "Processing",
+                    "segments_completed": completed,
+                    "segments_total": null,
+                    "playback_ready": ready,
+                    "skipped_variants": skipped_bg,
+                    "schemes": schemes_bg,
+                });
+                let _ = cache.set(
+                    &state_key_bg,
+                    &serde_json::to_vec(&state).unwrap(),
+                    3600,
+                );
+            }
+        });
+
+        {
+            // Use thread::scope so all spawned threads share references to our local variables
+            let all_results: Vec<(&str, usize, TrackResult)> = std::thread::scope(|scope| {
+                let mut handles: Vec<(&str, usize, std::thread::ScopedJoinHandle<'_, TrackResult>)> = Vec::new();
+
+                // ── Spawn video variant threads ──────────────────────
+                if is_multi_variant {
+                    for (vid, variant) in video_variants_for_task.iter().enumerate() {
+                        let config_clone = config.clone();
+                        let cid_ref = &cid;
+                        let request_ref = &request;
+                        let container_fmt_ref = &container_fmt;
+                        let manifest_ctx_ref = &manifest_ctx;
+                        let progress_ref = &progress_segments;
+                        let progress_ready_ref = &progress_playback_ready;
+                        let variant_url = variant.url.clone();
+                        handles.push(("video", vid, scope.spawn(move || {
+                            let variant_request = RepackageRequest {
+                                content_id: format!("{cid_ref}_v{vid}"),
+                                source_url: variant_url,
+                                output_formats: request_ref.output_formats.clone(),
+                                target_schemes: request_ref.target_schemes.clone(),
+                                container_format: request_ref.container_format,
+                                key_ids: vec![],
+                                raw_keys: vec![],
+                                key_rotation: None,
+                                clear_lead_segments: None,
+                                drm_systems: vec![],
+                                enable_iframe_playlist: false,
+                                dvr_window_duration: None,
+                                content_steering: None,
+                                cache_control: None,
+                            };
+
+                            let prefix = format!("v{vid}");
+                            let pipeline = RepackagePipeline::new(config_clone);
+                            let result = pipeline.execute_progressive(&variant_request, |event| {
+                                match event {
+                                    PipelineEvent::InitReady { inits } => {
+                                        for (out_format, scheme, init_data) in &inits {
+                                            let scheme_str = scheme.scheme_type_str();
+                                            let fmt_label = match out_format {
+                                                OutputFormat::Hls => "hls",
+                                                OutputFormat::Dash => "dash",
+                                            };
+                                            let out_dir = PathBuf::from(format!(
+                                                "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                            ));
+                                            if !init_data.is_empty() {
+                                                let _ = std::fs::write(
+                                                    out_dir.join(format!("{prefix}_init.mp4")),
+                                                    init_data,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    PipelineEvent::SegmentProcessed {
+                                        segment_number,
+                                        outputs: seg_outputs,
+                                        ..
+                                    } => {
+                                        for seg in &seg_outputs {
+                                            let scheme_str = seg.scheme.scheme_type_str();
+                                            let fmt_label = match seg.format {
+                                                OutputFormat::Hls => "hls",
+                                                OutputFormat::Dash => "dash",
+                                            };
+                                            let out_dir = PathBuf::from(format!(
+                                                "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                            ));
+
+                                            let seg_ext = container_fmt_ref.video_segment_extension();
+                                            let _ = std::fs::write(
+                                                out_dir.join(format!(
+                                                    "{prefix}_segment_{segment_number}{seg_ext}"
+                                                )),
+                                                seg.segment_data,
+                                            );
+
+                                            // Write per-variant video manifest
+                                            if let Some(ref manifest_str) = seg.manifest {
+                                                let ext = seg.format.manifest_extension();
+                                                let rewritten = rewrite_variant_manifest(
+                                                    manifest_str, cid_ref, vid,
+                                                    seg.format, &seg.scheme, *container_fmt_ref,
+                                                );
+                                                let _ = std::fs::write(
+                                                    out_dir.join(format!("{prefix}_video.{ext}")),
+                                                    &rewritten,
+                                                );
+                                                // Signal progressive manifest context
+                                                if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                                    ctx.signal_video_manifest(vid);
+                                                    // Check if playback is ready
+                                                    if ctx.first_manifest_written {
+                                                        progress_ready_ref.store(true, Ordering::Relaxed);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Update shared progress counter
+                                        progress_ref.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            });
+                            match result {
+                                Ok(outputs) => Ok(outputs),
+                                Err(e) => {
+                                    // Signal failure so the manifest context doesn't
+                                    // wait for this variant's data.
+                                    if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                        ctx.signal_video_failed();
+                                    }
+                                    Err(format!("variant {vid} failed: {e}"))
+                                }
+                            }
+                        })));
+                    }
+                } else {
+                    // Single variant — same as before but in a thread
+                    let config_clone = config.clone();
+                    let cid_ref = &cid;
+                    let request_clone = request.clone();
+                    let container_fmt_ref = &container_fmt;
+                    let manifest_ctx_ref = &manifest_ctx;
+                    let progress_ref = &progress_segments;
+                    let progress_ready_ref = &progress_playback_ready;
+                    handles.push(("video", 0, scope.spawn(move || {
+                        let pipeline = RepackagePipeline::new(config_clone);
+                        let result = pipeline.execute_progressive(&request_clone, |event| {
+                            match event {
+                                PipelineEvent::InitReady { inits } => {
+                                    for (out_format, scheme, init_data) in &inits {
+                                        let scheme_str = scheme.scheme_type_str();
+                                        let fmt_label = match out_format {
+                                            OutputFormat::Hls => "hls",
+                                            OutputFormat::Dash => "dash",
+                                        };
+                                        let out_dir = PathBuf::from(format!(
+                                            "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                        ));
+                                        if !init_data.is_empty() {
+                                            let _ = std::fs::write(out_dir.join("init.mp4"), init_data);
+                                        }
+                                    }
+                                }
+                                PipelineEvent::SegmentProcessed {
+                                    segment_number,
+                                    outputs: seg_outputs,
+                                    ..
+                                } => {
+                                    for seg in &seg_outputs {
+                                        let scheme_str = seg.scheme.scheme_type_str();
+                                        let fmt_label = match seg.format {
+                                            OutputFormat::Hls => "hls",
+                                            OutputFormat::Dash => "dash",
+                                        };
+                                        let out_dir = PathBuf::from(format!(
+                                            "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                        ));
+                                        let seg_ext = container_fmt_ref.video_segment_extension();
+                                        let _ = std::fs::write(
+                                            out_dir.join(format!("segment_{segment_number}{seg_ext}")),
+                                            seg.segment_data,
+                                        );
+                                        if let Some(ref manifest_str) = seg.manifest {
+                                            let ext = seg.format.manifest_extension();
+                                            let _ = std::fs::write(
+                                                out_dir.join(format!("video.{ext}")),
+                                                manifest_str,
+                                            );
+                                            // Signal progressive manifest context
+                                            if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                                ctx.signal_video_manifest(0);
+                                                if ctx.first_manifest_written {
+                                                    progress_ready_ref.store(true, Ordering::Relaxed);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Update shared progress counter
+                                    progress_ref.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                        match result {
+                            Ok(outputs) => Ok(outputs),
+                            Err(e) => {
+                                if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                    ctx.signal_video_failed();
+                                }
+                                Err(format!("video pipeline failed: {e}"))
+                            }
+                        }
+                    })));
+                }
+
+                // ── Spawn audio thread ───────────────────────────────
+                if let Some(ref audio_src) = audio_source {
+                    let config_clone = config.clone();
+                    let cid_ref = &cid;
+                    let request_ref = &request;
+                    let container_fmt_ref = &container_fmt;
+                    let manifest_ctx_ref = &manifest_ctx;
+                    let progress_ref = &progress_segments;
+                    let audio_url = audio_src.clone();
+                    handles.push(("audio", 0, scope.spawn(move || {
+                        let audio_request = RepackageRequest {
+                            content_id: format!("{cid_ref}_audio"),
+                            source_url: audio_url,
+                            output_formats: request_ref.output_formats.clone(),
+                            target_schemes: request_ref.target_schemes.clone(),
+                            container_format: request_ref.container_format,
+                            key_ids: vec![],
+                            raw_keys: vec![],
+                            key_rotation: None,
+                            clear_lead_segments: None,
+                            drm_systems: vec![],
+                            enable_iframe_playlist: false,
+                            dvr_window_duration: None,
+                            content_steering: None,
+                            cache_control: None,
+                        };
+                        let audio_pipeline = RepackagePipeline::new(config_clone);
+                        let result = audio_pipeline.execute_progressive(&audio_request, |event| {
+                            match event {
+                                PipelineEvent::InitReady { inits } => {
+                                    for (out_format, scheme, init_data) in &inits {
+                                        let scheme_str = scheme.scheme_type_str();
+                                        let fmt_label = match out_format {
+                                            OutputFormat::Hls => "hls",
+                                            OutputFormat::Dash => "dash",
+                                        };
+                                        let out_dir = PathBuf::from(format!(
+                                            "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                        ));
+                                        if !init_data.is_empty() {
+                                            let _ = std::fs::write(out_dir.join("audio_init.mp4"), init_data);
+                                        }
+                                    }
+                                }
+                                PipelineEvent::SegmentProcessed {
+                                    segment_number,
+                                    outputs: seg_outputs,
+                                    ..
+                                } => {
+                                    for seg in &seg_outputs {
+                                        let scheme_str = seg.scheme.scheme_type_str();
+                                        let fmt_label = match seg.format {
+                                            OutputFormat::Hls => "hls",
+                                            OutputFormat::Dash => "dash",
+                                        };
+                                        let out_dir = PathBuf::from(format!(
+                                            "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                        ));
+                                        let seg_ext = container_fmt_ref.audio_segment_extension();
+                                        let _ = std::fs::write(
+                                            out_dir.join(format!("audio_segment_{segment_number}{seg_ext}")),
+                                            seg.segment_data,
+                                        );
+                                        if let Some(ref manifest_str) = seg.manifest {
+                                            let ext = seg.format.manifest_extension();
+                                            let rewritten = rewrite_audio_manifest(
+                                                manifest_str, cid_ref, seg.format, &seg.scheme, *container_fmt_ref,
+                                            );
+                                            let _ = std::fs::write(
+                                                out_dir.join(format!("audio.{ext}")),
+                                                &rewritten,
+                                            );
+                                            // Signal audio manifest available — triggers
+                                            // combined manifest rebuild so player can use audio
+                                            if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                                ctx.signal_audio_manifest();
+                                            }
+                                        }
+                                    }
+                                    // Update shared progress counter
+                                    progress_ref.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                        match result {
+                            Ok(outputs) => Ok(outputs),
+                            Err(e) => {
+                                if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                    ctx.signal_audio_failed();
+                                }
+                                Err(format!("audio pipeline failed: {e}"))
+                            }
+                        }
+                    })));
+                }
+
+                // ── Spawn text track threads ─────────────────────────
+                for (text_idx, text_track) in text_source_tracks.iter().enumerate() {
+                    if text_track.is_raw_vtt {
+                        // Raw WebVTT: spawn a lightweight download thread.
+                        // For HLS subtitle tracks, the URL may be a media playlist (.m3u8)
+                        // containing references to .vtt segment files. In that case, fetch
+                        // the playlist, parse segment URLs, download all, and concatenate.
+                        let cid_ref = &cid;
+                        let request_ref = &request;
+                        let target_schemes_ref = &target_schemes;
+                        let manifest_ctx_ref = &manifest_ctx;
+                        let vtt_url = text_track.url.clone();
+                        handles.push(("text_vtt", text_idx, scope.spawn(move || {
+                            let vtt_bytes = if vtt_url.contains(".m3u8") {
+                                // HLS subtitle playlist: fetch, parse segments, download & concatenate
+                                download_hls_vtt_segments(&vtt_url)?
+                            } else {
+                                // Direct VTT URL: simple download
+                                match reqwest::blocking::get(&vtt_url) {
+                                    Ok(resp) if resp.status().is_success() => {
+                                        resp.bytes().map_err(|e| format!("VTT read failed: {e}"))?.to_vec()
+                                    }
+                                    Ok(resp) => return Err(format!("VTT download HTTP {}", resp.status())),
+                                    Err(e) => return Err(format!("VTT download failed: {e}")),
+                                }
+                            };
+                            for scheme in target_schemes_ref {
+                                let scheme_str = scheme.scheme_type_str();
+                                for out_format in &request_ref.output_formats {
+                                    let fmt_label = match out_format {
+                                        OutputFormat::Hls => "hls",
+                                        OutputFormat::Dash => "dash",
+                                    };
+                                    let out_dir = PathBuf::from(format!(
+                                        "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                    ));
+                                    let vtt_filename = format!("text_{text_idx}.vtt");
+                                    let _ = std::fs::write(out_dir.join(&vtt_filename), &vtt_bytes);
+                                    if *out_format == OutputFormat::Hls {
+                                        let wrapper = format!(
+                                            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:99999\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:99999.0,\n{vtt_filename}\n#EXT-X-ENDLIST\n"
+                                        );
+                                        let _ = std::fs::write(
+                                            out_dir.join(format!("text_{text_idx}.m3u8")),
+                                            &wrapper,
+                                        );
+                                    }
+                                }
+                            }
+                            // Signal text track available in combined manifest
+                            if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                ctx.signal_text_manifest(text_idx);
+                            }
+                            Ok(vec![])
+                        })));
+                    } else {
+                        // fMP4-wrapped text: run pipeline
+                        let config_clone = config.clone();
+                        let cid_ref = &cid;
+                        let request_ref = &request;
+                        let container_fmt_ref = &container_fmt;
+                        let manifest_ctx_ref = &manifest_ctx;
+                        let text_url = text_track.url.clone();
+                        handles.push(("text", text_idx, scope.spawn(move || {
+                            let text_request = RepackageRequest {
+                                content_id: format!("{cid_ref}_text_{text_idx}"),
+                                source_url: text_url,
+                                output_formats: request_ref.output_formats.clone(),
+                                target_schemes: request_ref.target_schemes.clone(),
+                                container_format: request_ref.container_format,
+                                key_ids: vec![],
+                                raw_keys: vec![],
+                                key_rotation: None,
+                                clear_lead_segments: None,
+                                drm_systems: vec![],
+                                enable_iframe_playlist: false,
+                                dvr_window_duration: None,
+                                content_steering: None,
+                                cache_control: None,
+                            };
+                            let text_prefix = format!("text_{text_idx}");
+                            let text_pipeline = RepackagePipeline::new(config_clone);
+                            let result = text_pipeline.execute_progressive(&text_request, |event| {
+                                match event {
+                                    PipelineEvent::InitReady { inits } => {
+                                        for (out_format, scheme, init_data) in &inits {
+                                            let scheme_str = scheme.scheme_type_str();
+                                            let fmt_label = match out_format {
+                                                OutputFormat::Hls => "hls",
+                                                OutputFormat::Dash => "dash",
+                                            };
+                                            let out_dir = PathBuf::from(format!(
+                                                "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                            ));
+                                            if !init_data.is_empty() {
+                                                let _ = std::fs::write(
+                                                    out_dir.join(format!("{text_prefix}_init.mp4")),
+                                                    init_data,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    PipelineEvent::SegmentProcessed {
+                                        segment_number,
+                                        outputs: seg_outputs,
+                                        ..
+                                    } => {
+                                        for seg in &seg_outputs {
+                                            let scheme_str = seg.scheme.scheme_type_str();
+                                            let fmt_label = match seg.format {
+                                                OutputFormat::Hls => "hls",
+                                                OutputFormat::Dash => "dash",
+                                            };
+                                            let out_dir = PathBuf::from(format!(
+                                                "sandbox/output/{cid_ref}/{fmt_label}_{scheme_str}"
+                                            ));
+                                            let seg_ext = container_fmt_ref.video_segment_extension();
+                                            let _ = std::fs::write(
+                                                out_dir.join(format!("{text_prefix}_segment_{segment_number}{seg_ext}")),
+                                                seg.segment_data,
+                                            );
+                                            if let Some(ref manifest_str) = seg.manifest {
+                                                let ext = seg.format.manifest_extension();
+                                                let rewritten = rewrite_text_manifest(
+                                                    manifest_str, cid_ref, text_idx,
+                                                    seg.format, &seg.scheme, *container_fmt_ref,
+                                                );
+                                                let _ = std::fs::write(
+                                                    out_dir.join(format!("{text_prefix}.{ext}")),
+                                                    &rewritten,
+                                                );
+                                                // Signal text track manifest available
+                                                if let Ok(mut ctx) = manifest_ctx_ref.lock() {
+                                                    ctx.signal_text_manifest(text_idx);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            result.map_err(|e| format!("text track {text_idx} failed: {e}"))
+                        })));
+                    }
+                }
+
+                // ── Join all threads and collect results ──────────────
+                handles.into_iter()
+                    .map(|(kind, idx, handle)| {
+                        let result = handle.join().unwrap_or_else(|_| Err(format!("{kind} {idx} panicked")));
+                        (kind, idx, result)
+                    })
+                    .collect()
+            });
+
+            // Stop the progress flusher — all processing threads have completed
+            progress_stop.store(true, Ordering::Relaxed);
+
+            // Categorize results from all threads.
+            // Signal failures to the progressive manifest context so it doesn't
+            // wait for variants that will never produce output.
+            for (kind, idx, result) in all_results {
+                match kind {
+                    "video" => {
+                        match result {
+                            Ok(outputs) if !outputs.is_empty() => {
+                                let seg_count = outputs.first()
+                                    .map(|(_, _, o)| o.manifest_state().segments.len())
+                                    .unwrap_or(0);
+                                eprintln!("  Video v{idx} complete: {seg_count} segments");
+                                if seg_count > segments_total_count {
+                                    segments_total_count = seg_count;
+                                }
+                                all_variant_outputs.push((idx, outputs));
+                            }
+                            Ok(_) => {
+                                eprintln!("  Warning: video v{idx} produced no output");
+                                if let Ok(mut ctx) = manifest_ctx.lock() {
+                                    ctx.signal_video_failed();
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: video v{idx} failed: {e}");
+                                if let Ok(mut ctx) = manifest_ctx.lock() {
+                                    ctx.signal_video_failed();
+                                }
+                            }
+                        }
+                    }
+                    "audio" => {
+                        match result {
+                            Ok(outputs) => {
+                                let seg_count = outputs.first()
+                                    .map(|(_, _, o)| o.manifest_state().segments.len())
+                                    .unwrap_or(0);
+                                eprintln!("  Audio complete: {seg_count} segments");
+                                audio_outputs_final = Some(outputs);
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: audio failed: {e}");
+                                if let Ok(mut ctx) = manifest_ctx.lock() {
+                                    ctx.signal_audio_failed();
+                                }
+                            }
+                        }
+                    }
+                    "text" | "text_vtt" => {
+                        // Ensure the vec is large enough (text results may arrive out of order)
+                        while text_outputs_final.len() <= idx {
+                            text_outputs_final.push(vec![]);
+                        }
+                        match result {
+                            Ok(outputs) => {
+                                eprintln!("  Text track {idx} complete");
+                                text_outputs_final[idx] = outputs;
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: text track {idx} failed: {e}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Select primary video outputs for finalization
+        if all_variant_outputs.is_empty() {
+            // All video failed
+            let failed_state = serde_json::json!({
+                "state": "Failed",
+                "segments_completed": 0,
+                "segments_total": null,
+                "error": "all video variants failed",
+            });
+            let _ = cache.set(
+                &state_key,
+                &serde_json::to_vec(&failed_state).unwrap(),
+                3600,
+            );
+            return;
+        }
+
+        // Write final per-variant manifests and select primary outputs.
+        // Filter video_variants_for_task to only include variants that succeeded.
+        let successful_variant_indices: Vec<usize> = all_variant_outputs.iter()
+            .map(|(vid, _)| *vid)
+            .collect();
+        let successful_variants: Vec<VideoVariantInfo> = if is_multi_variant {
+            successful_variant_indices.iter()
+                .filter_map(|&vid| video_variants_for_task.get(vid).map(|v| VideoVariantInfo {
+                    url: String::new(),
+                    bandwidth: v.bandwidth,
+                    width: v.width,
+                    height: v.height,
+                    codecs: v.codecs.clone(),
+                    frame_rate: v.frame_rate.clone(),
+                    original_index: Some(vid),
+                }))
+                .collect()
+        } else {
+            video_variants_for_task.iter().enumerate().map(|(idx, v)| VideoVariantInfo {
+                url: String::new(),
+                bandwidth: v.bandwidth,
+                width: v.width,
+                height: v.height,
+                codecs: v.codecs.clone(),
+                frame_rate: v.frame_rate.clone(),
+                original_index: Some(idx),
+            }).collect()
+        };
+
+        if is_multi_variant {
+            for (vid, variant_outputs) in &all_variant_outputs {
+                let prefix = format!("v{vid}");
+                for (out_format, scheme, output) in variant_outputs {
+                    if let Ok(rendered) = manifest::render_manifest(output.manifest_state()) {
+                        let ext = out_format.manifest_extension();
+                        let scheme_str = scheme.scheme_type_str();
+                        let fmt_label = match out_format {
+                            OutputFormat::Hls => "hls",
+                            OutputFormat::Dash => "dash",
+                        };
+                        let out_dir = PathBuf::from(format!(
+                            "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
+                        ));
+                        let rewritten = rewrite_variant_manifest(
+                            &rendered, &cid, *vid, *out_format, scheme, container_fmt,
+                        );
+                        let _ = std::fs::write(
+                            out_dir.join(format!("{prefix}_video.{ext}")),
+                            &rewritten,
+                        );
+                    }
+                }
+            }
+        }
+        video_outputs = all_variant_outputs.into_iter()
+            .map(|(_, outputs)| outputs)
+            .find(|v| !v.is_empty())
+            .unwrap_or_default();
+
+        // Update progressive manifest context with only successful variants
+        // so the combined manifest doesn't reference failed variants.
+        if is_multi_variant {
+            if let Ok(mut ctx) = manifest_ctx.lock() {
+                ctx.finalize_with_successful_variants(successful_variants.clone());
+            }
+        }
+
+        let first_segment_ms = Some(pipeline_start.elapsed().as_millis() as u64);
+
+        // ──────────────────────────────────────────────────────────────
+        // Phase 2: Finalize — write final manifests with all tracks,
+        // compute timing statistics, run validation.
+        // ──────────────────────────────────────────────────────────────
+        let pipeline_elapsed = pipeline_start.elapsed();
+        let total_segments = segments_total_count as u32;
+
+        let text_track_summary = if has_text {
+            format!(" +{} text track(s)", text_source_tracks.len())
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "  Pipeline complete: {}/{} — {} output(s) in {:.1}s{}{}",
+            cid, fmt_str, video_outputs.len(), pipeline_elapsed.as_secs_f64(),
+            if has_audio { " +audio" } else { "" },
+            text_track_summary,
+        );
+
+        let mut validation_results = Vec::new();
+
+        // Write final combined manifests
+        for (out_format, scheme, output) in &video_outputs {
+            let scheme_str = scheme.scheme_type_str();
+            let fmt_label = match out_format {
+                OutputFormat::Hls => "hls",
+                OutputFormat::Dash => "dash",
+            };
+            let out_dir = PathBuf::from(format!(
+                "sandbox/output/{cid}/{fmt_label}_{scheme_str}"
+            ));
+
+            // For DASH multi-variant: build combined ManifestState with all variants
+            // and per-Representation segment path prefixes.
+            let video_rendered = if is_multi_variant && *out_format == OutputFormat::Dash {
+                let mut combined_state = output.manifest_state().clone();
+                combined_state.variants = build_dash_variant_infos(&successful_variants);
+                manifest::render_manifest(&combined_state).ok()
+            } else {
+                manifest::render_manifest(output.manifest_state()).ok()
+            };
+            if let Some(video_rendered) = video_rendered {
+                let ext = out_format.manifest_extension();
+                let _ = std::fs::write(out_dir.join(format!("video.{ext}")), &video_rendered);
+
+                // Write final audio manifest if available
+                let final_audio_manifest = if let Some(ref audio_outs) = audio_outputs_final {
+                    if let Some((_, _, ref audio_output)) = audio_outs.iter()
+                        .find(|(f, s, _)| f == out_format && s == scheme)
+                    {
+                        let audio_rendered = manifest::render_manifest(audio_output.manifest_state()).ok();
+                        if let Some(ref arm) = audio_rendered {
+                            let rewritten = rewrite_audio_manifest(arm, &cid, *out_format, scheme, container_fmt);
+                            let _ = std::fs::write(out_dir.join(format!("audio.{ext}")), &rewritten);
+                        }
+                        audio_rendered
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Write final text manifests
+                let mut text_manifest_infos: Vec<TextManifestInfo> = Vec::new();
+                for (text_idx, text_outs) in text_outputs_final.iter().enumerate() {
+                    if let Some((_, _, ref text_output)) = text_outs.iter()
+                        .find(|(f, s, _)| f == out_format && s == scheme)
+                    {
+                        if let Ok(text_rendered) = manifest::render_manifest(text_output.manifest_state()) {
+                            let rewritten = rewrite_text_manifest(
+                                &text_rendered, &cid, text_idx, *out_format, scheme, container_fmt,
+                            );
+                            let text_prefix = format!("text_{text_idx}");
+                            let _ = std::fs::write(out_dir.join(format!("{text_prefix}.{ext}")), &rewritten);
+
+                            let track_info = &text_source_tracks[text_idx];
+                            text_manifest_infos.push(TextManifestInfo {
+                                index: text_idx,
+                                name: track_info.name.clone(),
+                                language: track_info.language.clone(),
+                            });
+                        }
+                    }
+                }
+
+                // Also add raw VTT text tracks to the manifest info
+                // (they don't have pipeline outputs but are still in text_source_tracks)
+                for (text_idx, text_track) in text_source_tracks.iter().enumerate() {
+                    if text_track.is_raw_vtt && !text_manifest_infos.iter().any(|t| t.index == text_idx) {
+                        text_manifest_infos.push(TextManifestInfo {
+                            index: text_idx,
+                            name: text_track.name.clone(),
+                            language: text_track.language.clone(),
+                        });
+                    }
+                }
+                // Sort by index to maintain order
+                text_manifest_infos.sort_by_key(|t| t.index);
+
+                // Build final combined manifest with all tracks
+                if has_audio || has_text || is_multi_variant {
+                    let combined = if let Some(ref raw_audio) = final_audio_manifest {
+                        build_progressive_combined_manifest(
+                            *out_format, &video_rendered, raw_audio,
+                            &cid, scheme, container_fmt,
+                            &text_manifest_infos,
+                            &successful_variants,
+                            true, // complete — final manifest
+                        )
+                    } else if !text_manifest_infos.is_empty() || is_multi_variant {
+                        build_progressive_combined_manifest(
+                            *out_format, &video_rendered, "",
+                            &cid, scheme, container_fmt,
+                            &text_manifest_infos,
+                            &successful_variants,
+                            true, // complete — final manifest
+                        )
+                    } else {
+                        video_rendered.clone()
+                    };
+                    let final_manifest = if *out_format == OutputFormat::Dash {
+                        fixup_dash_for_sandbox(&combined)
+                    } else {
+                        combined
+                    };
+                    let _ = std::fs::write(out_dir.join(format!("manifest.{ext}")), &final_manifest);
+                } else {
+                    // No separate audio/text — write video manifest as final
+                    let final_manifest = if *out_format == OutputFormat::Dash {
+                        fixup_dash_for_sandbox(&video_rendered)
+                    } else {
+                        video_rendered.clone()
+                    };
+                    let _ = std::fs::write(out_dir.join(format!("manifest.{ext}")), &final_manifest);
+                }
+            }
+
+            // I-frame playlist (HLS only)
+            if let Ok(Some(iframe_playlist)) = manifest::render_iframe_manifest(output.manifest_state()) {
+                let _ = std::fs::write(out_dir.join("iframes.m3u8"), iframe_playlist);
+            }
+
+            eprintln!("  Wrote {} segments to {}", total_segments, out_dir.display());
+
+            // Run compliance validation
+            let validation = validate_output(&cid, *out_format, scheme_str, output);
+            validation_results.push(validation);
+        }
+
+        // Validate audio output if present
+        if let Some(ref audio_outs) = audio_outputs_final {
+            for (out_format, scheme, audio_output) in audio_outs {
+                let scheme_str = scheme.scheme_type_str();
+                let mut audio_validation = validate_output(&cid, *out_format, scheme_str, audio_output);
+                if let Some(obj) = audio_validation.as_object_mut() {
+                    let label = obj.get("output").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    obj.insert("output".to_string(), serde_json::json!(format!("{label} (audio)")));
+                }
+                validation_results.push(audio_validation);
+            }
+        }
+
+        // Calculate total output bytes (video + audio + text)
+        let mut total_bytes: u64 = video_outputs
+            .iter()
+            .map(|(_, _, output)| {
+                let init_bytes = output.init_segment_data().map(|d| d.len() as u64).unwrap_or(0);
+                let seg_bytes: u64 = output
+                    .manifest_state()
+                    .segments
+                    .iter()
+                    .filter_map(|s| output.segment_data(s.number).map(|d| d.len() as u64))
+                    .sum();
+                init_bytes + seg_bytes
+            })
+            .sum();
+        if let Some(ref audio_outs) = audio_outputs_final {
+            total_bytes += audio_outs.iter().map(|(_, _, output)| {
+                let init_bytes = output.init_segment_data().map(|d| d.len() as u64).unwrap_or(0);
+                let seg_bytes: u64 = output
+                    .manifest_state()
+                    .segments
+                    .iter()
+                    .filter_map(|s| output.segment_data(s.number).map(|d| d.len() as u64))
+                    .sum();
+                init_bytes + seg_bytes
+            }).sum::<u64>();
+        }
+        for text_outs in &text_outputs_final {
+            total_bytes += text_outs.iter().map(|(_, _, output)| {
+                let init_bytes = output.init_segment_data().map(|d| d.len() as u64).unwrap_or(0);
+                let seg_bytes: u64 = output
+                    .manifest_state()
+                    .segments
+                    .iter()
+                    .filter_map(|s| output.segment_data(s.number).map(|d| d.len() as u64))
+                    .sum();
+                init_bytes + seg_bytes
+            }).sum::<u64>();
+        }
+
+        // Estimate WASM cold start from binary size on disk
+        let wasm_binary_size = std::fs::metadata("target/wasm32-wasip2/release/edgepack.wasm")
+            .map(|m| m.len())
+            .unwrap_or(628_000); // fallback: known ~628KB
+        let cold_start_us = (wasm_binary_size as f64 / 500_000.0 * 500.0) as u64;
+
+        // Write "Complete" state
+        let skipped_json: serde_json::Value = if skipped_variants.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::to_value(&skipped_variants).unwrap_or(serde_json::Value::Null)
+        };
+        let complete_state = serde_json::json!({
+            "state": "Complete",
+            "segments_completed": total_segments,
+            "segments_total": total_segments,
+            "schemes": scheme_list,
+            "validation": validation_results,
+            "skipped_variants": skipped_json,
+            "timing": {
+                "total_pipeline_ms": pipeline_elapsed.as_millis() as u64,
+                "first_segment_ms": first_segment_ms.unwrap_or(0),
+                "per_segment_ms": [],
+                "cold_start_us": cold_start_us,
+                "wasm_binary_kb": wasm_binary_size / 1024,
+                "total_segments": total_segments,
+                "total_bytes": total_bytes,
+                "avg_segment_ms": if total_segments > 0 {
+                    pipeline_elapsed.as_millis() as f64 / total_segments as f64
+                } else { 0.0 },
+                "throughput_mbps": if pipeline_elapsed.as_secs_f64() > 0.0 {
+                    (total_bytes as f64 * 8.0) / (pipeline_elapsed.as_secs_f64() * 1_000_000.0)
+                } else { 0.0 },
+            },
+        });
+        let _ = cache.set(
+            &state_key,
+            &serde_json::to_vec(&complete_state).unwrap(),
+            3600,
+        );
     });
 
     (
@@ -734,6 +1683,7 @@ async fn handle_status(
                 let validation = status.get("validation").cloned();
                 let timing = status.get("timing").cloned();
                 let playback_ready = status.get("playback_ready").and_then(|v| v.as_bool()).unwrap_or(false);
+                let skipped_variants = status.get("skipped_variants").cloned();
                 let output_dir = if state_str == "Complete" || playback_ready {
                     Some(format!("sandbox/output/{content_id}/{fmt}_*/"))
                 } else {
@@ -751,6 +1701,7 @@ async fn handle_status(
                         validation,
                         timing,
                         playback_ready,
+                        skipped_variants,
                     }),
                 )
                     .into_response()
@@ -1030,14 +1981,14 @@ async fn start_local_file_server(path: &str) -> Result<String, String> {
 async fn resolve_master_playlist(url: &str) -> Result<ResolvedSource, String> {
     let lower = url.to_lowercase();
 
-    // DASH MPD — check for separate audio AdaptationSets
+    // DASH MPD — check for separate audio/text AdaptationSets
     if lower.contains(".mpd") {
-        return resolve_dash_audio(url).await;
+        return resolve_dash_tracks(url).await;
     }
 
     // Only attempt HLS resolution for .m3u8 URLs
     if !lower.contains(".m3u8") {
-        return Ok(ResolvedSource { video_url: url.to_string(), audio_url: None });
+        return Ok(ResolvedSource { video_url: url.to_string(), audio_url: None, text_tracks: vec![], video_variants: vec![], skipped_variants: vec![] });
     }
 
     let resp = reqwest::get(url)
@@ -1056,83 +2007,69 @@ async fn resolve_master_playlist(url: &str) -> Result<ResolvedSource, String> {
     // Check if this is a master playlist (contains #EXT-X-STREAM-INF)
     if !body.contains("#EXT-X-STREAM-INF") {
         // Already a media playlist — use as-is
-        return Ok(ResolvedSource { video_url: url.to_string(), audio_url: None });
+        return Ok(ResolvedSource { video_url: url.to_string(), audio_url: None, text_tracks: vec![], video_variants: vec![], skipped_variants: vec![] });
     }
 
     eprintln!("  Detected HLS master playlist — resolving to media playlist...");
 
-    let base = url.rfind('/').map(|i| &url[..=i]).unwrap_or(url);
+    // Use the core parser to extract all variants and renditions
+    let master_info = edgepack::manifest::hls_input::parse_hls_master_playlist(&body, url)
+        .map_err(|e| format!("parse HLS master playlist: {e}"))?;
 
-    // Parse audio renditions (#EXT-X-MEDIA:TYPE=AUDIO with URI)
-    let mut audio_uri: Option<String> = None;
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("#EXT-X-MEDIA:") && trimmed.contains("TYPE=AUDIO") {
-            if let Some(uri_start) = trimmed.find("URI=\"") {
-                let after_uri = &trimmed[uri_start + 5..];
-                if let Some(uri_end) = after_uri.find('"') {
-                    let uri = &after_uri[..uri_end];
-                    if !uri.is_empty() {
-                        audio_uri = Some(uri.to_string());
-                        break; // Take the first audio rendition
-                    }
-                }
-            }
+    // Build video variants from parsed data
+    let video_variants: Vec<VideoVariantInfo> = master_info.variants.iter()
+        .zip(master_info.variant_uris.iter())
+        .enumerate()
+        .map(|(idx, (variant, uri))| VideoVariantInfo {
+            url: uri.clone(),
+            bandwidth: variant.bandwidth,
+            width: variant.width,
+            height: variant.height,
+            codecs: variant.codecs.clone(),
+            frame_rate: variant.frame_rate.clone(),
+            original_index: Some(idx),
+        })
+        .collect();
+
+    // Pick the highest-bandwidth variant as the primary video URL (backward compat)
+    let (video_url, best_bandwidth) = video_variants.iter()
+        .max_by_key(|v| v.bandwidth)
+        .map(|v| (v.url.clone(), v.bandwidth))
+        .ok_or("no variant streams found in master playlist")?;
+
+    // Extract audio URL from the first audio rendition with a URI
+    let audio_url = master_info.audio_renditions.iter()
+        .find_map(|r| r.uri.clone());
+
+    // Extract text/subtitle tracks from renditions.
+    // HLS subtitle playlists typically reference raw WebVTT segments (not fMP4),
+    // so we mark them as is_raw_vtt = true and store the playlist URL.
+    // The text track handler will fetch the playlist, parse segments, and concatenate.
+    let text_tracks_resolved: Vec<TextTrackInfo> = master_info.subtitle_renditions.iter()
+        .filter_map(|r| {
+            r.uri.as_ref().map(|uri| TextTrackInfo {
+                url: uri.clone(),
+                name: r.name.clone(),
+                language: r.language.clone(),
+                // HLS subtitle playlists are WebVTT-based (not fMP4) unless
+                // the playlist URL explicitly indicates fMP4 (extremely rare).
+                // Mark as raw VTT so we download + concatenate instead of pipeline.
+                is_raw_vtt: true,
+            })
+        })
+        .collect();
+
+    if video_variants.len() > 1 {
+        eprintln!("  Detected {} HLS variants:", video_variants.len());
+        for (i, v) in video_variants.iter().enumerate() {
+            eprintln!(
+                "    v{i}: {}x{} @ {} bps (codecs={:?})",
+                v.width.unwrap_or(0), v.height.unwrap_or(0), v.bandwidth, v.codecs
+            );
         }
     }
-
-    // Parse variant streams: pick the highest-bandwidth variant.
-    // Track both the bandwidth AND URL for the current best, only updating
-    // when a higher bandwidth is found.
-    let mut best_bandwidth: u64 = 0;
-    let mut best_url: Option<String> = None;
-    let mut pending_bandwidth: u64 = 0;
-    let mut next_is_url = false;
-
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("#EXT-X-STREAM-INF:") {
-            // Extract bandwidth
-            pending_bandwidth = 0;
-            if let Some(bw_str) = trimmed
-                .split(',')
-                .find(|s| s.contains("BANDWIDTH="))
-                .and_then(|s| s.split('=').nth(1))
-            {
-                if let Ok(bw) = bw_str.trim().parse::<u64>() {
-                    pending_bandwidth = bw;
-                }
-            }
-            next_is_url = true;
-        } else if next_is_url && !trimmed.is_empty() && !trimmed.starts_with('#') {
-            // Only update best if this variant has higher bandwidth (or is the first)
-            if pending_bandwidth > best_bandwidth || best_url.is_none() {
-                best_bandwidth = pending_bandwidth;
-                best_url = Some(trimmed.to_string());
-            }
-            next_is_url = false;
-        }
-    }
-
-    let variant_path = best_url.ok_or("no variant streams found in master playlist")?;
-
-    // Resolve relative URLs against master URL base
-    let video_url = if variant_path.starts_with("http://") || variant_path.starts_with("https://") {
-        variant_path
-    } else {
-        format!("{base}{variant_path}")
-    };
-
-    let audio_url = audio_uri.map(|uri| {
-        if uri.starts_with("http://") || uri.starts_with("https://") {
-            uri
-        } else {
-            format!("{base}{uri}")
-        }
-    });
-
     eprintln!(
-        "  Selected variant: {} (bandwidth: {})",
+        "  Selected primary variant: {} (bandwidth: {})",
         video_url, best_bandwidth
     );
     if let Some(ref audio) = audio_url {
@@ -1140,16 +2077,23 @@ async fn resolve_master_playlist(url: &str) -> Result<ResolvedSource, String> {
     } else {
         eprintln!("  Audio: muxed with video (no separate rendition)");
     }
+    if !text_tracks_resolved.is_empty() {
+        eprintln!("  Text tracks: {} track(s)", text_tracks_resolved.len());
+        for tt in &text_tracks_resolved {
+            eprintln!("    - {} (lang={:?})", tt.name, tt.language);
+        }
+    }
 
-    Ok(ResolvedSource { video_url, audio_url })
+    Ok(ResolvedSource { video_url, audio_url, text_tracks: text_tracks_resolved, video_variants, skipped_variants: vec![] })
 }
 
-/// Resolve audio from a DASH MPD by finding audio AdaptationSets.
+/// Resolve audio and text tracks from a DASH MPD.
 ///
 /// If the MPD has a separate audio `<AdaptationSet>` with `mimeType="audio/mp4"`,
 /// builds a synthetic audio-only DASH MPD, writes it to a temp file, serves it
 /// via a local HTTP server, and returns the URL as the audio source.
-async fn resolve_dash_audio(url: &str) -> Result<ResolvedSource, String> {
+/// Also extracts text `<AdaptationSet>` elements for subtitle tracks.
+async fn resolve_dash_tracks(url: &str) -> Result<ResolvedSource, String> {
     let resp = reqwest::get(url)
         .await
         .map_err(|e| format!("fetch DASH MPD failed: {e}"))?;
@@ -1165,7 +2109,7 @@ async fn resolve_dash_audio(url: &str) -> Result<ResolvedSource, String> {
 
     if !body.contains("<MPD") {
         // Not a DASH MPD — return as-is
-        return Ok(ResolvedSource { video_url: url.to_string(), audio_url: None });
+        return Ok(ResolvedSource { video_url: url.to_string(), audio_url: None, text_tracks: vec![], video_variants: vec![], skipped_variants: vec![] });
     }
 
     // URL base for resolving relative BaseURL references
@@ -1179,6 +2123,223 @@ async fn resolve_dash_audio(url: &str) -> Result<ResolvedSource, String> {
         .unwrap_or_else(|| "PT2S".to_string());
     let mpd_profiles = extract_xml_attr(&body, "MPD", "profiles")
         .unwrap_or_else(|| "urn:mpeg:dash:profile:isoff-on-demand:2011".to_string());
+
+    // ── Extract all video Representations ───────────────────────────────
+    // For each video AdaptationSet, extract individual Representations and build
+    // synthetic single-Representation MPDs so each can be processed independently.
+    // Non-ISOBMFF containers (e.g., WebM) are detected and skipped at this stage
+    // rather than allowed to fail during pipeline processing.
+    let mut video_variants: Vec<VideoVariantInfo> = Vec::new();
+    let mut skipped_variants_list: Vec<SkippedVariant> = Vec::new();
+    {
+        let mut vs = 0;
+        while let Some(as_start) = body[vs..].find("<AdaptationSet") {
+            let abs_start = vs + as_start;
+            let as_end = if let Some(end) = body[abs_start..].find("</AdaptationSet>") {
+                abs_start + end + "</AdaptationSet>".len()
+            } else {
+                vs = abs_start + 1;
+                continue;
+            };
+            let as_block = &body[abs_start..as_end];
+
+            // Detect video AdaptationSet (by contentType or mimeType on any element)
+            let is_video = as_block.contains("contentType=\"video\"")
+                || as_block.contains("contentType='video'")
+                || as_block.contains("mimeType=\"video/mp4\"")
+                || as_block.contains("mimeType='video/mp4'")
+                || as_block.contains("mimeType=\"video/webm\"")
+                || as_block.contains("mimeType='video/webm'");
+
+            if is_video {
+                // Check AdaptationSet-level mimeType (may be inherited by all Representations)
+                let as_open_end = as_block.find('>').unwrap_or(as_block.len());
+                let as_open_tag = &as_block[..=as_open_end];
+                let as_mime = extract_xml_attr(as_open_tag, "AdaptationSet", "mimeType");
+
+                // Find all <Representation> elements within this AdaptationSet
+                let mut rep_search = 0;
+                while let Some(rep_start) = as_block[rep_search..].find("<Representation") {
+                    let rep_abs = rep_search + rep_start;
+                    // Find end of this Representation (could be </Representation> or self-closing)
+                    let rep_end = if let Some(end) = as_block[rep_abs..].find("</Representation>") {
+                        rep_abs + end + "</Representation>".len()
+                    } else if let Some(end) = as_block[rep_abs..].find("/>") {
+                        rep_abs + end + 2
+                    } else {
+                        rep_search = rep_abs + 1;
+                        continue;
+                    };
+                    let rep_block = &as_block[rep_abs..rep_end];
+
+                    // Extract variant metadata from Representation attributes
+                    let bandwidth = extract_xml_attr(rep_block, "Representation", "bandwidth")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let width = extract_xml_attr(rep_block, "Representation", "width")
+                        .and_then(|v| v.parse::<u32>().ok());
+                    let height = extract_xml_attr(rep_block, "Representation", "height")
+                        .and_then(|v| v.parse::<u32>().ok());
+                    let codecs = extract_xml_attr(rep_block, "Representation", "codecs");
+                    let frame_rate = extract_xml_attr(rep_block, "Representation", "frameRate");
+
+                    // Determine effective mimeType: Representation-level overrides AdaptationSet-level
+                    let rep_mime = extract_xml_attr(rep_block, "Representation", "mimeType");
+                    let effective_mime = rep_mime.as_deref().or(as_mime.as_deref());
+
+                    // Skip non-ISOBMFF containers (WebM, etc.) — edgepack only processes ISOBMFF/CMAF
+                    let is_isobmff = match effective_mime {
+                        Some(m) => m == "video/mp4" || m == "video/iso.segment",
+                        // If no mimeType, assume ISOBMFF (the common case for DASH)
+                        None => true,
+                    };
+
+                    if !is_isobmff {
+                        let res_label = match (width, height) {
+                            (Some(w), Some(h)) => format!("{w}x{h}"),
+                            _ => "unknown".to_string(),
+                        };
+                        let codec_label = codecs.as_deref().unwrap_or("unknown");
+                        let mime_label = effective_mime.unwrap_or("unknown");
+                        eprintln!(
+                            "  ⚠ Skipping Representation: {res_label} @ {bandwidth} bps \
+                             (codecs={codec_label}, mimeType={mime_label}) — \
+                             non-ISOBMFF container not supported"
+                        );
+                        skipped_variants_list.push(SkippedVariant {
+                            reason: format!(
+                                "Container '{mime_label}' not supported — edgepack processes ISOBMFF (video/mp4) only"
+                            ),
+                            bandwidth,
+                            width,
+                            height,
+                            codecs,
+                            mime_type: effective_mime.map(|s| s.to_string()),
+                        });
+                        rep_search = rep_end;
+                        continue;
+                    }
+
+                    // Resolve BaseURL references in the Representation to absolute URLs
+                    let mut resolved_rep = rep_block.to_string();
+                    let mut bu_search = 0;
+                    while let Some(bu_start) = resolved_rep[bu_search..].find("<BaseURL>") {
+                        let tag_start = bu_search + bu_start;
+                        let value_start = tag_start + "<BaseURL>".len();
+                        if let Some(bu_end) = resolved_rep[value_start..].find("</BaseURL>") {
+                            let value_end = value_start + bu_end;
+                            let relative_url = resolved_rep[value_start..value_end].to_string();
+                            if !relative_url.starts_with("http://") && !relative_url.starts_with("https://") {
+                                let absolute_url = format!("{base}{relative_url}");
+                                resolved_rep = format!(
+                                    "{}{}{}",
+                                    &resolved_rep[..value_start],
+                                    absolute_url,
+                                    &resolved_rep[value_end..],
+                                );
+                            }
+                            bu_search = value_start + 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Also check for any shared content outside Representations that
+                    // should be included (e.g., SegmentTemplate at AdaptationSet level).
+                    // Extract content between the opening tag and first <Representation>
+                    let shared_content = if rep_start > as_open_end + 1 - 0 {
+                        let shared_start = as_open_end + 1;
+                        let first_rep_in_block = as_block.find("<Representation").unwrap_or(shared_start);
+                        let shared = as_block[shared_start..first_rep_in_block].trim();
+                        if shared.is_empty() { String::new() } else { format!("    {shared}\n") }
+                    } else {
+                        String::new()
+                    };
+
+                    // Build a synthetic single-Representation video MPD
+                    let synthetic_video_mpd = format!(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="{mpd_profiles}" minBufferTime="{mpd_min_buffer}" type="{mpd_type}" mediaPresentationDuration="{mpd_duration}">
+  <BaseURL>{base}</BaseURL>
+  <Period id="0">
+    {as_open_tag}
+{shared_content}      {resolved_rep}
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+                    );
+
+                    // Write synthetic MPD to temp file and serve it
+                    let vid = video_variants.len();
+                    let tmp_dir = std::env::temp_dir().join("edgepack_video");
+                    let _ = std::fs::create_dir_all(&tmp_dir);
+                    let file_hash = {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        format!("{url}_video_{vid}").hash(&mut hasher);
+                        hasher.finish()
+                    };
+                    let tmp_path = tmp_dir.join(format!("video_{vid}_{file_hash:016x}.mpd"));
+                    if std::fs::write(&tmp_path, &synthetic_video_mpd).is_ok() {
+                        if let Ok(video_url) = start_local_file_server(
+                            tmp_path.to_str().unwrap_or("")
+                        ).await {
+                            video_variants.push(VideoVariantInfo {
+                                url: video_url,
+                                bandwidth,
+                                width,
+                                height,
+                                codecs,
+                                frame_rate,
+                                original_index: Some(vid),
+                            });
+                        }
+                    }
+
+                    rep_search = rep_end;
+                }
+            }
+            vs = as_end;
+        }
+    }
+
+    // Set video_url to highest-bandwidth variant for backward compatibility
+    let video_url_resolved = if let Some(best) = video_variants.iter().max_by_key(|v| v.bandwidth) {
+        best.url.clone()
+    } else {
+        url.to_string()
+    };
+
+    if video_variants.len() > 1 {
+        eprintln!("  Detected {} DASH video Representations (ISOBMFF):", video_variants.len());
+        for (i, v) in video_variants.iter().enumerate() {
+            eprintln!(
+                "    v{i}: {}x{} @ {} bps (codecs={:?})",
+                v.width.unwrap_or(0), v.height.unwrap_or(0), v.bandwidth, v.codecs
+            );
+        }
+    } else if video_variants.len() == 1 {
+        eprintln!("  Single DASH video Representation: {} bps", video_variants[0].bandwidth);
+    }
+
+    if !skipped_variants_list.is_empty() {
+        eprintln!(
+            "  ⚠ Skipped {} non-ISOBMFF Representation(s):",
+            skipped_variants_list.len()
+        );
+        for sv in &skipped_variants_list {
+            eprintln!(
+                "    - {}x{} @ {} bps (codecs={:?}, mime={:?}): {}",
+                sv.width.unwrap_or(0),
+                sv.height.unwrap_or(0),
+                sv.bandwidth,
+                sv.codecs,
+                sv.mime_type,
+                sv.reason,
+            );
+        }
+    }
 
     // Find the first audio AdaptationSet with mimeType="audio/mp4"
     // We look for <AdaptationSet ... contentType="audio" ...> blocks that contain audio/mp4
@@ -1252,65 +2413,188 @@ async fn resolve_dash_audio(url: &str) -> Result<ResolvedSource, String> {
         search_start = as_end;
     }
 
-    let audio_as = match audio_adaptation_set {
-        Some(a) => a,
-        None => {
-            eprintln!("  DASH MPD: no separate audio/mp4 AdaptationSet found");
-            return Ok(ResolvedSource { video_url: url.to_string(), audio_url: None });
+    // Also find text AdaptationSets (contentType="text" or mimeType containing ttml/wvtt/text)
+    let mut text_tracks_found: Vec<TextTrackInfo> = Vec::new();
+    let mut text_search_start = 0;
+    while let Some(as_start) = body[text_search_start..].find("<AdaptationSet") {
+        let abs_start = text_search_start + as_start;
+        let as_end = if let Some(end) = body[abs_start..].find("</AdaptationSet>") {
+            abs_start + end + "</AdaptationSet>".len()
+        } else {
+            text_search_start = abs_start + 1;
+            continue;
+        };
+        let as_block = &body[abs_start..as_end];
+
+        // Detect raw WebVTT (mimeType="text/vtt") — not wrapped in fMP4
+        let is_raw_vtt = as_block.contains("mimeType=\"text/vtt\"")
+            || as_block.contains("mimeType='text/vtt'");
+
+        let is_text = is_raw_vtt
+            || as_block.contains("contentType=\"text\"")
+            || as_block.contains("contentType='text'")
+            || as_block.contains("mimeType=\"application/ttml+xml\"")
+            || (as_block.contains("mimeType=\"application/mp4\"")
+                && (as_block.contains("codecs=\"stpp") || as_block.contains("codecs=\"wvtt")));
+
+        if is_text {
+            let lang = extract_xml_attr(as_block, "AdaptationSet", "lang");
+            let name = lang.clone().unwrap_or_else(|| "subtitles".to_string());
+
+            if is_raw_vtt {
+                // Raw WebVTT: extract the BaseURL content (the .vtt file URL) directly.
+                // No synthetic MPD needed — just store the URL for pass-through.
+                if let Some(bu_start) = as_block.find("<BaseURL>") {
+                    let value_start = bu_start + "<BaseURL>".len();
+                    if let Some(bu_end) = as_block[value_start..].find("</BaseURL>") {
+                        let vtt_url_raw = &as_block[value_start..value_start + bu_end];
+                        let vtt_url = if vtt_url_raw.starts_with("http://") || vtt_url_raw.starts_with("https://") {
+                            vtt_url_raw.to_string()
+                        } else {
+                            format!("{base}{vtt_url_raw}")
+                        };
+                        text_tracks_found.push(TextTrackInfo {
+                            url: vtt_url,
+                            name,
+                            language: lang,
+                            is_raw_vtt: true,
+                        });
+                    }
+                }
+            } else {
+                // fMP4-wrapped text: build a synthetic text-only MPD
+                let mut resolved_block = as_block.to_string();
+                let mut bu_search = 0;
+                while let Some(bu_start) = resolved_block[bu_search..].find("<BaseURL>") {
+                    let tag_start = bu_search + bu_start;
+                    let value_start = tag_start + "<BaseURL>".len();
+                    if let Some(bu_end) = resolved_block[value_start..].find("</BaseURL>") {
+                        let value_end = value_start + bu_end;
+                        let relative_url = resolved_block[value_start..value_end].to_string();
+                        if !relative_url.starts_with("http://") && !relative_url.starts_with("https://") {
+                            let absolute_url = format!("{base}{relative_url}");
+                            resolved_block = format!(
+                                "{}{}{}",
+                                &resolved_block[..value_start],
+                                absolute_url,
+                                &resolved_block[value_end..],
+                            );
+                        }
+                        bu_search = value_start + 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                let text_idx = text_tracks_found.len();
+                let synthetic_text_mpd = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="{mpd_profiles}" minBufferTime="{mpd_min_buffer}" type="{mpd_type}" mediaPresentationDuration="{mpd_duration}">
+  <BaseURL>{base}</BaseURL>
+  <Period id="0">
+    {resolved_block}
+  </Period>
+</MPD>"#
+                );
+
+                let tmp_dir = std::env::temp_dir().join("edgepack_text");
+                let _ = std::fs::create_dir_all(&tmp_dir);
+                let file_hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    format!("{url}_text_{text_idx}").hash(&mut hasher);
+                    hasher.finish()
+                };
+                let tmp_path = tmp_dir.join(format!("text_{text_idx}_{file_hash:016x}.mpd"));
+                if std::fs::write(&tmp_path, &synthetic_text_mpd).is_ok() {
+                    if let Ok(text_url) = start_local_file_server(
+                        tmp_path.to_str().unwrap_or("")
+                    ).await {
+                        text_tracks_found.push(TextTrackInfo { url: text_url, name, language: lang, is_raw_vtt: false });
+                    }
+                }
+            }
         }
-    };
+        text_search_start = as_end;
+    }
 
-    eprintln!("  Detected DASH MPD with separate audio AdaptationSet");
+    // Handle audio
+    let audio_url = if let Some(audio_as) = audio_adaptation_set {
+        eprintln!("  Detected DASH MPD with separate audio AdaptationSet");
 
-    // Build a synthetic audio-only DASH MPD.
-    // Include a <BaseURL> pointing to the original MPD's directory so that any
-    // relative SegmentTemplate paths also resolve correctly (not just SegmentBase
-    // which already has absolute BaseURL from the rewriting above).
-    let synthetic_mpd = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        // Build a synthetic audio-only DASH MPD
+        let synthetic_mpd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="{mpd_profiles}" minBufferTime="{mpd_min_buffer}" type="{mpd_type}" mediaPresentationDuration="{mpd_duration}">
   <BaseURL>{base}</BaseURL>
   <Period id="0">
     {audio_as}
   </Period>
 </MPD>"#
-    );
+        );
 
-    // Write to temp file and serve via local HTTP
-    let tmp_dir = std::env::temp_dir().join("edgepack_audio");
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("create temp dir: {e}"))?;
+        let tmp_dir = std::env::temp_dir().join("edgepack_audio");
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| format!("create temp dir: {e}"))?;
 
-    // Use a hash of the URL for the temp filename to avoid collisions
-    let file_hash = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        url.hash(&mut hasher);
-        hasher.finish()
+        let file_hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            url.hash(&mut hasher);
+            hasher.finish()
+        };
+        let tmp_path = tmp_dir.join(format!("audio_{file_hash:016x}.mpd"));
+        std::fs::write(&tmp_path, &synthetic_mpd)
+            .map_err(|e| format!("write synthetic audio MPD: {e}"))?;
+
+        let audio_url = start_local_file_server(tmp_path.to_str().ok_or("invalid temp path")?)
+            .await?;
+
+        eprintln!("  Audio DASH MPD served at: {}", audio_url);
+        Some(audio_url)
+    } else {
+        eprintln!("  DASH MPD: no separate audio/mp4 AdaptationSet found");
+        None
     };
-    let tmp_path = tmp_dir.join(format!("audio_{file_hash:016x}.mpd"));
-    std::fs::write(&tmp_path, &synthetic_mpd)
-        .map_err(|e| format!("write synthetic audio MPD: {e}"))?;
 
-    let audio_url = start_local_file_server(tmp_path.to_str().ok_or("invalid temp path")?)
-        .await?;
+    if !text_tracks_found.is_empty() {
+        eprintln!("  DASH MPD: {} text track(s) found", text_tracks_found.len());
+    }
 
-    eprintln!("  Audio DASH MPD served at: {}", audio_url);
-
-    Ok(ResolvedSource { video_url: url.to_string(), audio_url: Some(audio_url) })
+    Ok(ResolvedSource {
+        video_url: video_url_resolved,
+        audio_url,
+        text_tracks: text_tracks_found,
+        video_variants,
+        skipped_variants: skipped_variants_list,
+    })
 }
 
 /// Extract an XML attribute value from the first occurrence of a given element.
+/// Uses word-boundary matching to avoid substring collisions (e.g. `width` inside `bandwidth`).
+/// Extract the full content of an XML element (opening tag through closing tag) as a string.
+/// Returns the inner block e.g. for `<SegmentTimeline>...\n</SegmentTimeline>`
+/// returns `<SegmentTimeline>...\n</SegmentTimeline>`.
+fn extract_xml_block(xml: &str, element: &str) -> Option<String> {
+    let open_tag = format!("<{element}");
+    let close_tag = format!("</{element}>");
+    let start = xml.find(&open_tag)?;
+    let end = xml[start..].find(&close_tag)?;
+    Some(xml[start..start + end + close_tag.len()].to_string())
+}
+
 fn extract_xml_attr(xml: &str, element: &str, attr: &str) -> Option<String> {
     let tag_start = xml.find(&format!("<{element}"))?;
     let tag_content = &xml[tag_start..];
     let tag_end = tag_content.find('>')?;
     let tag = &tag_content[..=tag_end];
 
-    // Try both quote styles
+    // Try both quote styles, with leading space to ensure word boundary
+    // (prevents "width" matching inside "bandwidth")
     for quote in ['"', '\''] {
-        let pattern = format!("{attr}={quote}");
+        let pattern = format!(" {attr}={quote}");
         if let Some(attr_start) = tag.find(&pattern) {
             let value_start = attr_start + pattern.len();
             if let Some(value_end) = tag[value_start..].find(quote) {
@@ -1382,12 +2666,18 @@ fn merge_dash_audio(
         .map(|block| {
             let mut rewritten = block
                 .replace(audio_base_url, "")
-                .replace("init.mp4", "audio_init.mp4")
-                .replace("segment_$Number$", "audio_segment_$Number$")
-                .replace("segment_$Number%", "audio_segment_$Number%")
                 // Force contentType to audio (in case it was detected differently)
                 .replace("contentType=\"video\"", "contentType=\"audio\"")
                 .replace("mimeType=\"video/mp4\"", "mimeType=\"audio/mp4\"");
+            // Only add audio_ prefix if not already present (the audio pipeline
+            // may already write audio_init.mp4 / audio_segment_N filenames).
+            if !rewritten.contains("audio_init.mp4") {
+                rewritten = rewritten.replace("init.mp4", "audio_init.mp4");
+            }
+            if !rewritten.contains("audio_segment_") {
+                rewritten = rewritten.replace("segment_$Number$", "audio_segment_$Number$");
+                rewritten = rewritten.replace("segment_$Number%", "audio_segment_$Number%");
+            }
             // Fix segment extensions for formats where video ≠ audio extension (CMAF)
             if video_ext != audio_ext {
                 rewritten = rewritten.replace(video_ext, audio_ext);
@@ -1410,98 +2700,684 @@ fn merge_dash_audio(
     }
 }
 
-/// Build a combined manifest that includes both video and pre-processed audio.
+/// Build a multi-variant DASH MPD from a single-variant base MPD.
 ///
-/// For HLS: renders a master playlist referencing video.m3u8 and audio.m3u8.
-/// For DASH: merges the audio AdaptationSet into the video MPD.
-///
-/// Returns `None` if no matching audio output exists for this (format, scheme) pair.
-fn build_combined_manifest(
+/// Takes the first variant's MPD (with SegmentTimeline) and replaces its single
+/// Representation with multiple Representations, each with per-variant
+/// SegmentTemplate init/media paths (v{vid}_ prefix).
+fn build_dash_multi_variant_mpd(
+    base_mpd: &str,
+    video_variants: &[VideoVariantInfo],
+    container_format: edgepack::media::container::ContainerFormat,
+) -> String {
+    // Extract the SegmentTimeline from the base MPD
+    let timeline_block = extract_xml_block(base_mpd, "SegmentTimeline");
+    let timescale = extract_xml_attr(base_mpd, "SegmentTemplate", "timescale")
+        .unwrap_or_else(|| "1000".to_string());
+
+    if timeline_block.is_none() {
+        // Fallback: return base as-is if no SegmentTimeline
+        return base_mpd.to_string();
+    }
+    let timeline = timeline_block.unwrap();
+    let seg_ext = container_format.video_segment_extension();
+
+    // Build per-Representation blocks with variant-specific SegmentTemplate
+    let mut representations = String::new();
+    for variant in video_variants {
+        let file_vid = variant.original_index.unwrap_or(0);
+        let prefix = format!("v{file_vid}_");
+        // Only include video codec (strip audio codec if present)
+        let video_codec = variant.codecs.as_deref()
+            .map(|c| c.split(',').next().unwrap_or(c))
+            .unwrap_or("avc1.64001f");
+
+        representations.push_str(&format!(
+            "      <Representation id=\"v{file_vid}\" bandwidth=\"{}\"",
+            variant.bandwidth
+        ));
+        representations.push_str(&format!(" codecs=\"{video_codec}\""));
+        if let (Some(w), Some(h)) = (variant.width, variant.height) {
+            representations.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
+        }
+        if let Some(ref fr) = variant.frame_rate {
+            // Parse frame rate string to float for DASH
+            let fps_str = if let Some((n, d)) = fr.split_once('/') {
+                let n: f64 = n.parse().unwrap_or(30.0);
+                let d: f64 = d.parse().unwrap_or(1.0);
+                if d > 0.0 { format!("{:.3}", n / d) } else { "30".to_string() }
+            } else {
+                fr.clone()
+            };
+            representations.push_str(&format!(" frameRate=\"{fps_str}\""));
+        }
+        representations.push_str(">\n");
+        representations.push_str(&format!(
+            "        <SegmentTemplate timescale=\"{timescale}\" initialization=\"{prefix}init.mp4\" media=\"{prefix}segment_$Number${seg_ext}\" startNumber=\"0\">\n"
+        ));
+        representations.push_str(&format!("          {timeline}\n"));
+        representations.push_str("        </SegmentTemplate>\n");
+        representations.push_str("      </Representation>\n");
+    }
+
+    // Replace the existing AdaptationSet content with multi-variant Representations.
+    // Find the video AdaptationSet and replace its content.
+    let mut result = String::new();
+    let mut skip_until_close = false;
+    let mut found_close = false;
+
+    for line in base_mpd.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("<AdaptationSet") && trimmed.contains("contentType=\"video\"") {
+            result.push_str(line);
+            result.push('\n');
+            // Inject all Representations
+            result.push_str(&representations);
+            skip_until_close = true;
+            continue;
+        }
+        if skip_until_close {
+            if trimmed.contains("</AdaptationSet") {
+                result.push_str(line);
+                result.push('\n');
+                skip_until_close = false;
+                found_close = true;
+            }
+            // Skip original Representation/SegmentTemplate content
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    if !found_close {
+        // Fallback: return base if we couldn't find the AdaptationSet structure
+        return base_mpd.to_string();
+    }
+
+    result
+}
+
+/// Merge a text track into a DASH MPD as a subtitle AdaptationSet.
+fn merge_dash_text_track(
+    mpd: &str,
+    text_track: &TextManifestInfo,
+    _container_format: edgepack::media::container::ContainerFormat,
+) -> String {
+    let lang_attr = text_track.language.as_ref()
+        .map(|l| format!(" lang=\"{l}\""))
+        .unwrap_or_default();
+
+    // Build a simple text AdaptationSet referencing the VTT file
+    let text_as = format!(
+        "    <AdaptationSet contentType=\"text\" mimeType=\"text/vtt\" segmentAlignment=\"true\"{lang_attr}>\n\
+         \x20     <Representation id=\"text_{}\" bandwidth=\"1000\">\n\
+         \x20       <BaseURL>text_{}.vtt</BaseURL>\n\
+         \x20     </Representation>\n\
+         \x20   </AdaptationSet>\n",
+        text_track.index, text_track.index,
+    );
+
+    // Inject before </Period>
+    if let Some(pos) = mpd.find("</Period>") {
+        let mut merged = String::with_capacity(mpd.len() + text_as.len());
+        merged.push_str(&mpd[..pos]);
+        merged.push_str(&text_as);
+        merged.push_str(&mpd[pos..]);
+        merged
+    } else {
+        mpd.to_string()
+    }
+}
+
+/// Information about a text track for combined manifest building.
+struct TextManifestInfo {
+    index: usize,
+    name: String,
+    language: Option<String>,
+}
+
+/// Rewrite an audio manifest from the audio pipeline to use audio-specific
+/// segment names and relative paths.
+fn rewrite_audio_manifest(
+    manifest: &str,
+    content_id: &str,
     format: OutputFormat,
     scheme: &EncryptionScheme,
-    video_manifest: &str,
-    audio: &PreprocessedAudio,
     container_format: edgepack::media::container::ContainerFormat,
-) -> Option<String> {
-    // Find matching audio output for this (format, scheme) pair
-    let audio_output = audio.outputs.iter()
-        .find(|(f, s, _)| *f == format && s == scheme)?;
-    let (_, _, ref audio_prog) = audio_output;
+) -> String {
+    let scheme_str = scheme.scheme_type_str();
+    let fmt_label = match format {
+        OutputFormat::Hls => "hls",
+        OutputFormat::Dash => "dash",
+    };
+    let video_ext = container_format.video_segment_extension();
+    let audio_ext = container_format.audio_segment_extension();
 
+    // Strip the audio pipeline's base URL so paths become relative
+    let base_url = format!("/repackage/{content_id}_audio/{fmt_label}_{scheme_str}/");
+    let mut rewritten = manifest
+        .replace(&base_url, "")
+        .replace("init.mp4", "audio_init.mp4")
+        .replace("segment_", "audio_segment_");
+    // Fix segment extensions for formats where video ≠ audio (CMAF)
+    if video_ext != audio_ext {
+        rewritten = rewritten.replace(video_ext, audio_ext);
+    }
+    rewritten
+}
+
+/// Build VariantInfo entries for all video variants with DASH per-Representation segment path prefixes.
+///
+/// Each variant gets `segment_path_prefix: Some("v{vid}_")` so the DASH renderer generates
+/// per-Representation `<SegmentTemplate>` elements with variant-specific init/media segment paths
+/// (e.g., `initialization="v0_init.mp4"`, `media="v0_segment_$Number$.cmfv"`).
+fn build_dash_variant_infos(
+    video_variants: &[VideoVariantInfo],
+) -> Vec<edgepack::manifest::types::VariantInfo> {
+    use edgepack::manifest::types::{TrackMediaType, VariantInfo};
+    video_variants
+        .iter()
+        .enumerate()
+        .map(|(vid, variant)| {
+            // Use original_index for file paths to match the v{N}_ prefix on disk
+            let file_vid = variant.original_index.unwrap_or(vid);
+            let resolution = match (variant.width, variant.height) {
+                (Some(w), Some(h)) => Some((w, h)),
+                _ => None,
+            };
+            let frame_rate = variant.frame_rate.as_ref().and_then(|fr| {
+                if let Some((n, d)) = fr.split_once('/') {
+                    let n: f64 = n.parse().ok()?;
+                    let d: f64 = d.parse().ok()?;
+                    if d > 0.0 { Some(n / d) } else { None }
+                } else {
+                    fr.parse::<f64>().ok()
+                }
+            });
+            VariantInfo {
+                id: format!("v{file_vid}"),
+                bandwidth: variant.bandwidth,
+                // Strip audio codec from video-only Representation
+                // (HLS CODECS combines video+audio, but DASH has separate AdaptationSets)
+                codecs: variant.codecs.as_deref()
+                    .map(|c| c.split(',').next().unwrap_or(c).to_string())
+                    .unwrap_or_else(|| "avc1.64001f".to_string()),
+                resolution,
+                frame_rate,
+                track_type: TrackMediaType::Video,
+                language: None,
+                segment_path_prefix: Some(format!("v{file_vid}_")),
+            }
+        })
+        .collect()
+}
+
+/// Download and concatenate all WebVTT segments from an HLS subtitle media playlist.
+///
+/// Fetches the .m3u8 media playlist, parses segment URIs, downloads each .vtt segment,
+/// and concatenates them into a single WebVTT file. Handles WEBVTT headers in subsequent
+/// segments (strips them to avoid duplicates).
+fn download_hls_vtt_segments(playlist_url: &str) -> Result<Vec<u8>, String> {
+    let client = shared_reqwest_client();
+
+    // Fetch the playlist
+    let playlist_resp = client.get(playlist_url)
+        .send()
+        .map_err(|e| format!("fetch subtitle playlist failed: {e}"))?;
+    if !playlist_resp.status().is_success() {
+        return Err(format!("subtitle playlist HTTP {}", playlist_resp.status()));
+    }
+    let playlist_body = playlist_resp.text()
+        .map_err(|e| format!("read subtitle playlist failed: {e}"))?;
+
+    // Compute base URL for resolving relative segment URIs
+    let base_url = if let Some(last_slash) = playlist_url.rfind('/') {
+        &playlist_url[..=last_slash]
+    } else {
+        playlist_url
+    };
+
+    // Parse segment URIs from the playlist
+    let segment_urls: Vec<String> = playlist_body.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                trimmed.to_string()
+            } else {
+                format!("{base_url}{trimmed}")
+            }
+        })
+        .collect();
+
+    if segment_urls.is_empty() {
+        return Err("no segments found in subtitle playlist".to_string());
+    }
+
+    eprintln!("  Downloading {} VTT subtitle segments...", segment_urls.len());
+
+    // Download and concatenate all segments
+    let mut combined = Vec::new();
+    let mut is_first = true;
+
+    for seg_url in &segment_urls {
+        match client.get(seg_url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.text() {
+                    Ok(text) => {
+                        if is_first {
+                            combined.extend_from_slice(text.as_bytes());
+                            is_first = false;
+                        } else {
+                            // Strip the WEBVTT header from subsequent segments
+                            // to avoid duplicate headers in the concatenated output.
+                            let content = text.trim_start();
+                            let stripped = if content.starts_with("WEBVTT") {
+                                // Skip past the header line (and optional blank line after)
+                                let after_header = content.find('\n')
+                                    .map(|i| &content[i + 1..])
+                                    .unwrap_or("");
+                                let after_blank = after_header.strip_prefix('\n')
+                                    .or_else(|| after_header.strip_prefix("\r\n"))
+                                    .unwrap_or(after_header);
+                                after_blank
+                            } else {
+                                content
+                            };
+                            if !stripped.is_empty() {
+                                combined.push(b'\n');
+                                combined.extend_from_slice(stripped.as_bytes());
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("  Warning: failed to read VTT segment {seg_url}: {e}"),
+                }
+            }
+            Ok(resp) => eprintln!("  Warning: VTT segment HTTP {} for {seg_url}", resp.status()),
+            Err(e) => eprintln!("  Warning: failed to fetch VTT segment {seg_url}: {e}"),
+        }
+    }
+
+    if combined.is_empty() {
+        return Err("all VTT segments failed to download".to_string());
+    }
+
+    Ok(combined)
+}
+
+/// Rewrite a video variant manifest from a per-variant pipeline to use variant-specific
+/// segment names and relative paths (v{vid}_ prefix).
+fn rewrite_variant_manifest(
+    manifest: &str,
+    content_id: &str,
+    vid: usize,
+    format: OutputFormat,
+    scheme: &EncryptionScheme,
+    container_format: edgepack::media::container::ContainerFormat,
+) -> String {
+    let scheme_str = scheme.scheme_type_str();
+    let fmt_label = match format {
+        OutputFormat::Hls => "hls",
+        OutputFormat::Dash => "dash",
+    };
+    let _video_ext = container_format.video_segment_extension();
+    let prefix = format!("v{vid}");
+
+    // Strip the variant pipeline's base URL so paths become relative
+    let base_url = format!("/repackage/{content_id}_v{vid}/{fmt_label}_{scheme_str}/");
+    let rewritten = manifest
+        .replace(&base_url, "")
+        .replace("init.mp4", &format!("{prefix}_init.mp4"))
+        .replace("segment_", &format!("{prefix}_segment_"));
+    rewritten
+}
+
+/// Rewrite a text track manifest from the text pipeline to use track-specific
+/// segment names and relative paths.
+fn rewrite_text_manifest(
+    manifest: &str,
+    content_id: &str,
+    text_idx: usize,
+    format: OutputFormat,
+    scheme: &EncryptionScheme,
+    container_format: edgepack::media::container::ContainerFormat,
+) -> String {
+    let scheme_str = scheme.scheme_type_str();
+    let fmt_label = match format {
+        OutputFormat::Hls => "hls",
+        OutputFormat::Dash => "dash",
+    };
+    let video_ext = container_format.video_segment_extension();
+    let text_ext = container_format.video_segment_extension(); // text in fMP4 uses same ext
+
+    let base_url = format!("/repackage/{content_id}_text_{text_idx}/{fmt_label}_{scheme_str}/");
+    let prefix = format!("text_{text_idx}");
+    let mut rewritten = manifest
+        .replace(&base_url, "")
+        .replace("init.mp4", &format!("{prefix}_init.mp4"))
+        .replace("segment_", &format!("{prefix}_segment_"));
+    if video_ext != text_ext {
+        rewritten = rewritten.replace(video_ext, text_ext);
+    }
+    rewritten
+}
+
+/// Build a combined manifest that includes video + audio + text tracks.
+///
+/// For HLS: renders a master playlist referencing video.m3u8, audio.m3u8, and text_N.m3u8.
+///   Multi-variant: one `#EXT-X-STREAM-INF` per variant with real metadata (v{vid}_video.m3u8).
+///   Single-variant: single `#EXT-X-STREAM-INF` with metadata from source (video.m3u8).
+/// For DASH: merges audio and text AdaptationSets into the video MPD.
+fn build_progressive_combined_manifest(
+    format: OutputFormat,
+    video_manifest: &str,
+    raw_audio_manifest: &str,
+    content_id: &str,
+    scheme: &EncryptionScheme,
+    container_format: edgepack::media::container::ContainerFormat,
+    text_tracks: &[TextManifestInfo],
+    video_variants: &[VideoVariantInfo],
+    is_complete: bool,
+) -> String {
     match format {
         OutputFormat::Hls => {
-            // Build HLS master playlist referencing video.m3u8 and audio.m3u8
-            let video_manifest_state = {
-                // Parse video manifest state from the rendered manifest is not possible directly.
-                // Instead, we construct a minimal ManifestState with the video codec info
-                // extracted from the video manifest text. But render_master() needs a ManifestState.
-                // We need to get the video's ManifestState — but we only have the rendered text.
-                //
-                // Approach: use the audio output's ManifestState to get audio variants, and
-                // build a synthetic master state with video codecs extracted from the manifest.
-                //
-                // Actually, the simplest approach: build the master playlist manually since
-                // we have both the video and audio media playlists already written to disk.
-                let audio_state = audio_prog.manifest_state();
-                let audio_codecs: Vec<String> = audio_state.variants.iter()
-                    .filter(|v| v.track_type == edgepack::manifest::types::TrackMediaType::Audio)
-                    .map(|v| v.codecs.clone())
-                    .collect();
-                let audio_codec = audio_codecs.first()
-                    .cloned()
-                    .unwrap_or_else(|| "mp4a.40.2".to_string());
+            let audio_codec = "mp4a.40.2".to_string();
+            let has_audio = !raw_audio_manifest.is_empty();
 
-                // Extract video codec from the media playlist (look for existing codec info)
-                // We don't have the pipeline's ManifestState here, so extract from
-                // the rendered manifest or use a reasonable default.
-                let video_codec = extract_codec_from_hls_manifest(video_manifest)
-                    .unwrap_or_else(|| "avc1.64001f".to_string());
+            let mut master = String::new();
+            master.push_str("#EXTM3U\n");
+            master.push_str("#EXT-X-VERSION:7\n");
+            master.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+            // For progressive (not yet complete) content, tell the player to start
+            // from the beginning rather than seeking to the live edge.
+            // Per RFC 8216 §4.4.2.1.3, #EXT-X-START in the master playlist
+            // indicates the preferred start point. VOD playlists already start
+            // from the beginning so this is only needed during progressive processing.
+            if !is_complete {
+                master.push_str("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n");
+            }
 
-                let mut master = String::new();
-                master.push_str("#EXTM3U\n");
-                master.push_str("#EXT-X-VERSION:7\n");
-                master.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
-                // Audio rendition group
-                master.push_str(&format!(
+            // Audio rendition group
+            if has_audio {
+                master.push_str(
                     "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"audio\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n"
-                ));
-                // Video stream with audio group reference
+                );
+            }
+
+            // Text rendition groups
+            for tt in text_tracks {
+                let lang_attr = tt.language.as_ref()
+                    .map(|l| format!(",LANGUAGE=\"{l}\""))
+                    .unwrap_or_default();
                 master.push_str(&format!(
-                    "#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"{video_codec},{audio_codec}\",AUDIO=\"audio\"\n"
+                    "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\",DEFAULT=NO,AUTOSELECT=YES{lang_attr},URI=\"text_{}.m3u8\"\n",
+                    tt.name, tt.index,
                 ));
+            }
+
+            if video_variants.len() > 1 {
+                // Multi-variant: emit one #EXT-X-STREAM-INF per variant with real metadata
+                for (vid, variant) in video_variants.iter().enumerate() {
+                    // Use original_index for filenames if set (preserves v{N}_ names after filtering)
+                    let file_vid = variant.original_index.unwrap_or(vid);
+                    // Strip audio codecs from variant codecs — source HLS may include
+                    // combined video+audio (e.g. "avc1.4d401f,mp4a.40.2"). We add the
+                    // audio codec explicitly below when has_audio is true.
+                    let video_codec = strip_audio_codecs(
+                        variant.codecs.as_deref().unwrap_or("avc1.64001f")
+                    );
+                    let mut stream_inf = format!("#EXT-X-STREAM-INF:BANDWIDTH={}", variant.bandwidth);
+
+                    // RESOLUTION
+                    if let (Some(w), Some(h)) = (variant.width, variant.height) {
+                        stream_inf.push_str(&format!(",RESOLUTION={w}x{h}"));
+                    }
+
+                    // FRAME-RATE
+                    if let Some(ref fr) = variant.frame_rate {
+                        stream_inf.push_str(&format!(",FRAME-RATE={fr}"));
+                    }
+
+                    // CODECS
+                    stream_inf.push_str(&format!(",CODECS=\"{video_codec}"));
+                    if has_audio {
+                        stream_inf.push_str(&format!(",{audio_codec}"));
+                    }
+                    stream_inf.push('"');
+
+                    // Group references
+                    if has_audio {
+                        stream_inf.push_str(",AUDIO=\"audio\"");
+                    }
+                    if !text_tracks.is_empty() {
+                        stream_inf.push_str(",SUBTITLES=\"subs\"");
+                    }
+
+                    master.push_str(&stream_inf);
+                    master.push('\n');
+                    master.push_str(&format!("v{file_vid}_video.m3u8\n"));
+                }
+            } else {
+                // Single variant: use metadata from source if available
+                let (bandwidth, video_codec, resolution, frame_rate) = if let Some(v) = video_variants.first() {
+                    (
+                        v.bandwidth,
+                        // Strip audio codecs — source may include combined video+audio
+                        strip_audio_codecs(v.codecs.as_deref().unwrap_or("avc1.64001f")),
+                        if let (Some(w), Some(h)) = (v.width, v.height) {
+                            Some(format!("{w}x{h}"))
+                        } else {
+                            None
+                        },
+                        v.frame_rate.clone(),
+                    )
+                } else {
+                    (2_000_000, "avc1.64001f".to_string(), None, None)
+                };
+
+                let mut stream_inf = format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}");
+
+                if let Some(ref res) = resolution {
+                    stream_inf.push_str(&format!(",RESOLUTION={res}"));
+                }
+                if let Some(ref fr) = frame_rate {
+                    stream_inf.push_str(&format!(",FRAME-RATE={fr}"));
+                }
+
+                stream_inf.push_str(&format!(",CODECS=\"{video_codec}"));
+                if has_audio {
+                    stream_inf.push_str(&format!(",{audio_codec}"));
+                }
+                stream_inf.push('"');
+                if has_audio {
+                    stream_inf.push_str(",AUDIO=\"audio\"");
+                }
+                if !text_tracks.is_empty() {
+                    stream_inf.push_str(",SUBTITLES=\"subs\"");
+                }
+                master.push_str(&stream_inf);
+                master.push('\n');
                 master.push_str("video.m3u8\n");
-                master
-            };
-            Some(video_manifest_state)
+            }
+            master
         }
         OutputFormat::Dash => {
+            let mut merged = if video_variants.len() > 1 && !video_manifest.is_empty() {
+                // Multi-variant DASH: replace the single Representation in the base MPD
+                // with multiple per-variant Representations, each with its own
+                // SegmentTemplate using variant-specific path prefixes.
+                build_dash_multi_variant_mpd(video_manifest, video_variants, container_format)
+            } else {
+                video_manifest.to_string()
+            };
+
             // Merge audio AdaptationSet into the video MPD
-            let audio_mpd = manifest::render_manifest(audio_prog.manifest_state()).ok()?;
-            let audio_base = &audio_prog.manifest_state().base_url;
-            let merged = merge_dash_audio(video_manifest, &audio_mpd, audio_base, container_format);
-            Some(merged)
+            if !raw_audio_manifest.is_empty() {
+                let audio_base = format!("/repackage/{content_id}_audio/dash_{}/",
+                    scheme.scheme_type_str());
+                merged = merge_dash_audio(&merged, raw_audio_manifest, &audio_base, container_format);
+            }
+
+            // Merge text track AdaptationSets into the MPD
+            for tt in text_tracks {
+                merged = merge_dash_text_track(&merged, tt, container_format);
+            }
+
+            merged
         }
     }
 }
 
-/// Wrapper type for pre-processed audio output.
-/// Moved here for use by both the pipeline closure and build_combined_manifest.
-struct PreprocessedAudio {
-    outputs: Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>,
+/// Strip audio codec strings from a combined codec string.
+/// Source HLS master playlists often include combined video+audio codecs
+/// (e.g. "avc1.4d401f,mp4a.40.2"). This strips audio codecs so the caller
+/// can add the audio codec explicitly and avoid duplicates.
+fn strip_audio_codecs(codecs: &str) -> String {
+    codecs
+        .split(',')
+        .filter(|c| {
+            let c = c.trim();
+            !c.starts_with("mp4a.")
+                && !c.starts_with("ac-3")
+                && !c.starts_with("ec-3")
+                && !c.starts_with("opus")
+                && !c.starts_with("flac")
+                && !c.starts_with("dtsc")
+                && !c.starts_with("dtse")
+                && !c.starts_with("dtsx")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
-/// Extract codec string from HLS media playlist comments or init segment reference.
-/// Falls back to None if not found.
-fn extract_codec_from_hls_manifest(_manifest: &str) -> Option<String> {
-    // HLS media playlists don't contain codec strings directly.
-    // The codec is in the init segment's stsd box, which we don't have access to here.
-    // Return None to use default.
-    None
+/// Extract an attribute value from an HLS #EXT-X-MEDIA tag.
+#[allow(dead_code)]
+fn extract_hls_media_attr(tag: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=\"");
+    let start = tag.find(&pattern)?;
+    let value_start = start + pattern.len();
+    let value_end = tag[value_start..].find('"')?;
+    Some(tag[value_start..value_start + value_end].to_string())
 }
 
 /// Fix DASH MPD for sandbox playback.
 ///
 /// During progressive output, the pipeline renders `type="dynamic"` (live) manifests.
+/// For sandbox progressive playback, keep `type="dynamic"` so DASH.js refreshes the
+/// MPD and picks up new segments. Adds attributes to make the player start from the
+/// beginning of content rather than seeking to the live edge:
+///
+/// - `suggestedPresentationDelay` set to total content duration (pushes start to beginning)
+/// - `publishTime` with current UTC timestamp (required for dynamic MPDs)
+/// - `minimumUpdatePeriod="PT2S"` (give sandbox time between disk writes)
+/// - Removes `mediaPresentationDuration` (invalid for in-progress dynamic MPDs)
+fn fixup_dash_progressive(mpd: &str) -> String {
+    let mut fixed = mpd.to_string();
+
+    // Ensure type="dynamic" is present (core library sets this during Live phase)
+    if !fixed.contains("type=\"dynamic\"") {
+        // If it's already static (shouldn't happen during progressive), convert to dynamic
+        fixed = fixed.replace("type=\"static\"", "type=\"dynamic\"");
+    }
+
+    // Replace minimumUpdatePeriod with a longer interval for disk-based serving
+    fixed = fixed.replace("minimumUpdatePeriod=\"PT1S\"", "minimumUpdatePeriod=\"PT2S\"");
+
+    // Compute total duration and set suggestedPresentationDelay to push playback to beginning
+    let total_duration = compute_dash_duration_from_timeline(&fixed);
+    if total_duration > 0.0 {
+        // Add a small buffer to ensure we're fully at the beginning
+        let delay_str = format_seconds_as_iso8601(total_duration + 10.0);
+
+        // Remove existing suggestedPresentationDelay if present
+        if let Some(start) = fixed.find(" suggestedPresentationDelay=\"") {
+            let attr_start = start;
+            let after_first_quote = attr_start + " suggestedPresentationDelay=\"".len();
+            if let Some(close_quote) = fixed[after_first_quote..].find('"') {
+                fixed = format!("{}{}", &fixed[..attr_start], &fixed[after_first_quote + close_quote + 1..]);
+            }
+        }
+
+        // Insert suggestedPresentationDelay after minimumUpdatePeriod
+        if let Some(pos) = fixed.find("minimumUpdatePeriod=\"PT2S\"") {
+            let insert_at = pos + "minimumUpdatePeriod=\"PT2S\"".len();
+            fixed.insert_str(insert_at, &format!(" suggestedPresentationDelay=\"{delay_str}\""));
+        }
+    }
+
+    // Add publishTime (required for dynamic MPDs) — current UTC timestamp
+    if !fixed.contains("publishTime=\"") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        // Simple UTC timestamp: compute year/month/day/hour/min/sec from epoch
+        let (year, month, day, hour, min, sec) = epoch_to_utc(secs);
+        let publish_time = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z");
+        // Insert after type="dynamic"
+        if let Some(pos) = fixed.find("type=\"dynamic\"") {
+            let insert_at = pos + "type=\"dynamic\"".len();
+            fixed.insert_str(insert_at, &format!(" publishTime=\"{publish_time}\""));
+        }
+    }
+
+    // Remove mediaPresentationDuration if present (invalid for in-progress dynamic MPDs)
+    if let Some(start) = fixed.find(" mediaPresentationDuration=\"") {
+        let after_first_quote = start + " mediaPresentationDuration=\"".len();
+        if let Some(close_quote) = fixed[after_first_quote..].find('"') {
+            fixed = format!("{}{}", &fixed[..start], &fixed[after_first_quote + close_quote + 1..]);
+        }
+    }
+
+    fixed
+}
+
+/// Convert epoch seconds to UTC (year, month, day, hour, minute, second).
+fn epoch_to_utc(epoch_secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let secs_per_day = 86400u64;
+    let mut days = epoch_secs / secs_per_day;
+    let day_secs = epoch_secs % secs_per_day;
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+
+    // Days since 1970-01-01
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days: [u64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1u64;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+
+    (year, month, days + 1, hour, min, sec)
+}
+
+fn is_leap_year(y: u64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
 /// For sandbox playback where all segments are immediately available on disk, convert
 /// to `type="static"` (VOD) so DASH.js doesn't try to calculate segment availability
 /// windows based on wall clock time.
@@ -1852,100 +3728,6 @@ fn validate_output(
     })
 }
 
-fn write_output_to_disk(
-    content_id: &str,
-    format: OutputFormat,
-    scheme: &str,
-    output: &ProgressiveOutput,
-    is_audio: bool,
-) -> Result<(), String> {
-    let fmt_str = match format {
-        OutputFormat::Hls => "hls",
-        OutputFormat::Dash => "dash",
-    };
-
-    let out_dir = PathBuf::from(format!("sandbox/output/{content_id}/{fmt_str}_{scheme}"));
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("create output dir: {e}"))?;
-
-    let state = output.manifest_state();
-    let track_label = if is_audio { "audio" } else { "video" };
-
-    // Write manifest
-    if let Ok(rendered) = manifest::render_manifest(state) {
-        let ext = format.manifest_extension();
-        if is_audio {
-            // For audio output, write a separate audio manifest with corrected segment names.
-            // 1. Strip the absolute base_url (from audio pipeline's content_id) so URIs are relative.
-            //    The audio manifest is served from the same directory as audio segments.
-            // 2. Prefix segments with audio_ and fix extensions.
-            let base_url = &state.base_url;
-            let video_ext = state.container_format.video_segment_extension();
-            let audio_ext = state.container_format.audio_segment_extension();
-            let audio_rendered = rendered
-                .replace(base_url, "")
-                .replace("init.mp4", "audio_init.mp4")
-                .replace("segment_", "audio_segment_")
-                .replace(video_ext, audio_ext);
-            // Write as "audio.{ext}" to match HLS master playlist URI reference.
-            // Also write "audio_manifest.{ext}" for backward compat with output links.
-            let manifest_path = out_dir.join(format!("audio.{ext}"));
-            std::fs::write(&manifest_path, &audio_rendered)
-                .map_err(|e| format!("write audio manifest: {e}"))?;
-            let compat_path = out_dir.join(format!("audio_manifest.{ext}"));
-            let _ = std::fs::write(&compat_path, &audio_rendered);
-            eprintln!("  Wrote {}", manifest_path.display());
-        } else {
-            let manifest_path = out_dir.join(format!("manifest.{ext}"));
-            std::fs::write(&manifest_path, rendered)
-                .map_err(|e| format!("write manifest: {e}"))?;
-            eprintln!("  Wrote {}", manifest_path.display());
-        }
-    }
-
-    // Write init segment
-    if let Some(data) = output.init_segment_data() {
-        let init_name = if is_audio { "audio_init.mp4" } else { "init.mp4" };
-        let init_path = out_dir.join(init_name);
-        std::fs::write(&init_path, data).map_err(|e| format!("write {track_label} init segment: {e}"))?;
-        eprintln!("  Wrote {} ({} bytes)", init_path.display(), data.len());
-    }
-
-    // Write media segments with track-appropriate extensions and prefixes.
-    // Audio segments use "audio_segment_" prefix to avoid overwriting video segments
-    // when both tracks share the same extension (fMP4 .m4s, ISO .mp4, TS .ts).
-    let seg_ext = if is_audio {
-        state.container_format.audio_segment_extension()
-    } else {
-        state.container_format.video_segment_extension()
-    };
-    let seg_prefix = if is_audio { "audio_segment_" } else { "segment_" };
-    let mut seg_num = 0u32;
-    for seg in &state.segments {
-        if let Some(data) = output.segment_data(seg.number) {
-            let seg_path = out_dir.join(format!("{seg_prefix}{}{seg_ext}", seg.number));
-            std::fs::write(&seg_path, data)
-                .map_err(|e| format!("write {track_label} segment {}: {e}", seg.number))?;
-            seg_num += 1;
-        }
-    }
-    if seg_num > 0 {
-        eprintln!("  Wrote {seg_num} {track_label} segments to {}", out_dir.display());
-    }
-
-    // Write I-frame playlist (HLS only, video track only)
-    if !is_audio {
-        if let Ok(Some(iframe_playlist)) = manifest::render_iframe_manifest(state) {
-            let iframe_path = out_dir.join("iframes.m3u8");
-            std::fs::write(&iframe_path, iframe_playlist)
-                .map_err(|e| format!("write I-frame playlist: {e}"))?;
-            eprintln!("  Wrote {}", iframe_path.display());
-        }
-    }
-
-    Ok(())
-}
-
 // ─── Main ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -2252,7 +4034,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>edgepack sandbox</h1>
-  <p class="subtitle">Local repackaging tool &mdash; configurable encryption &amp; container format</p>
+  <p class="subtitle">Local repackaging tool &mdash; video, audio, subtitles &amp; metadata across all encryption schemes &amp; container formats</p>
 
   <div class="card">
     <label for="source-preset">Test Stream Presets</label>
@@ -2406,6 +4188,7 @@ const SANDBOX_HTML: &str = r#"<!DOCTYPE html>
     <div class="progress-bar">
       <div id="progress-fill" class="progress-fill"></div>
     </div>
+    <div id="skipped-variants" class="hidden" style="margin-top:0.75rem;"></div>
     <div id="error-section" class="hidden" style="margin-top:0.75rem;padding:0.75rem;background:rgba(239,68,68,0.1);border:1px solid var(--error);border-radius:0.5rem;">
       <div style="font-size:0.8rem;color:var(--error);font-weight:600;margin-bottom:0.25rem;">Pipeline Error</div>
       <pre id="error-detail" style="font-size:0.75rem;color:var(--text-muted);white-space:pre-wrap;word-break:break-all;margin:0;"></pre>
@@ -2587,7 +4370,7 @@ async function initPlayer(contentId, format, scheme, containerFormat) {
       dashPlayer.initialize(video, manifestUrl, true);
       dashPlayer.updateSettings({
         streaming: {
-          delay: { liveDelay: 2 },
+          delay: { liveDelay: 0, useSuggestedPresentationDelay: true },
           retryAttempts: { MPD: 60, MediaSegment: 10 },
           retryIntervals: { MPD: 500, MediaSegment: 500 },
         }
@@ -2722,14 +4505,31 @@ async function pollStatus(contentId, format, containerFormat, targetSchemes) {
     stateEl.className = 'state';
 
     if (data.state === 'Processing') {
-      fill.style.width = '30%';
-      segEl.textContent = ' \u2014 fetching and repackaging...';
+      if (data.segments_total) {
+        const pct = Math.round((data.segments_completed / data.segments_total) * 100);
+        segEl.textContent = ` \u2014 ${data.segments_completed}/${data.segments_total} segments`;
+        fill.style.width = pct + '%';
+      } else if (data.segments_completed > 0) {
+        segEl.textContent = ` \u2014 ${data.segments_completed} segments processed`;
+        // Animate progress bar without total (pulse between 30-70%)
+        const pulse = 30 + Math.min(40, data.segments_completed / 50);
+        fill.style.width = pulse + '%';
+      } else {
+        fill.style.width = '15%';
+        segEl.textContent = ' \u2014 fetching and repackaging...';
+      }
     }
 
-    if (data.segments_total) {
-      const pct = Math.round((data.segments_completed / data.segments_total) * 100);
-      segEl.textContent = ` \u2014 ${data.segments_completed}/${data.segments_total} segments`;
-      fill.style.width = pct + '%';
+    // Show skipped variants if any
+    const skippedEl = document.getElementById('skipped-variants');
+    if (skippedEl && data.skipped_variants && data.skipped_variants.length > 0) {
+      let html = `<div class="check-warnings">\u26a0 ${data.skipped_variants.length} variant(s) skipped:</div>`;
+      for (const sv of data.skipped_variants) {
+        const res = (sv.width && sv.height) ? `${sv.width}x${sv.height}` : '?';
+        html += `<div class="check-warnings" style="margin-left:1rem;font-size:0.65rem;">${res} @ ${Math.round(sv.bandwidth/1000)}k (${sv.codecs || '?'}, ${sv.mime_type || '?'})</div>`;
+      }
+      skippedEl.innerHTML = html;
+      skippedEl.classList.remove('hidden');
     }
 
     // Start player as soon as playback is ready (init + first segment on disk)

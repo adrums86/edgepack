@@ -217,6 +217,107 @@ fn build_sample_entry(box_type: &[u8; 4], child: &[u8]) -> Vec<u8> {
     entry
 }
 
+/// Build a tkhd v0 full box with width/height dimensions (fixed-point 16.16).
+///
+/// tkhd v0 layout: version(1) + flags(3) + creation_time(4) + modification_time(4)
+/// + track_id(4) + reserved(4) + duration(4) + reserved(8) + layer(2) + alternate_group(2)
+/// + volume(2) + reserved(2) + matrix(36) + width(4) + height(4) = 84 bytes payload
+/// Total box: 8 (header) + 4 (version+flags) + 80 (body) = 92 bytes
+pub fn build_tkhd_v0(track_id: u32, width: u32, height: u32) -> Vec<u8> {
+    let total_size: u32 = 92;
+    let mut tkhd = Vec::with_capacity(total_size as usize);
+    cmaf::write_box_header(&mut tkhd, total_size, b"tkhd");
+    tkhd.push(0); // version = 0
+    tkhd.extend_from_slice(&[0, 0, 1]); // flags = track_enabled
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // creation_time
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+    tkhd.extend_from_slice(&track_id.to_be_bytes()); // track_id
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    tkhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+    tkhd.extend_from_slice(&[0u8; 8]); // reserved
+    tkhd.extend_from_slice(&0u16.to_be_bytes()); // layer
+    tkhd.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
+    tkhd.extend_from_slice(&0u16.to_be_bytes()); // volume
+    tkhd.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    tkhd.extend_from_slice(&[0u8; 36]); // matrix (identity)
+    // width and height as fixed-point 16.16
+    tkhd.extend_from_slice(&(width << 16).to_be_bytes());
+    tkhd.extend_from_slice(&(height << 16).to_be_bytes());
+    tkhd
+}
+
+/// Build a clear init segment with tkhd dimensions for multi-variant tests.
+pub fn build_clear_init_segment_with_dimensions(width: u32, height: u32) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    // ftyp box
+    let ftyp_payload = b"isom\x00\x00\x02\x00isomiso6cmfc";
+    let ftyp_size = 8 + ftyp_payload.len() as u32;
+    cmaf::write_box_header(&mut data, ftyp_size, b"ftyp");
+    data.extend_from_slice(ftyp_payload);
+
+    // Build moov children
+    let mut moov_children = Vec::new();
+
+    // mvhd (minimal)
+    let mut mvhd = Vec::new();
+    cmaf::write_full_box_header(&mut mvhd, 120, b"mvhd", 1, 0);
+    mvhd.resize(120, 0);
+    moov_children.extend_from_slice(&mvhd);
+
+    // trak with tkhd → mdia → minf → stbl → stsd → avc1
+    let tkhd = build_tkhd_v0(1, width, height);
+
+    // Build hdlr box for video handler
+    let mut hdlr = Vec::new();
+    let hdlr_size: u32 = 33;
+    cmaf::write_box_header(&mut hdlr, hdlr_size, b"hdlr");
+    hdlr.extend_from_slice(&[0u8; 4]); // version + flags
+    hdlr.extend_from_slice(&0u32.to_be_bytes()); // pre_defined
+    hdlr.extend_from_slice(b"vide"); // handler_type
+    hdlr.extend_from_slice(&[0u8; 12]); // reserved
+    hdlr.push(0); // name (null terminated)
+
+    // Build mdhd box (timescale)
+    let mut mdhd = Vec::new();
+    let mdhd_size: u32 = 32;
+    cmaf::write_box_header(&mut mdhd, mdhd_size, b"mdhd");
+    mdhd.extend_from_slice(&[0u8; 4]); // version + flags
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // creation_time
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // modification_time
+    mdhd.extend_from_slice(&90000u32.to_be_bytes()); // timescale
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // language + pre_defined
+
+    // Clear sample entry: avc1 with 24-byte prefix (no sinf)
+    let entry_prefix = [0u8; 24];
+    let entry_size = 8 + entry_prefix.len() as u32;
+    let mut entry = Vec::new();
+    cmaf::write_box_header(&mut entry, entry_size, b"avc1");
+    entry.extend_from_slice(&entry_prefix);
+
+    let stsd = build_stsd(&entry);
+    let stbl = wrap_box(b"stbl", &stsd);
+    let minf = wrap_box(b"minf", &stbl);
+    let mut mdia_children = Vec::new();
+    mdia_children.extend_from_slice(&mdhd);
+    mdia_children.extend_from_slice(&hdlr);
+    mdia_children.extend_from_slice(&minf);
+    let mdia = wrap_box(b"mdia", &mdia_children);
+
+    let mut trak_children = Vec::new();
+    trak_children.extend_from_slice(&tkhd);
+    trak_children.extend_from_slice(&mdia);
+    let trak = wrap_box(b"trak", &trak_children);
+    moov_children.extend_from_slice(&trak);
+
+    let moov_size = 8 + moov_children.len() as u32;
+    cmaf::write_box_header(&mut data, moov_size, b"moov");
+    data.extend_from_slice(&moov_children);
+
+    data
+}
+
 /// Wrap child data in a container box.
 pub fn wrap_box(box_type: &[u8; 4], children: &[u8]) -> Vec<u8> {
     let total = 8 + children.len() as u32;

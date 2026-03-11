@@ -166,6 +166,59 @@ impl CacheKeys {
     pub fn part(content_id: &str, format: &str, segment_number: u32, part_index: u32) -> String {
         format!("ep:{content_id}:{format}:part:{segment_number}:{part_index}")
     }
+
+    // --- Per-Variant key builders (CDN Fan-Out) ---
+    // Each variant is an independent cache key for parallel CDN processing.
+
+    /// Build a variant-qualified key prefix: e.g. "v0", "v4".
+    fn variant_prefix(variant_id: u32) -> String {
+        format!("v{variant_id}")
+    }
+
+    /// Per-variant manifest state.
+    /// Key: `ep:{id}:v{vid}:{fmt}_{scheme}:manifest_state` or `ep:{id}:v{vid}:{fmt}:manifest_state`
+    pub fn variant_manifest_state(content_id: &str, variant_id: u32, format: &str, scheme: Option<&str>) -> String {
+        let vp = Self::variant_prefix(variant_id);
+        match scheme {
+            Some(s) => format!("ep:{content_id}:{vp}:{format}_{s}:manifest_state"),
+            None => format!("ep:{content_id}:{vp}:{format}:manifest_state"),
+        }
+    }
+
+    /// Per-variant init segment.
+    /// Key: `ep:{id}:v{vid}:{scheme}:init` or `ep:{id}:v{vid}:init`
+    pub fn variant_init_segment(content_id: &str, variant_id: u32, scheme: Option<&str>) -> String {
+        let vp = Self::variant_prefix(variant_id);
+        match scheme {
+            Some(s) => format!("ep:{content_id}:{vp}:{s}:init"),
+            None => format!("ep:{content_id}:{vp}:init"),
+        }
+    }
+
+    /// Per-variant media segment.
+    /// Key: `ep:{id}:v{vid}:{scheme}:seg:{n}` or `ep:{id}:v{vid}:seg:{n}`
+    pub fn variant_media_segment(content_id: &str, variant_id: u32, number: u32, scheme: Option<&str>) -> String {
+        let vp = Self::variant_prefix(variant_id);
+        match scheme {
+            Some(s) => format!("ep:{content_id}:{vp}:{s}:seg:{number}"),
+            None => format!("ep:{content_id}:{vp}:seg:{number}"),
+        }
+    }
+
+    /// Per-variant source variants metadata (shared across formats).
+    /// Key: `ep:{id}:variants`
+    pub fn source_variants(content_id: &str) -> String {
+        format!("ep:{content_id}:variants")
+    }
+
+    /// Master manifest key (all variant metadata, no segment processing).
+    /// Key: `ep:{id}:master:{fmt}_{scheme}` or `ep:{id}:master:{fmt}`
+    pub fn master_manifest(content_id: &str, format: &str, scheme: Option<&str>) -> String {
+        match scheme {
+            Some(s) => format!("ep:{content_id}:master:{format}_{s}"),
+            None => format!("ep:{content_id}:master:{format}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -372,5 +425,75 @@ mod tests {
         let unqualified = CacheKeys::init_segment("abc", "hls");
         let qualified = CacheKeys::init_segment_for_scheme("abc", "hls", "cenc");
         assert_ne!(unqualified, qualified);
+    }
+
+    // --- Per-Variant key tests (CDN Fan-Out) ---
+
+    #[test]
+    fn cache_keys_variant_manifest_state() {
+        assert_eq!(
+            CacheKeys::variant_manifest_state("abc", 0, "hls", Some("cenc")),
+            "ep:abc:v0:hls_cenc:manifest_state"
+        );
+        assert_eq!(
+            CacheKeys::variant_manifest_state("abc", 4, "dash", Some("cbcs")),
+            "ep:abc:v4:dash_cbcs:manifest_state"
+        );
+        assert_eq!(
+            CacheKeys::variant_manifest_state("abc", 0, "hls", None),
+            "ep:abc:v0:hls:manifest_state"
+        );
+    }
+
+    #[test]
+    fn cache_keys_variant_init_segment() {
+        assert_eq!(
+            CacheKeys::variant_init_segment("abc", 0, Some("cenc")),
+            "ep:abc:v0:cenc:init"
+        );
+        assert_eq!(
+            CacheKeys::variant_init_segment("abc", 8, Some("cbcs")),
+            "ep:abc:v8:cbcs:init"
+        );
+        assert_eq!(
+            CacheKeys::variant_init_segment("abc", 0, None),
+            "ep:abc:v0:init"
+        );
+    }
+
+    #[test]
+    fn cache_keys_variant_media_segment() {
+        assert_eq!(
+            CacheKeys::variant_media_segment("abc", 0, 5, Some("cenc")),
+            "ep:abc:v0:cenc:seg:5"
+        );
+        assert_eq!(
+            CacheKeys::variant_media_segment("abc", 4, 42, None),
+            "ep:abc:v4:seg:42"
+        );
+    }
+
+    #[test]
+    fn cache_keys_source_variants() {
+        assert_eq!(CacheKeys::source_variants("abc"), "ep:abc:variants");
+    }
+
+    #[test]
+    fn cache_keys_master_manifest() {
+        assert_eq!(
+            CacheKeys::master_manifest("abc", "hls", Some("cenc")),
+            "ep:abc:master:hls_cenc"
+        );
+        assert_eq!(
+            CacheKeys::master_manifest("abc", "dash", None),
+            "ep:abc:master:dash"
+        );
+    }
+
+    #[test]
+    fn cache_keys_variant_keys_differ_from_global() {
+        let global = CacheKeys::init_segment_for_scheme_only("abc", "cenc");
+        let variant = CacheKeys::variant_init_segment("abc", 0, Some("cenc"));
+        assert_ne!(global, variant);
     }
 }

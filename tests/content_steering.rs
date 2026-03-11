@@ -26,6 +26,7 @@ fn hls_master_content_steering_full() {
         frame_rate: None,
         track_type: TrackMediaType::Video,
         language: None,
+        segment_path_prefix: None,
     });
     let m3u8 = edgepack::manifest::hls::render_master(&state, &["v1.m3u8".into()]).unwrap();
     assert!(m3u8.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://steer.example.com/v1\",PATHWAY-ID=\"cdn-a\""));
@@ -47,6 +48,7 @@ fn hls_master_content_steering_server_uri_only() {
         frame_rate: None,
         track_type: TrackMediaType::Video,
         language: None,
+        segment_path_prefix: None,
     });
     let m3u8 = edgepack::manifest::hls::render_master(&state, &["v1.m3u8".into()]).unwrap();
     assert!(m3u8.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://steer.example.com/v1\""));
@@ -64,6 +66,7 @@ fn hls_master_no_steering_backward_compat() {
         frame_rate: None,
         track_type: TrackMediaType::Video,
         language: None,
+        segment_path_prefix: None,
     });
     let m3u8 = edgepack::manifest::hls::render_master(&state, &["v1.m3u8".into()]).unwrap();
     assert!(!m3u8.contains("CONTENT-STEERING"));
@@ -101,6 +104,7 @@ fn hls_master_steering_tag_position_before_session_key() {
         frame_rate: None,
         track_type: TrackMediaType::Video,
         language: None,
+        segment_path_prefix: None,
     });
     let m3u8 = edgepack::manifest::hls::render_master(&state, &["v1.m3u8".into()]).unwrap();
     let steering_pos = m3u8.find("#EXT-X-CONTENT-STEERING").unwrap();

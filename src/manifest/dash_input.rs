@@ -43,6 +43,8 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
     let mut timeline_entries: Vec<(u64, u32)> = Vec::new(); // (duration_ticks, repeat_count)
     let mut uniform_duration: Option<u64> = None; // for SegmentTemplate@duration
     let mut base_url_override: Option<String> = None; // absolute BaseURL at MPD/Period level
+    // Source variant metadata accumulated from all video Representations
+    let mut source_variants: Vec<crate::manifest::types::SourceVariantInfo> = Vec::new();
     let mut found_video_segment_template = false; // whether we've locked in on a video SegmentTemplate
     let mut capturing_current_template = false; // whether current AdaptationSet's template is being captured
     let mut ll_dash_info: Option<LowLatencyDashInfo> = None;
@@ -122,16 +124,61 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                         current_seg_base_timescale = 0;
                         current_seg_base_init_range = None;
 
-                        // Check mimeType on Representation as fallback for video detection
-                        if !adaptation_set_is_video {
-                            for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"mimeType" {
+                        // Extract variant metadata from Representation attributes
+                        let mut rep_bandwidth: u64 = 0;
+                        let mut rep_width: Option<u32> = None;
+                        let mut rep_height: Option<u32> = None;
+                        let mut rep_codecs: Option<String> = None;
+                        let mut rep_frame_rate: Option<String> = None;
+                        let mut rep_is_video = adaptation_set_is_video;
+
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"mimeType" => {
                                     let val = String::from_utf8_lossy(&attr.value);
                                     if val.starts_with("video/") {
+                                        rep_is_video = true;
                                         adaptation_set_is_video = true;
                                     }
                                 }
+                                b"bandwidth" => {
+                                    rep_bandwidth = String::from_utf8_lossy(&attr.value)
+                                        .parse()
+                                        .unwrap_or(0);
+                                }
+                                b"width" => {
+                                    rep_width = String::from_utf8_lossy(&attr.value)
+                                        .parse()
+                                        .ok();
+                                }
+                                b"height" => {
+                                    rep_height = String::from_utf8_lossy(&attr.value)
+                                        .parse()
+                                        .ok();
+                                }
+                                b"codecs" => {
+                                    rep_codecs = Some(
+                                        String::from_utf8_lossy(&attr.value).to_string(),
+                                    );
+                                }
+                                b"frameRate" => {
+                                    rep_frame_rate = Some(
+                                        String::from_utf8_lossy(&attr.value).to_string(),
+                                    );
+                                }
+                                _ => {}
                             }
+                        }
+
+                        // Collect variant metadata from video Representations
+                        if rep_is_video && rep_bandwidth > 0 {
+                            source_variants.push(crate::manifest::types::SourceVariantInfo {
+                                bandwidth: rep_bandwidth,
+                                width: rep_width,
+                                height: rep_height,
+                                codecs: rep_codecs,
+                                frame_rate: rep_frame_rate,
+                            });
                         }
                     }
                     b"BaseURL" => {
@@ -561,6 +608,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
             init_byte_range: None,
             segment_byte_ranges: Vec::new(),
             segment_base: None,
+            source_variants: source_variants,
         });
     }
 
@@ -594,6 +642,7 @@ pub fn parse_dash_manifest(manifest_text: &str, manifest_url: &str) -> Result<So
                 index_range: rep.index_range,
                 timescale: rep.timescale,
             }),
+            source_variants: source_variants,
         });
     }
 

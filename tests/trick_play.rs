@@ -122,6 +122,7 @@ fn hls_master_iframe_stream_inf() {
         frame_rate: Some(29.97),
         track_type: TrackMediaType::Video,
         language: None,
+        segment_path_prefix: None,
     });
     let uris = vec!["v720.m3u8".to_string()];
     let m3u8 = hls::render_master(&state, &uris).unwrap();
@@ -153,6 +154,7 @@ fn hls_master_no_iframe_stream_when_empty_segments() {
         frame_rate: None,
         track_type: TrackMediaType::Video,
         language: None,
+        segment_path_prefix: None,
     });
     let uris = vec!["v1.m3u8".into()];
     let m3u8 = hls::render_master(&state, &uris).unwrap();
@@ -172,6 +174,7 @@ fn dash_trick_play_adaptation_set() {
         frame_rate: Some(30.0),
         track_type: TrackMediaType::Video,
         language: None,
+        segment_path_prefix: None,
     });
     let mpd = dash::render(&state).unwrap();
     // Main video AdaptationSet should have id="1"

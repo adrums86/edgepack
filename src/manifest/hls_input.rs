@@ -6,7 +6,7 @@
 
 use crate::drm::scheme::EncryptionScheme;
 use crate::error::{EdgepackError, Result};
-use crate::manifest::types::{AdBreakInfo, ServerControl, SourceManifest, SourcePartInfo};
+use crate::manifest::types::{AdBreakInfo, HlsRenditionInfo, ServerControl, SourceManifest, SourcePartInfo, SourceVariantInfo};
 use crate::url::Url;
 
 /// Parse an HLS M3U8 media playlist into a `SourceManifest`.
@@ -161,7 +161,150 @@ pub fn parse_hls_manifest(manifest_text: &str, manifest_url: &str) -> Result<Sou
         init_byte_range: None,
         segment_byte_ranges: Vec::new(),
         segment_base: None,
+        source_variants: Vec::new(),
     })
+}
+
+/// Parsed HLS master playlist variant and rendition metadata.
+///
+/// Contains all variant streams and rendition groups extracted from an HLS master
+/// playlist. Used by the sandbox and CDN handler to discover available quality
+/// levels, audio tracks, and subtitle tracks for multi-variant processing.
+#[derive(Debug, Clone)]
+pub struct HlsMasterPlaylistInfo {
+    /// Video variant metadata (bandwidth, resolution, codecs, frame rate).
+    pub variants: Vec<SourceVariantInfo>,
+    /// URIs of variant media playlists (parallel to `variants`).
+    pub variant_uris: Vec<String>,
+    /// Audio rendition group members.
+    pub audio_renditions: Vec<HlsRenditionInfo>,
+    /// Subtitle rendition group members.
+    pub subtitle_renditions: Vec<HlsRenditionInfo>,
+}
+
+/// Parse an HLS master playlist to extract variant and rendition metadata.
+///
+/// This is separate from `parse_hls_manifest()` which handles media playlists.
+/// The master parser extracts metadata only — it does not parse segment data.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The manifest URL is invalid
+/// - The manifest is not a master playlist (no `#EXT-X-STREAM-INF`)
+pub fn parse_hls_master_playlist(manifest_text: &str, manifest_url: &str) -> Result<HlsMasterPlaylistInfo> {
+    let base_url = Url::parse(manifest_url).map_err(|e| {
+        EdgepackError::Manifest(format!("invalid manifest URL: {e}"))
+    })?;
+
+    if !manifest_text.contains("#EXT-X-STREAM-INF") {
+        return Err(EdgepackError::Manifest(
+            "not an HLS master playlist — no #EXT-X-STREAM-INF found".into(),
+        ));
+    }
+
+    let mut variants = Vec::new();
+    let mut variant_uris = Vec::new();
+    let mut audio_renditions = Vec::new();
+    let mut subtitle_renditions = Vec::new();
+    let mut pending_stream_inf: Option<SourceVariantInfo> = None;
+
+    for line in manifest_text.lines() {
+        let line = line.trim();
+
+        if line.starts_with("#EXT-X-STREAM-INF:") {
+            let attrs = &line["#EXT-X-STREAM-INF:".len()..];
+
+            let bandwidth = extract_attribute_unquoted_from(attrs, "BANDWIDTH")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            let (width, height) = extract_attribute_unquoted_from(attrs, "RESOLUTION")
+                .and_then(|v| {
+                    let parts: Vec<&str> = v.split('x').collect();
+                    if parts.len() == 2 {
+                        Some((parts[0].parse::<u32>().ok()?, parts[1].parse::<u32>().ok()?))
+                    } else {
+                        None
+                    }
+                })
+                .map(|(w, h)| (Some(w), Some(h)))
+                .unwrap_or((None, None));
+
+            let codecs = extract_attribute(line, "CODECS");
+
+            let frame_rate = extract_attribute_unquoted_from(attrs, "FRAME-RATE")
+                .map(|v| v.to_string());
+
+            pending_stream_inf = Some(SourceVariantInfo {
+                bandwidth,
+                width,
+                height,
+                codecs,
+                frame_rate,
+            });
+        } else if line.starts_with("#EXT-X-MEDIA:") {
+            // Parse rendition groups
+            let media_type = extract_attribute_unquoted(line, "TYPE");
+            let uri = extract_attribute(line, "URI");
+            let name = extract_attribute(line, "NAME").unwrap_or_default();
+            let language = extract_attribute(line, "LANGUAGE");
+            let group_id = extract_attribute(line, "GROUP-ID").unwrap_or_default();
+            let is_default = extract_attribute_unquoted(line, "DEFAULT")
+                .map(|v| v == "YES")
+                .unwrap_or(false);
+
+            // Resolve URI if present
+            let resolved_uri = if let Some(ref u) = uri {
+                Some(resolve_url(&base_url, u)?)
+            } else {
+                None
+            };
+
+            let rendition = HlsRenditionInfo {
+                uri: resolved_uri,
+                name,
+                language,
+                group_id,
+                is_default,
+            };
+
+            match media_type.as_deref() {
+                Some("AUDIO") => audio_renditions.push(rendition),
+                Some("SUBTITLES") => subtitle_renditions.push(rendition),
+                // CLOSED-CAPTIONS have no URI — still captured for manifest rendering
+                Some("CLOSED-CAPTIONS") => subtitle_renditions.push(rendition),
+                _ => {}
+            }
+        } else if !line.starts_with('#') && !line.is_empty() {
+            // URI line following #EXT-X-STREAM-INF
+            if let Some(variant_info) = pending_stream_inf.take() {
+                let resolved = resolve_url(&base_url, line)?;
+                variants.push(variant_info);
+                variant_uris.push(resolved);
+            }
+        }
+    }
+
+    Ok(HlsMasterPlaylistInfo {
+        variants,
+        variant_uris,
+        audio_renditions,
+        subtitle_renditions,
+    })
+}
+
+/// Extract an unquoted attribute from a substring (without the tag prefix).
+fn extract_attribute_unquoted_from(attrs: &str, attr: &str) -> Option<String> {
+    let search = format!("{attr}=");
+    let start = attrs.find(&search)? + search.len();
+    let rest = &attrs[start..];
+    if rest.starts_with('"') {
+        let end = rest[1..].find('"')?;
+        return Some(rest[1..1 + end].to_string());
+    }
+    let end = rest.find(',').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 /// Resolve a possibly-relative URI against a base URL.

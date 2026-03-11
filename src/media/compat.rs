@@ -530,6 +530,8 @@ mod tests {
                 timescale: 90000,
                 kid: None,
                 language: None,
+                width: Some(1920),
+                height: Some(1080),
             },
             TrackInfo {
                 track_type: TrackType::Audio,
@@ -538,6 +540,8 @@ mod tests {
                 timescale: 44100,
                 kid: None,
                 language: None,
+                width: None,
+                height: None,
             },
         ];
         let r = validate_repackage_request(
@@ -558,6 +562,8 @@ mod tests {
             timescale: 90000,
             kid: None,
             language: None,
+            width: Some(1920),
+            height: Some(1080),
         }];
         let r = validate_repackage_request(
             EncryptionScheme::None,
@@ -577,6 +583,8 @@ mod tests {
             timescale: 90000,
             kid: None,
             language: None,
+            width: Some(1920),
+            height: Some(1080),
         }];
         let r = validate_repackage_request(
             EncryptionScheme::Cbcs,

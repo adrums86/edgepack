@@ -26,6 +26,7 @@
 | 24 | Spec Compliance Fixes | Done |
 | 25 | Manifest Correctness Fixes | Done |
 | 26 | Runtime Policy Controls | Done |
+| 28 | Multi-Variant Architecture (CDN Fan-Out) | Done |
 
 ---
 
@@ -80,7 +81,21 @@ Replace panicking code with fallible error handling for defense-in-depth.
 
 ---
 
-### Phase 28: Hot Path Performance Optimization — P2
+### ~~Phase 28: Multi-Variant Architecture (CDN Fan-Out) — P1~~ Done
+
+Lossless multi-variant processing preserving all source ABR tiers.
+
+- **Source variant metadata extraction**: DASH parser extracts all `<Representation>` attributes (bandwidth, width, height, codecs, frameRate) into `SourceVariantInfo`. HLS `parse_hls_master_playlist()` extracts `#EXT-X-STREAM-INF` and `#EXT-X-MEDIA` metadata.
+- **TrackInfo width/height**: `extract_tracks()` now parses tkhd box for width/height (fixed-point 16.16).
+- **Pipeline variant merging**: `build_variants_from_tracks()` merges source variant metadata with tkhd dimensions for accurate manifest rendering.
+- **Per-variant CDN routing**: New routes `/repackage/{id}/{format}/v/{vid}/manifest|init.mp4|iframes|segment_{n}.{ext}` enable independent per-variant caching and processing.
+- **Variant-qualified cache keys**: `CacheKeys::variant_*` methods for `ep:{id}:v{vid}:{scheme}:*` keys.
+- **Sandbox multi-variant processing**: `std::thread::scope` for parallel variant processing, per-variant output files (`v{vid}_*`), raw WebVTT pass-through, real metadata in combined manifests.
+- 31 integration tests in `tests/multi_variant.rs`, new fixtures in `tests/common/mod.rs`.
+
+---
+
+### Phase 31: Hot Path Performance Optimization — P2
 
 Performance improvements to the segment rewriting and manifest rendering hot paths.
 

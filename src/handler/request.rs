@@ -536,6 +536,136 @@ fn jit_segment_fallback(
     }
 }
 
+// ─── Per-Variant Handlers (CDN Fan-Out) ────────────────────────────
+
+/// Handle a request for a per-variant manifest.
+///
+/// In the CDN fan-out model, each variant is an independent cache key.
+/// Uses variant-qualified cache keys: `ep:{id}:v{vid}:{fmt}_{scheme}:manifest`.
+pub fn handle_variant_manifest_request(
+    content_id: &str,
+    format: OutputFormat,
+    variant_id: u32,
+    scheme: Option<&str>,
+    ctx: &HandlerContext,
+) -> Result<HttpResponse> {
+    let cache = cache::global_cache();
+    let fmt = format_str(format);
+    let key = CacheKeys::variant_manifest_state(content_id, variant_id, fmt, scheme);
+
+    let state_bytes = match cache.get(&key)? {
+        Some(data) => data,
+        None => {
+            // JIT fallback for per-variant manifest
+            if let Some(resp) = jit_manifest_fallback(content_id, format, fmt, scheme, ctx)? {
+                return Ok(resp);
+            }
+            return Ok(HttpResponse::not_found(&format!(
+                "variant {variant_id} manifest not found for {content_id}/{fmt}"
+            )));
+        }
+    };
+
+    render_manifest_response(&state_bytes, format, ctx)
+}
+
+/// Handle a request for a per-variant init segment.
+pub fn handle_variant_init_request(
+    content_id: &str,
+    _format: OutputFormat,
+    variant_id: u32,
+    scheme: Option<&str>,
+    ctx: &HandlerContext,
+) -> Result<HttpResponse> {
+    let cache = cache::global_cache();
+    let key = CacheKeys::variant_init_segment(content_id, variant_id, scheme);
+
+    match cache.get(&key)? {
+        Some(data) => Ok(HttpResponse::ok_with_cache(
+            data,
+            "video/mp4",
+            &format!(
+                "public, max-age={}, immutable",
+                ctx.config.cache.vod_max_age
+            ),
+        )),
+        None => Ok(HttpResponse::not_found(&format!(
+            "variant {variant_id} init not found for {content_id}"
+        ))),
+    }
+}
+
+/// Handle a request for a per-variant I-frame playlist.
+pub fn handle_variant_iframe_request(
+    content_id: &str,
+    format: OutputFormat,
+    variant_id: u32,
+    scheme: Option<&str>,
+    ctx: &HandlerContext,
+) -> Result<HttpResponse> {
+    // DASH trick play is embedded in the regular MPD — no separate per-variant iframe endpoint
+    if format == OutputFormat::Dash {
+        return Ok(HttpResponse::not_found(
+            "DASH trick play is embedded in the regular MPD — use the per-variant manifest instead"
+        ));
+    }
+
+    let cache = cache::global_cache();
+    let fmt = format_str(format);
+    let key = CacheKeys::variant_manifest_state(content_id, variant_id, fmt, scheme);
+
+    match cache.get(&key)? {
+        Some(state_bytes) => {
+            let state: ManifestState = serde_json::from_slice(&state_bytes)
+                .map_err(|e| crate::error::EdgepackError::Cache(format!("deserialize manifest: {e}")))?;
+            let rendered = manifest::render_iframe_manifest(&state)?;
+            match rendered {
+                Some(body) => Ok(HttpResponse::ok_with_cache(
+                    body.into_bytes(),
+                    format.content_type(),
+                    &format!(
+                        "public, max-age={}, immutable",
+                        ctx.config.cache.vod_max_age
+                    ),
+                )),
+                None => Ok(HttpResponse::not_found(
+                    "I-frame playlist not available for this variant"
+                )),
+            }
+        }
+        None => Ok(HttpResponse::not_found(&format!(
+            "variant {variant_id} iframe manifest not found for {content_id}"
+        ))),
+    }
+}
+
+/// Handle a request for a per-variant media segment.
+pub fn handle_variant_segment_request(
+    content_id: &str,
+    _format: OutputFormat,
+    variant_id: u32,
+    segment_number: u32,
+    scheme: Option<&str>,
+    ctx: &HandlerContext,
+) -> Result<HttpResponse> {
+    let cache = cache::global_cache();
+    let key = CacheKeys::variant_media_segment(content_id, variant_id, segment_number, scheme);
+
+    match cache.get(&key)? {
+        Some(data) => Ok(HttpResponse::ok_with_cache(
+            data,
+            "video/mp4",
+            &format!(
+                "public, max-age={}, immutable",
+                ctx.config.cache.vod_max_age
+            ),
+        )),
+        None => Ok(HttpResponse::not_found(&format!(
+            "variant {variant_id} segment {segment_number} not found for {content_id}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

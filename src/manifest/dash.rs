@@ -141,14 +141,16 @@ pub fn render(state: &ManifestState) -> Result<String> {
             ));
         }
 
-        // SegmentTemplate
-        mpd.push_str(&build_segment_template(state));
+        // Check if per-Representation SegmentTemplates are needed (multi-variant with
+        // different segment paths per variant). When any variant has segment_path_prefix,
+        // each Representation gets its own SegmentTemplate with variant-specific init/media paths.
+        let needs_per_rep_template = video_variants
+            .iter()
+            .any(|v| v.segment_path_prefix.is_some());
 
-        if video_variants.is_empty() {
-            // Single representation (no variant info available)
-            mpd.push_str("      <Representation id=\"video\" bandwidth=\"2000000\">\n");
-            mpd.push_str("      </Representation>\n");
-        } else {
+        if needs_per_rep_template {
+            // Per-Representation SegmentTemplate: no shared template at AdaptationSet level.
+            // Each variant has its own init segment and media segment paths.
             for variant in &video_variants {
                 mpd.push_str(&format!(
                     "      <Representation id=\"{}\" bandwidth=\"{}\"",
@@ -164,7 +166,36 @@ pub fn render(state: &ManifestState) -> Result<String> {
                     mpd.push_str(&format!(" frameRate=\"{fps}\""));
                 }
                 mpd.push_str(">\n");
+                let prefix = variant.segment_path_prefix.as_deref().unwrap_or("");
+                mpd.push_str(&build_segment_template_with_prefix(state, prefix));
                 mpd.push_str("      </Representation>\n");
+            }
+        } else {
+            // Shared SegmentTemplate at AdaptationSet level (single-variant or no prefix)
+            mpd.push_str(&build_segment_template(state));
+
+            if video_variants.is_empty() {
+                // Single representation (no variant info available)
+                mpd.push_str("      <Representation id=\"video\" bandwidth=\"2000000\">\n");
+                mpd.push_str("      </Representation>\n");
+            } else {
+                for variant in &video_variants {
+                    mpd.push_str(&format!(
+                        "      <Representation id=\"{}\" bandwidth=\"{}\"",
+                        variant.id, variant.bandwidth
+                    ));
+                    if !variant.codecs.is_empty() {
+                        mpd.push_str(&format!(" codecs=\"{}\"", variant.codecs));
+                    }
+                    if let Some((w, h)) = variant.resolution {
+                        mpd.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
+                    }
+                    if let Some(fps) = variant.frame_rate {
+                        mpd.push_str(&format!(" frameRate=\"{fps}\""));
+                    }
+                    mpd.push_str(">\n");
+                    mpd.push_str("      </Representation>\n");
+                }
             }
         }
 
@@ -174,11 +205,9 @@ pub fn render(state: &ManifestState) -> Result<String> {
         if state.enable_iframe_playlist && !windowed_iframes.is_empty() {
             mpd.push_str("    <AdaptationSet contentType=\"video\" mimeType=\"video/mp4\" segmentAlignment=\"true\">\n");
             mpd.push_str("      <EssentialProperty schemeIdUri=\"http://dashif.org/guidelines/trickmode\" value=\"1\"/>\n");
-            mpd.push_str(&build_segment_template(state));
-            if video_variants.is_empty() {
-                mpd.push_str("      <Representation id=\"video_trick\" bandwidth=\"200000\">\n");
-                mpd.push_str("      </Representation>\n");
-            } else {
+
+            if needs_per_rep_template {
+                // Trick play also needs per-Representation SegmentTemplate
                 for variant in &video_variants {
                     mpd.push_str(&format!(
                         "      <Representation id=\"{}_trick\" bandwidth=\"{}\"",
@@ -192,7 +221,31 @@ pub fn render(state: &ManifestState) -> Result<String> {
                         mpd.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
                     }
                     mpd.push_str(">\n");
+                    let prefix = variant.segment_path_prefix.as_deref().unwrap_or("");
+                    mpd.push_str(&build_segment_template_with_prefix(state, prefix));
                     mpd.push_str("      </Representation>\n");
+                }
+            } else {
+                mpd.push_str(&build_segment_template(state));
+                if video_variants.is_empty() {
+                    mpd.push_str("      <Representation id=\"video_trick\" bandwidth=\"200000\">\n");
+                    mpd.push_str("      </Representation>\n");
+                } else {
+                    for variant in &video_variants {
+                        mpd.push_str(&format!(
+                            "      <Representation id=\"{}_trick\" bandwidth=\"{}\"",
+                            variant.id,
+                            variant.bandwidth / 10
+                        ));
+                        if !variant.codecs.is_empty() {
+                            mpd.push_str(&format!(" codecs=\"{}\"", variant.codecs));
+                        }
+                        if let Some((w, h)) = variant.resolution {
+                            mpd.push_str(&format!(" width=\"{w}\" height=\"{h}\""));
+                        }
+                        mpd.push_str(">\n");
+                        mpd.push_str("      </Representation>\n");
+                    }
                 }
             }
             mpd.push_str("    </AdaptationSet>\n");
@@ -373,6 +426,64 @@ fn build_segment_template(state: &ManifestState) -> String {
     }
     xml.push_str("        </SegmentTimeline>\n");
     xml.push_str("      </SegmentTemplate>\n");
+    xml
+}
+
+/// Build a per-Representation SegmentTemplate with a variant-specific path prefix.
+///
+/// Used for multi-variant DASH output where each Representation has its own
+/// init segment and media segment files at different paths.
+///
+/// - CDN: prefix = `"v/0/"` → `initialization="v/0/init.mp4"`, `media="v/0/segment_$Number$.cmfv"`
+/// - Sandbox: prefix = `"v0_"` → `initialization="v0_init.mp4"`, `media="v0_segment_$Number$.cmfv"`
+fn build_segment_template_with_prefix(state: &ManifestState, prefix: &str) -> String {
+    let timescale = 1000u32; // millisecond timescale
+
+    let segments = state.windowed_segments();
+    let start_number = segments.first().map(|s| s.number).unwrap_or(0);
+
+    let seg_ext = state.container_format.video_segment_extension();
+    let mut xml = format!(
+        "        <SegmentTemplate timescale=\"{timescale}\" \
+         initialization=\"{prefix}init.mp4\" \
+         media=\"{prefix}segment_$Number${seg_ext}\" \
+         startNumber=\"{start_number}\""
+    );
+
+    // LL-DASH: add availabilityTimeOffset and availabilityTimeComplete
+    if let Some(ref ll) = state.ll_dash_info {
+        xml.push_str(&format!(
+            " availabilityTimeOffset=\"{:.3}\"",
+            ll.availability_time_offset
+        ));
+        if !ll.availability_time_complete {
+            xml.push_str(" availabilityTimeComplete=\"false\"");
+        }
+    }
+
+    xml.push_str(">\n");
+
+    xml.push_str("          <SegmentTimeline>\n");
+    for (i, segment) in segments.iter().enumerate() {
+        let duration_ms = (segment.duration * timescale as f64) as u64;
+        if i == 0 && start_number > 0 {
+            let t: u64 = state
+                .segments
+                .iter()
+                .take_while(|s| s.number < segment.number)
+                .map(|s| (s.duration * timescale as f64) as u64)
+                .sum();
+            xml.push_str(&format!(
+                "            <S t=\"{t}\" d=\"{duration_ms}\"/>\n"
+            ));
+        } else {
+            xml.push_str(&format!(
+                "            <S d=\"{duration_ms}\"/>\n"
+            ));
+        }
+    }
+    xml.push_str("          </SegmentTimeline>\n");
+    xml.push_str("        </SegmentTemplate>\n");
     xml
 }
 
@@ -588,6 +699,7 @@ mod tests {
             frame_rate: Some(30.0),
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("contentType=\"video\""));
@@ -609,6 +721,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Audio,
             language: None,
+            segment_path_prefix: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("contentType=\"audio\""));
@@ -653,6 +766,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("contentType=\"text\""));
@@ -673,6 +787,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("spa".into()),
+            segment_path_prefix: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("contentType=\"text\""));
@@ -700,6 +815,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "sub_eng".into(),
@@ -709,6 +825,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         let mpd = render(&state).unwrap();
         // Video AdaptationSet should have ContentProtection
@@ -775,6 +892,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Audio,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         let mpd = render(&state).unwrap();
         assert!(mpd.contains("contentType=\"audio\""));
@@ -792,6 +910,7 @@ mod tests {
             frame_rate: Some(30.0),
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "a1".into(),
@@ -801,6 +920,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Audio,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "sub_eng".into(),
@@ -810,6 +930,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         state.cea_captions.push(CeaCaptionInfo {
             service_name: "CC1".into(),

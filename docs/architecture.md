@@ -1,6 +1,6 @@
 # edgepack Architecture
 
-All diagrams use [Mermaid](https://mermaid.js.org/) syntax (11 diagrams total). They render natively in Confluence (Mermaid macro), Jira (Mermaid code blocks), GitHub, and can be imported into Lucidchart via **File → Import → Mermaid**.
+All diagrams use [Mermaid](https://mermaid.js.org/) syntax (17 diagrams total). They render natively in Confluence (Mermaid macro), Jira (Mermaid code blocks), GitHub, and can be imported into Lucidchart via **File → Import → Mermaid**.
 
 ---
 
@@ -716,3 +716,190 @@ graph LR
 | Endpoint | Reason |
 |----------|--------|
 | `GET /health` | Operational monitoring must work under full lockdown |
+
+---
+
+## 14. Multi-Variant CDN Fan-Out Architecture
+
+The current architecture processes a single variant (bitrate/resolution) per request. Multi-variant fan-out extends the system to parse a source MPD or master playlist containing N variants and produce per-variant manifests and segments, each independently cacheable at the CDN edge. This enables ABR (Adaptive Bitrate) playback where the player selects from multiple quality levels.
+
+See [`multi-variant-architecture.md`](multi-variant-architecture.md) for the full design document with detailed flow diagrams, cache key analysis, and implementation plan.
+
+### 14a. CDN Fan-Out Request Flow
+
+Shows the end-to-end flow from player request through multi-variant manifest generation and per-variant segment delivery.
+
+```mermaid
+sequenceDiagram
+    participant Player
+    participant CDN as CDN Cache
+    participant EP1 as WASM Instance #1
+    participant EP2 as WASM Instance #2
+    participant Origin
+
+    Note over Player,Origin: Phase 1 — Master Manifest (cache miss)
+    Player->>CDN: GET /repackage/{id}/hls_cenc/manifest
+    CDN-->>EP1: cache miss → instantiate WASM
+    EP1->>Origin: GET source manifest (.mpd / .m3u8)
+    Origin-->>EP1: source manifest (N variants)
+    EP1->>EP1: Parse source → extract N variants
+    EP1->>EP1: Cache variant metadata (ep:{id}:variants)
+    EP1->>EP1: Render master M3U8 / MPD with per-variant URIs
+    EP1-->>CDN: master manifest (Cache-Control: immutable)
+    CDN-->>Player: master manifest
+
+    Note over Player,Origin: Phase 2 — Player ABR selects variant
+    Player->>Player: ABR algorithm selects variant {vid}
+
+    Note over Player,Origin: Phase 3 — Per-Variant Manifest (cache miss → JIT)
+    Player->>CDN: GET /repackage/{id}/hls_cenc/v/{vid}/manifest
+    CDN-->>EP2: cache miss → instantiate WASM
+    EP2->>EP2: Load cached variant metadata
+    EP2->>Origin: GET variant init segment
+    Origin-->>EP2: init.mp4 (source scheme)
+    EP2->>EP2: JIT setup (SPEKE keys, init rewrite)
+
+    loop For each segment in variant
+        EP2->>Origin: GET variant segment_N
+        Origin-->>EP2: segment_N (source scheme)
+        EP2->>EP2: Decrypt → Re-encrypt (target scheme)
+    end
+
+    EP2-->>CDN: per-variant manifest + segments
+    CDN-->>Player: variant manifest
+
+    Note over Player,Origin: Phase 4 — Per-Variant Segments (CDN cache hits)
+    Player->>CDN: GET /repackage/{id}/hls_cenc/v/{vid}/segment_0.cmfv
+    CDN-->>Player: segment (Cache-Control: immutable, 1yr)
+```
+
+---
+
+### 14b. Per-Variant Cache Key Structure
+
+Shows the cache key hierarchy separating master-level, variant-level, and shared entries. Per-variant keys include the variant ID `{vid}` to isolate each bitrate/resolution track in the CDN cache.
+
+```mermaid
+graph TB
+    subgraph Master["Master-Level Keys"]
+        style Master fill:#1E3A5F,stroke:#3B82F6,color:#F9FAFB
+        M1["ep:{id}:master:{fmt}_{scheme}<br/>Master manifest state<br/>(HLS master M3U8 / DASH MPD)"]
+        M2["ep:{id}:variants<br/>Source variant metadata<br/>(parsed from source manifest)"]
+    end
+
+    subgraph PerVariant["Per-Variant Keys (× N variants)"]
+        style PerVariant fill:#14532D,stroke:#22C55E,color:#BBF7D0
+        V1["ep:{id}:v{vid}:{scheme}:init<br/>Rewritten init segment<br/>(per-variant, per-scheme)"]
+        V2["ep:{id}:v{vid}:{scheme}:seg:{n}<br/>Rewritten media segment<br/>(per-variant, per-scheme)"]
+        V3["ep:{id}:v{vid}:{fmt}_{scheme}:manifest_state<br/>Per-variant manifest state"]
+    end
+
+    subgraph Shared["Shared Keys (across all variants)"]
+        style Shared fill:#374151,stroke:#6B7280,color:#F9FAFB
+        S1["ep:{id}:keys<br/>DRM content keys<br/>(SENSITIVE — encrypted)"]
+        S2["ep:{id}:source_config<br/>Source configuration<br/>(JIT settings)"]
+        S3["ep:{id}:speke<br/>SPEKE CPIX response<br/>(SENSITIVE — encrypted)"]
+    end
+
+    M1 --- V1
+    V1 --- V2
+    V2 --- V3
+    S1 -.- V1
+    S2 -.- M2
+```
+
+---
+
+### 14c. Per-Variant Route Table
+
+Shows the new URL patterns for per-variant resources alongside existing single-variant routes. The `{vid}` path segment identifies the variant (e.g., video bitrate index).
+
+```mermaid
+graph LR
+    subgraph Existing["Existing Routes (single-variant)"]
+        style Existing fill:#374151,stroke:#6B7280,color:#F9FAFB
+        R1["GET /repackage/{id}/{format}/manifest"]
+        R2["GET /repackage/{id}/{format}/init.mp4"]
+        R3["GET /repackage/{id}/{format}/iframes"]
+        R4["GET /repackage/{id}/{format}/key"]
+        R5["GET /repackage/{id}/{format}/segment_{n}.{ext}"]
+    end
+
+    subgraph New["New Per-Variant Routes"]
+        style New fill:#1E3A5F,stroke:#3B82F6,color:#F9FAFB
+        N1["GET /repackage/{id}/{format}/v/{vid}/manifest<br/>Per-variant media playlist / MPD"]
+        N2["GET /repackage/{id}/{format}/v/{vid}/init.mp4<br/>Per-variant init segment"]
+        N3["GET /repackage/{id}/{format}/v/{vid}/iframes<br/>Per-variant I-frame playlist"]
+        N4["GET /repackage/{id}/{format}/v/{vid}/segment_{n}.{ext}<br/>Per-variant media segment"]
+    end
+
+    subgraph Handlers["Handler Dispatch"]
+        style Handlers fill:#14532D,stroke:#22C55E,color:#BBF7D0
+        H1["handle_master_manifest_request()<br/>→ render master with variant URIs"]
+        H2["handle_variant_manifest_request()<br/>→ JIT per-variant pipeline"]
+        H3["handle_variant_init_request()<br/>→ per-variant init segment"]
+        H4["handle_variant_segment_request()<br/>→ per-variant media segment"]
+    end
+
+    R1 --> H1
+    N1 --> H2
+    N2 --> H3
+    N3 --> H2
+    N4 --> H4
+```
+
+---
+
+### 14d. Sandbox Parallel Processing
+
+Shows how the sandbox binary processes multiple variants in parallel using `std::thread::scope`, followed by sequential audio and text track processing and master manifest assembly.
+
+```mermaid
+flowchart TD
+    subgraph Resolve["Phase 0: Source Resolution"]
+        Fetch["Fetch source manifest"]
+        Extract["Extract N variants<br/>(bitrate, resolution, codec)"]
+        Fetch --> Extract
+    end
+
+    subgraph Parallel["Phase 1: Parallel Variant Processing"]
+        style Parallel fill:#1E3A5F,stroke:#3B82F6,color:#F9FAFB
+        Scope["std::thread::scope"]
+        V1["Variant 0<br/>pipeline.execute_progressive()<br/>→ segments + manifest"]
+        V2["Variant 1<br/>pipeline.execute_progressive()<br/>→ segments + manifest"]
+        VN["Variant N<br/>pipeline.execute_progressive()<br/>→ segments + manifest"]
+        Scope --> V1
+        Scope --> V2
+        Scope --> VN
+    end
+
+    subgraph Audio["Phase 2: Audio Processing (sequential)"]
+        style Audio fill:#14532D,stroke:#22C55E,color:#BBF7D0
+        AudioResolve["Resolve audio tracks<br/>from source manifest"]
+        AudioPipeline["For each audio track:<br/>pipeline.execute_progressive()<br/>→ audio_segment_{n}"]
+        AudioResolve --> AudioPipeline
+    end
+
+    subgraph Text["Phase 3: Text Processing (sequential)"]
+        style Text fill:#374151,stroke:#6B7280,color:#F9FAFB
+        TextResolve["Resolve text tracks<br/>(WebVTT / TTML / CEA)"]
+        TextPipeline["For each text track:<br/>raw WebVTT pass-through<br/>or fMP4 subtitle pipeline<br/>→ text_N_segment_{n}"]
+        TextResolve --> TextPipeline
+    end
+
+    subgraph Master["Phase 4: Master Manifest Assembly"]
+        style Master fill:#5B21B6,stroke:#8B5CF6,color:#F9FAFB
+        Collect["Collect all variant results"]
+        Render["Render combined master manifest<br/>HLS: EXT-X-STREAM-INF per variant<br/>+ AUDIO/SUBTITLES groups<br/>DASH: AdaptationSet per variant<br/>+ audio/text AdaptationSets"]
+        Write["Write to sandbox/output/<br/>{content_id}/{format}_{scheme}/"]
+        Collect --> Render
+        Render --> Write
+    end
+
+    Extract --> Scope
+    V1 --> Collect
+    V2 --> Collect
+    VN --> Collect
+    AudioPipeline --> Collect
+    TextPipeline --> Collect
+```

@@ -761,6 +761,7 @@ fn source_manifest_ts_fields_serde_roundtrip() {
         init_byte_range: None,
         segment_byte_ranges: Vec::new(),
         segment_base: None,
+        source_variants: Vec::new(),
     };
 
     let json = serde_json::to_string(&source).unwrap();

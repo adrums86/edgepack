@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 ts = []
-sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
+sandbox = ["ts", "dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
 
 [[bin]]
 name = "sandbox"

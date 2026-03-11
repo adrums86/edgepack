@@ -4,7 +4,7 @@
 
 A lightweight media repackager that runs as a WebAssembly module directly on CDN edge nodes. Compiled from Rust to `wasm32-wasip2`, the ~628 KB binary instantiates in under 1 ms — enabling **just-in-time packaging** where content is repackaged on the first viewer request rather than pre-processed in a central origin. This eliminates the origin packaging bottleneck: no batch jobs, no packaging queues, no storage of pre-packaged variants.
 
-edgepack repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4 ↔ ISO BMFF), producing progressive output manifests and segments cached at the CDN with configurable TTLs. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (CBCS + CENC simultaneously), **multi-key DRM** with per-track keying, **configurable cache-control headers** (env var defaults, per-request overrides, safety invariants), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **subtitle/text track pass-through** (WebVTT/TTML, CEA-608/708), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **low-latency streaming** (LL-HLS partial segments, LL-DASH), **trick play** (HLS I-frame playlists, DASH trick play AdaptationSets), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), and codec string extraction for manifest signaling.
+edgepack repackages DASH and HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4 ↔ ISO BMFF), producing progressive output manifests and segments cached at the CDN with configurable TTLs. Supports **lossless multi-variant ABR** (preserves all video variants from source DASH/HLS, per-variant routing, parallel processing, real bandwidth/resolution/codecs metadata), **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (CBCS + CENC simultaneously), **multi-key DRM** with per-track keying, **configurable cache-control headers** (env var defaults, per-request overrides, safety invariants), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **subtitle/text track pass-through** (WebVTT/TTML, CEA-608/708), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **low-latency streaming** (LL-HLS partial segments, LL-DASH), **trick play** (HLS I-frame playlists, DASH trick play AdaptationSets), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), and codec string extraction for manifest signaling.
 
 ## Why WASM at the Edge
 
@@ -74,7 +74,7 @@ target/wasm32-wasip2/release/edgepack.wasm
 | Feature | Description |
 |---------|-------------|
 | `ts` | MPEG-TS input (TS demux + CMAF transmux) and output (CMAF→TS mux + AES-128 encryption) |
-| `sandbox` | Local development sandbox with web UI (native binary, not WASM) |
+| `sandbox` | Local development sandbox with web UI (native binary, not WASM). Includes `ts` automatically. |
 
 #### Binary Size
 
@@ -105,7 +105,7 @@ Tests run on the native host target (not WASM), since the test harness cannot ex
 cargo test --target $(rustc -vV | grep host | awk '{print $2}')
 ```
 
-The project includes **1,346 tests** without optional features. With `--features ts`: **1,508 tests**. See [`docs/testing.md`](docs/testing.md) for detailed coverage tables, fixtures, and benchmarks. Quick examples:
+The project includes **1,413 tests** without optional features. With `--features ts`: **1,575 tests**. See [`docs/testing.md`](docs/testing.md) for detailed coverage tables, fixtures, and benchmarks. Quick examples:
 
 ```bash
 cargo test --target $(rustc -vV | grep host | awk '{print $2}') drm::            # specific module
@@ -194,17 +194,27 @@ GET /repackage/{content_id}/{format}/init.mp4
 GET /repackage/{content_id}/{format}/segment_{n}.{ext}
 GET /repackage/{content_id}/{format}/iframes
 GET /repackage/{content_id}/{format}/key
+
+# Per-variant routes (multi-variant ABR)
+GET /repackage/{content_id}/{format}/v/{vid}/manifest
+GET /repackage/{content_id}/{format}/v/{vid}/init.mp4
+GET /repackage/{content_id}/{format}/v/{vid}/segment_{n}.{ext}
+GET /repackage/{content_id}/{format}/v/{vid}/iframes
+
 GET /health
 ```
 
 - `{content_id}` — unique content identifier
 - `{format}` — `hls`, `dash`, or scheme-qualified: `hls_cenc`, `hls_cbcs`, `dash_cenc`, `dash_cbcs`, `hls_none`, `dash_none`
+- `{vid}` — variant index (0-indexed, sorted by bandwidth ascending)
 - `{n}` — segment number (0-indexed)
 - `{ext}` — any CMAF or ISOBMFF segment extension (see [Supported Segment Extensions](#supported-segment-extensions))
 
 The `/key` endpoint serves the raw 16-byte AES-128 key for HLS-TS `#EXT-X-KEY:METHOD=AES-128` URI. Only valid when the container format is TS and content is encrypted.
 
 The `/iframes` endpoint serves HLS I-frame-only playlists (`#EXT-X-I-FRAMES-ONLY`) for trick play. For DASH, trick play is embedded in the regular MPD.
+
+For multi-variant sources, the top-level `/manifest` returns a master manifest referencing per-variant media playlists at `/v/{vid}/manifest`. Each variant's init segment, segments, and I-frame playlist are independently cacheable at their own URLs — enabling CDN edge nodes to process and cache only the variants that viewers actually request.
 
 Scheme-qualified format paths (e.g., `hls_cenc`) route to scheme-specific cached data. Plain format paths (`hls`, `dash`) route to the default/sole target scheme for backward compatibility.
 
@@ -358,7 +368,7 @@ These are only included when building with `--features sandbox` and are gated be
 
 ## Local Sandbox
 
-The sandbox tests the full repackaging pipeline locally without deploying to a CDN edge. It reuses the same `RepackagePipeline` as the production WASM build, with `reqwest` for HTTP and an in-memory encrypted cache.
+The sandbox tests the full repackaging pipeline locally without deploying to a CDN edge. It reuses the same `RepackagePipeline` as the production WASM build, with `reqwest` for HTTP and an in-memory encrypted cache. The `sandbox` feature includes `ts` automatically, enabling MPEG-TS I/O without a separate feature flag. The sandbox processes all video variants in parallel (via scoped threads), rebuilds the combined master manifest progressively as variants become ready, and defers the first manifest write until all variants + audio have produced at least one playable segment for fastest time-to-first-playback. Non-ISOBMFF variants (e.g., VP9 in WebM) are detected and filtered at source detection time, with skipped variant details reported in the status API.
 
 ### Running
 
@@ -377,20 +387,32 @@ Local file paths (e.g. `./content/master.m3u8`) are also supported — the sandb
 
 ### How It Works
 
-1. The web UI collects source URL, SPEKE credentials, and output format
-2. The sandbox builds an `AppConfig` and `RepackageRequest`, then runs `RepackagePipeline::execute()` in a blocking thread
-3. The pipeline fetches the source manifest, gets DRM keys via SPEKE, and repackages all segments — returning `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` with per-(format, scheme) output in memory
-4. On completion, output is written to disk per scheme at `sandbox/output/{content_id}/{format}_{scheme}/`
+1. The web UI collects source URL, SPEKE credentials, output format, container format, and encryption scheme
+2. The sandbox resolves master playlists to separate video, audio, and text track URLs
+3. Each track is processed progressively via `RepackagePipeline::execute_progressive()` — segments and manifests are written to disk as they complete, enabling playback before the pipeline finishes
+4. Audio segments are prefixed `audio_`, text segments `text_N_`. Combined manifests (HLS master with audio/subtitle groups, DASH MPD with audio/text AdaptationSets) are rebuilt after each track segment
+5. On completion, final combined manifests are written to `sandbox/output/{content_id}/{format}_{scheme}/`
 
 ### Output Structure
 
 ```
 sandbox/output/{content_id}/{format}_{scheme}/
-├── manifest.m3u8   (or manifest.mpd)
-├── iframes.m3u8    (HLS only, when enable_iframe_playlist=true)
-├── init.mp4
-├── segment_0.cmfv  (or .m4s or .mp4 or .ts)
-├── segment_1.cmfv
+├── manifest.m3u8       (or manifest.mpd — combined master with all tracks)
+├── v0_video.m3u8       (variant 0 media playlist — multi-variant)
+├── v1_video.m3u8       (variant 1 media playlist — multi-variant)
+├── video.m3u8          (or video.mpd — single-variant fallback)
+├── audio.m3u8          (or audio.mpd — audio-only manifest, if separate audio)
+├── text_0.m3u8         (subtitle track manifest, if present)
+├── text_0.vtt          (raw WebVTT subtitle file, if source is text/vtt)
+├── v0_init.mp4         (variant 0 init segment — multi-variant)
+├── v1_init.mp4         (variant 1 init segment — multi-variant)
+├── init.mp4            (video init segment — single-variant fallback)
+├── audio_init.mp4      (audio init segment, if separate audio)
+├── v0_segment_0.cmfv   (variant 0 segments — multi-variant)
+├── v0_segment_1.cmfv
+├── v1_segment_0.cmfv   (variant 1 segments — multi-variant)
+├── segment_0.cmfv      (single-variant fallback)
+├── audio_segment_0.cmfa
 └── ...
 ```
 
@@ -407,11 +429,11 @@ For dual-scheme output, each scheme gets its own directory (e.g., `hls_cenc/` an
 
 ## Project Status
 
-The runtime is fully implemented and compiles to a ~628 KB WASM component that instantiates in under 1 ms — production-ready for JIT packaging at the edge. All nine encryption scheme combinations, four container formats (CMAF, fMP4, ISO BMFF, MPEG-TS), dual-format output (simultaneous HLS + DASH sharing format-agnostic segments), dual-scheme output, multi-key DRM with per-track keying, subtitle/text track pass-through, SCTE-35 ad marker pass-through, codec/scheme compatibility validation, advanced DRM (ClearKey, raw key mode, key rotation, clear lead), low-latency streaming (LL-HLS partial segments, LL-DASH), trick play (HLS I-frame playlists, DASH trick play AdaptationSets), MPEG-TS input/output (feature-gated), and configurable cache-control headers are supported. The in-process cache encrypts sensitive DRM data at rest with AES-128-CTR and cleans up keys after processing completes. Portable across any CDN supporting WASI Preview 2.
+The runtime is fully implemented and compiles to a ~628 KB WASM component that instantiates in under 1 ms — production-ready for JIT packaging at the edge. All nine encryption scheme combinations, four container formats (CMAF, fMP4, ISO BMFF, MPEG-TS), dual-format output (simultaneous HLS + DASH sharing format-agnostic segments), dual-scheme output, multi-key DRM with per-track keying, lossless multi-variant ABR (per-variant routing, CDN fan-out, parallel processing), subtitle/text track pass-through, SCTE-35 ad marker pass-through, codec/scheme compatibility validation, advanced DRM (ClearKey, raw key mode, key rotation, clear lead), low-latency streaming (LL-HLS partial segments, LL-DASH), trick play (HLS I-frame playlists, DASH trick play AdaptationSets), MPEG-TS input/output (feature-gated), and configurable cache-control headers are supported. The in-process cache encrypts sensitive DRM data at rest with AES-128-CTR and cleans up keys after processing completes. Portable across any CDN supporting WASI Preview 2.
 
 ## Roadmap
 
-Phases 1–14, 16, 17, 19, 21, and 22 are complete. All P0 and P1 items are done. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. See [`docs/roadmap.md`](docs/roadmap.md) for detailed phase descriptions.
+Phases 1–14, 16, 17, 19, 21, 22, and 24–28 are complete. All P0 and P1 items are done. The roadmap targets feature parity with Shaka Packager and AWS Elemental MediaPackage, optimized for CDN edge deployment. See [`docs/roadmap.md`](docs/roadmap.md) for detailed phase descriptions.
 
 ## License
 

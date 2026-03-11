@@ -243,8 +243,21 @@ fn wasi_err(context: &str) -> EdgepackError {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
+fn shared_reqwest_client() -> &'static reqwest::blocking::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .pool_max_idle_per_host(32)
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
 fn send_reqwest(req: OutgoingHttpRequest) -> Result<HttpClientResponse> {
-    let client = reqwest::blocking::Client::new();
+    let client = shared_reqwest_client();
 
     let mut builder = match req.method {
         HttpClientMethod::Get => client.get(&req.url),
