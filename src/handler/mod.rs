@@ -130,6 +130,48 @@ pub fn route(req: &HttpRequest, ctx: &HandlerContext) -> Result<HttpResponse> {
             request::handle_key_request(content_id, output_format, scheme.as_deref(), ctx)
         }
 
+        // Per-variant routes — matched before catch-all segment route.
+        // CDN fan-out: each variant is an independent cache key processed by a separate WASM invocation.
+        // GET /repackage/{content_id}/{format}/v/{vid}/manifest
+        (HttpMethod::Get, ["repackage", content_id, format, "v", vid, "manifest"]) => {
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
+            let variant_id: u32 = vid.parse().map_err(|_| {
+                EdgepackError::InvalidInput(format!("invalid variant ID: {vid}"))
+            })?;
+            request::handle_variant_manifest_request(content_id, output_format, variant_id, scheme.as_deref(), ctx)
+        }
+
+        // GET /repackage/{content_id}/{format}/v/{vid}/init.mp4
+        (HttpMethod::Get, ["repackage", content_id, format, "v", vid, "init.mp4"]) => {
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
+            let variant_id: u32 = vid.parse().map_err(|_| {
+                EdgepackError::InvalidInput(format!("invalid variant ID: {vid}"))
+            })?;
+            request::handle_variant_init_request(content_id, output_format, variant_id, scheme.as_deref(), ctx)
+        }
+
+        // GET /repackage/{content_id}/{format}/v/{vid}/iframes
+        (HttpMethod::Get, ["repackage", content_id, format, "v", vid, "iframes"]) => {
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
+            let variant_id: u32 = vid.parse().map_err(|_| {
+                EdgepackError::InvalidInput(format!("invalid variant ID: {vid}"))
+            })?;
+            request::handle_variant_iframe_request(content_id, output_format, variant_id, scheme.as_deref(), ctx)
+        }
+
+        // GET /repackage/{content_id}/{format}/v/{vid}/segment_{n}.{ext}
+        (HttpMethod::Get, ["repackage", content_id, format, "v", vid, segment_file]) => {
+            let (output_format, scheme) = parse_and_check_policy(format, ctx)?;
+            let variant_id: u32 = vid.parse().map_err(|_| {
+                EdgepackError::InvalidInput(format!("invalid variant ID: {vid}"))
+            })?;
+            if let Some(seg_num) = parse_segment_number(segment_file) {
+                request::handle_variant_segment_request(content_id, output_format, variant_id, seg_num, scheme.as_deref(), ctx)
+            } else {
+                Ok(HttpResponse::not_found("unknown resource"))
+            }
+        }
+
         // On-demand: GET /repackage/{content_id}/{format}/segment_{n}.{ext}
         // Accepts all CMAF (ISO 23000-19) and ISOBMFF (ISO 14496-12) segment extensions:
         // .cmfv, .cmfa, .cmft, .cmfm, .m4s, .mp4, .m4a, .ts

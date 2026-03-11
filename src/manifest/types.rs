@@ -69,6 +69,16 @@ pub struct VariantInfo {
     /// ISO 639-2/T language code (e.g., "eng", "und"). Used for audio/subtitle renditions.
     #[serde(default)]
     pub language: Option<String>,
+    /// Per-variant segment path prefix for DASH multi-variant output.
+    ///
+    /// When set, the DASH renderer generates a per-Representation `<SegmentTemplate>`
+    /// instead of a shared AdaptationSet-level one. Used for multi-variant output where
+    /// each variant has its own init and media segments at different paths.
+    ///
+    /// CDN example: `"v/0/"` → `initialization="v/0/init.mp4"`, `media="v/0/segment_$Number$.cmfv"`
+    /// Sandbox example: `"v0_"` → `initialization="v0_init.mp4"`, `media="v0_segment_$Number$.cmfv"`
+    #[serde(default)]
+    pub segment_path_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +507,42 @@ impl ManifestState {
     }
 }
 
+/// Variant metadata extracted from source manifest (DASH Representations or HLS variants).
+///
+/// Captures per-variant attributes needed for lossless manifest rendering:
+/// bandwidth, resolution, codecs, and frame rate. Used by the pipeline to populate
+/// `ManifestState.variants` with real source metadata instead of hardcoded defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceVariantInfo {
+    /// Bandwidth in bits per second.
+    pub bandwidth: u64,
+    /// Video width in pixels.
+    pub width: Option<u32>,
+    /// Video height in pixels.
+    pub height: Option<u32>,
+    /// Codec string from manifest (e.g., "avc1.64001f").
+    pub codecs: Option<String>,
+    /// Frame rate from manifest (e.g., "24", "30000/1001").
+    pub frame_rate: Option<String>,
+}
+
+/// Rendition metadata extracted from HLS master playlist or DASH AdaptationSet.
+///
+/// Represents an audio, subtitle, or closed-caption rendition group member.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlsRenditionInfo {
+    /// URI of the rendition playlist (None for closed captions which are inline).
+    pub uri: Option<String>,
+    /// Human-readable name for the rendition.
+    pub name: String,
+    /// ISO 639-1/2 language code (e.g., "en", "eng").
+    pub language: Option<String>,
+    /// Group ID this rendition belongs to.
+    pub group_id: String,
+    /// Whether this is the default rendition in the group.
+    pub is_default: bool,
+}
+
 /// Parsed source manifest information (input side).
 ///
 /// Extracted from an HLS M3U8 or DASH MPD source manifest. Contains
@@ -556,6 +602,11 @@ pub struct SourceManifest {
     /// `segment_durations`, and `segment_byte_ranges` are populated.
     #[serde(default)]
     pub segment_base: Option<SegmentBaseSource>,
+    /// Source variant metadata extracted from DASH Representations or HLS master playlist.
+    /// Contains per-variant bandwidth, resolution, codecs, and frame rate.
+    /// Empty for single-variant sources or when metadata is unavailable.
+    #[serde(default)]
+    pub source_variants: Vec<SourceVariantInfo>,
 }
 
 /// SegmentBase metadata for DASH on-demand profiles.
@@ -669,6 +720,7 @@ mod tests {
             frame_rate: Some(30.0),
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         };
         assert_eq!(v.track_type, TrackMediaType::Video);
         assert_eq!(v.resolution, Some((1920, 1080)));
@@ -684,6 +736,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Audio,
             language: Some("eng".to_string()),
+            segment_path_prefix: None,
         };
         assert_eq!(v.track_type, TrackMediaType::Audio);
         assert!(v.resolution.is_none());
@@ -700,6 +753,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("eng".to_string()),
+            segment_path_prefix: None,
         };
         assert_eq!(v.track_type, TrackMediaType::Subtitle);
         assert_eq!(v.codecs, "wvtt");
@@ -1067,6 +1121,7 @@ mod tests {
             init_byte_range: None,
             segment_byte_ranges: Vec::new(),
             segment_base: None,
+            source_variants: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: SourceManifest = serde_json::from_str(&json).unwrap();
@@ -1449,6 +1504,7 @@ mod tests {
             init_byte_range: None,
             segment_byte_ranges: Vec::new(),
             segment_base: None,
+            source_variants: Vec::new(),
         };
         let json = serde_json::to_string(&source).unwrap();
         let parsed: SourceManifest = serde_json::from_str(&json).unwrap();

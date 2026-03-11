@@ -248,7 +248,7 @@ impl RepackagePipeline {
                 };
                 let mut progressive =
                     ProgressiveOutput::new(content_id.clone(), out_format, base_url, drm_info, container_format);
-                progressive.set_variants(build_variants_from_tracks(&tracks));
+                progressive.set_variants(build_variants_from_tracks(&tracks, Some(&source)));
                 if !skip_init {
                     progressive.set_init_segment(new_init.clone());
                 }
@@ -864,7 +864,7 @@ impl RepackagePipeline {
             init_segment: jit_init_segment,
             segments: manifest_segments,
             target_duration,
-            variants: build_variants_from_tracks(&tracks),
+            variants: build_variants_from_tracks(&tracks, Some(&source)),
             drm_info,
             media_sequence: 0,
             base_url: base_url.to_string(),
@@ -1072,11 +1072,24 @@ fn build_track_key_mapping(
 
 /// Build VariantInfo from extracted track metadata for manifest population.
 ///
-/// Converts each video/audio track into a VariantInfo with codec string.
-/// Tracks with unknown types are skipped. Bandwidth defaults to 0
-/// (will be updated from actual segment sizes if needed).
-fn build_variants_from_tracks(tracks: &[TrackInfo]) -> Vec<VariantInfo> {
-    tracks
+/// Converts each video/audio track into a VariantInfo with codec string,
+/// enriched with source variant metadata when available. For multi-variant
+/// sources, creates one VariantInfo per source variant (for master manifest
+/// rendering) while using the processed variant's codec string from the
+/// actual init segment.
+///
+/// When `source` is provided and has `source_variants`, the first matching
+/// source variant enriches the processed video track with bandwidth,
+/// resolution (from tkhd if available, falling back to source), and frame rate.
+pub fn build_variants_from_tracks(tracks: &[TrackInfo], source: Option<&SourceManifest>) -> Vec<VariantInfo> {
+    let source_variants = source.map(|s| &s.source_variants[..]).unwrap_or(&[]);
+
+    // Find the first video track's codec string for use with source variants
+    let video_codec = tracks.iter()
+        .find(|t| t.track_type == crate::media::TrackType::Video)
+        .map(|t| t.codec_string.clone());
+
+    let mut result: Vec<VariantInfo> = tracks
         .iter()
         .filter_map(|t| {
             let track_type = match t.track_type {
@@ -1085,6 +1098,50 @@ fn build_variants_from_tracks(tracks: &[TrackInfo]) -> Vec<VariantInfo> {
                 crate::media::TrackType::Subtitle => TrackMediaType::Subtitle,
                 _ => return None,
             };
+
+            // For video tracks, try to enrich with source variant metadata
+            if track_type == TrackMediaType::Video {
+                // Use tkhd dimensions if available
+                let tkhd_resolution = match (t.width, t.height) {
+                    (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                    _ => None,
+                };
+
+                // If we have source variants, use the first one's metadata
+                // to enrich this track (single-variant pipeline processing)
+                if let Some(sv) = source_variants.first() {
+                    let resolution = tkhd_resolution.or_else(|| {
+                        match (sv.width, sv.height) {
+                            (Some(w), Some(h)) => Some((w, h)),
+                            _ => None,
+                        }
+                    });
+                    let frame_rate = sv.frame_rate.as_ref().and_then(|fr| parse_frame_rate(fr));
+
+                    return Some(VariantInfo {
+                        id: t.track_id.to_string(),
+                        bandwidth: sv.bandwidth,
+                        codecs: t.codec_string.clone(),
+                        resolution,
+                        frame_rate,
+                        track_type,
+                        language: t.language.clone(),
+                        segment_path_prefix: None,
+                    });
+                }
+
+                return Some(VariantInfo {
+                    id: t.track_id.to_string(),
+                    bandwidth: 0,
+                    codecs: t.codec_string.clone(),
+                    resolution: tkhd_resolution,
+                    frame_rate: None,
+                    track_type,
+                    language: t.language.clone(),
+                    segment_path_prefix: None,
+                });
+            }
+
             Some(VariantInfo {
                 id: t.track_id.to_string(),
                 bandwidth: 0,
@@ -1093,9 +1150,59 @@ fn build_variants_from_tracks(tracks: &[TrackInfo]) -> Vec<VariantInfo> {
                 frame_rate: None,
                 track_type,
                 language: t.language.clone(),
+                segment_path_prefix: None,
             })
         })
-        .collect()
+        .collect();
+
+    // If source has multiple video variants, add the remaining variants
+    // to the result for master manifest rendering. Each gets the processed
+    // video track's codec string since they share the same codec family.
+    //
+    // For multi-variant output: set segment_path_prefix on ALL video variants
+    // (including the first one from the track). This enables per-Representation
+    // SegmentTemplate in DASH and per-variant segment paths in HLS.
+    // CDN paths: "v/0/", "v/1/", etc.
+    if source_variants.len() > 1 {
+        // Set prefix on the first video variant (already in result from track parsing)
+        if let Some(first_video) = result.iter_mut().find(|v| v.track_type == TrackMediaType::Video) {
+            first_video.id = "v0".to_string();
+            first_video.segment_path_prefix = Some("v/0/".to_string());
+        }
+
+        if let Some(ref codec) = video_codec {
+            for (idx, sv) in source_variants.iter().enumerate().skip(1) {
+                let resolution = match (sv.width, sv.height) {
+                    (Some(w), Some(h)) => Some((w, h)),
+                    _ => None,
+                };
+                let frame_rate = sv.frame_rate.as_ref().and_then(|fr| parse_frame_rate(fr));
+                result.push(VariantInfo {
+                    id: format!("v{}", idx),
+                    bandwidth: sv.bandwidth,
+                    codecs: sv.codecs.as_ref().unwrap_or(codec).clone(),
+                    resolution,
+                    frame_rate,
+                    track_type: TrackMediaType::Video,
+                    language: None,
+                    segment_path_prefix: Some(format!("v/{idx}/")),
+                });
+            }
+        }
+    }
+
+    result
+}
+
+/// Parse a frame rate string (e.g., "24", "30000/1001", "29.97") into an f64.
+fn parse_frame_rate(fr: &str) -> Option<f64> {
+    if let Some((num, den)) = fr.split_once('/') {
+        let n = num.parse::<f64>().ok()?;
+        let d = den.parse::<f64>().ok()?;
+        if d > 0.0 { Some(n / d) } else { None }
+    } else {
+        fr.parse::<f64>().ok()
+    }
 }
 
 fn find_key_for_kid(key_set: &DrmKeySet, kid: &[u8; 16]) -> Result<ContentKey> {
@@ -1892,6 +1999,8 @@ mod tests {
                 timescale: 90000,
                 kid: Some([0xAA; 16]),
                 language: None,
+                width: Some(1920),
+                height: Some(1080),
             },
             TrackInfo {
                 track_type: TrackType::Audio,
@@ -1900,6 +2009,8 @@ mod tests {
                 timescale: 44100,
                 kid: Some([0xBB; 16]),
                 language: None,
+                width: None,
+                height: None,
             },
         ];
 
@@ -1960,6 +2071,8 @@ mod tests {
             timescale: 90000,
             kid: Some([0xAA; 16]),
             language: None,
+            width: Some(1920),
+            height: Some(1080),
         }];
 
         let info = ProtectionSchemeInfo {
@@ -1995,14 +2108,17 @@ mod tests {
             timescale: 90000,
             kid: None,
             language: None,
+            width: Some(1920),
+            height: Some(1080),
         }];
 
-        let variants = build_variants_from_tracks(&tracks);
+        let variants = build_variants_from_tracks(&tracks, None);
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].id, "1");
         assert_eq!(variants[0].codecs, "avc1.64001f");
         assert_eq!(variants[0].track_type, TrackMediaType::Video);
         assert_eq!(variants[0].bandwidth, 0);
+        assert_eq!(variants[0].resolution, Some((1920, 1080)));
     }
 
     #[test]
@@ -2017,9 +2133,11 @@ mod tests {
             timescale: 44100,
             kid: None,
             language: None,
+            width: None,
+            height: None,
         }];
 
-        let variants = build_variants_from_tracks(&tracks);
+        let variants = build_variants_from_tracks(&tracks, None);
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].codecs, "mp4a.40.2");
         assert_eq!(variants[0].track_type, TrackMediaType::Audio);
@@ -2038,6 +2156,8 @@ mod tests {
                 timescale: 90000,
                 kid: None,
                 language: None,
+                width: Some(1280),
+                height: Some(720),
             },
             TrackInfo {
                 track_type: TrackType::Audio,
@@ -2046,10 +2166,12 @@ mod tests {
                 timescale: 44100,
                 kid: None,
                 language: None,
+                width: None,
+                height: None,
             },
         ];
 
-        let variants = build_variants_from_tracks(&tracks);
+        let variants = build_variants_from_tracks(&tracks, None);
         assert_eq!(variants.len(), 2);
         assert_eq!(variants[0].track_type, TrackMediaType::Video);
         assert_eq!(variants[1].track_type, TrackMediaType::Audio);
@@ -2067,9 +2189,11 @@ mod tests {
             timescale: 1000,
             kid: None,
             language: Some("eng".to_string()),
+            width: None,
+            height: None,
         }];
 
-        let variants = build_variants_from_tracks(&tracks);
+        let variants = build_variants_from_tracks(&tracks, None);
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].track_type, TrackMediaType::Subtitle);
         assert_eq!(variants[0].codecs, "wvtt");
@@ -2089,17 +2213,143 @@ mod tests {
                 timescale: 0,
                 kid: None,
                 language: None,
+                width: None,
+                height: None,
             },
         ];
 
-        let variants = build_variants_from_tracks(&tracks);
+        let variants = build_variants_from_tracks(&tracks, None);
         assert!(variants.is_empty());
     }
 
     #[test]
     fn build_variants_from_tracks_empty() {
-        let variants = build_variants_from_tracks(&[]);
+        let variants = build_variants_from_tracks(&[], None);
         assert!(variants.is_empty());
+    }
+
+    #[test]
+    fn build_variants_from_tracks_with_source_metadata() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+        use crate::manifest::types::{SourceManifest, SourceVariantInfo};
+
+        let tracks = vec![TrackInfo {
+            track_type: TrackType::Video,
+            track_id: 1,
+            codec_string: "avc1.64001f".to_string(),
+            timescale: 90000,
+            kid: None,
+            language: None,
+            width: Some(1920),
+            height: Some(1080),
+        }];
+
+        let mut source = SourceManifest {
+            init_segment_url: String::new(),
+            segment_urls: Vec::new(),
+            segment_durations: Vec::new(),
+            is_live: false,
+            source_scheme: None,
+            ad_breaks: Vec::new(),
+            parts: Vec::new(),
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info: None,
+            is_ts_source: false,
+            aes128_key_url: None,
+            aes128_iv: None,
+            content_steering: None,
+            init_byte_range: None,
+            segment_byte_ranges: Vec::new(),
+            segment_base: None,
+            source_variants: vec![
+                SourceVariantInfo {
+                    bandwidth: 5000000,
+                    width: Some(1920),
+                    height: Some(1080),
+                    codecs: Some("avc1.64001f".to_string()),
+                    frame_rate: Some("24".to_string()),
+                },
+            ],
+        };
+
+        let variants = build_variants_from_tracks(&tracks, Some(&source));
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].bandwidth, 5000000);
+        assert_eq!(variants[0].resolution, Some((1920, 1080)));
+        assert_eq!(variants[0].frame_rate, Some(24.0));
+    }
+
+    #[test]
+    fn build_variants_from_tracks_multi_variant_source() {
+        use crate::media::codec::TrackInfo;
+        use crate::media::TrackType;
+        use crate::manifest::types::{SourceManifest, SourceVariantInfo};
+
+        let tracks = vec![TrackInfo {
+            track_type: TrackType::Video,
+            track_id: 1,
+            codec_string: "avc1.64001f".to_string(),
+            timescale: 90000,
+            kid: None,
+            language: None,
+            width: Some(1920),
+            height: Some(1080),
+        }];
+
+        let source = SourceManifest {
+            init_segment_url: String::new(),
+            segment_urls: Vec::new(),
+            segment_durations: Vec::new(),
+            is_live: false,
+            source_scheme: None,
+            ad_breaks: Vec::new(),
+            parts: Vec::new(),
+            part_target_duration: None,
+            server_control: None,
+            ll_dash_info: None,
+            is_ts_source: false,
+            aes128_key_url: None,
+            aes128_iv: None,
+            content_steering: None,
+            init_byte_range: None,
+            segment_byte_ranges: Vec::new(),
+            segment_base: None,
+            source_variants: vec![
+                SourceVariantInfo {
+                    bandwidth: 500000,
+                    width: Some(426),
+                    height: Some(240),
+                    codecs: Some("avc1.42c00d".to_string()),
+                    frame_rate: None,
+                },
+                SourceVariantInfo {
+                    bandwidth: 2000000,
+                    width: Some(1280),
+                    height: Some(720),
+                    codecs: Some("avc1.64001f".to_string()),
+                    frame_rate: None,
+                },
+                SourceVariantInfo {
+                    bandwidth: 5000000,
+                    width: Some(1920),
+                    height: Some(1080),
+                    codecs: Some("avc1.640028".to_string()),
+                    frame_rate: None,
+                },
+            ],
+        };
+
+        let variants = build_variants_from_tracks(&tracks, Some(&source));
+        // Should have 1 video from track + 2 additional from source variants
+        let video_variants: Vec<_> = variants.iter()
+            .filter(|v| v.track_type == TrackMediaType::Video)
+            .collect();
+        assert_eq!(video_variants.len(), 3);
+        assert_eq!(video_variants[0].bandwidth, 500000);
+        assert_eq!(video_variants[1].bandwidth, 2000000);
+        assert_eq!(video_variants[2].bandwidth, 5000000);
     }
 
     #[test]

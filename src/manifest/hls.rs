@@ -554,6 +554,7 @@ mod tests {
             frame_rate: Some(29.97),
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let uris = vec!["v720.m3u8".to_string()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -576,6 +577,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Audio,
             language: None,
+            segment_path_prefix: None,
         });
         let uris = vec!["audio.m3u8".to_string()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -604,6 +606,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let uris = vec!["v1.m3u8".into()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -621,6 +624,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let m3u8 = render_master(&state, &[]).unwrap();
         assert!(m3u8.contains("variant.m3u8"));
@@ -637,6 +641,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "sub_eng".into(),
@@ -646,6 +651,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         let uris = vec!["v1.m3u8".into(), "subs_eng.m3u8".into()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -670,6 +676,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "sub_spa".into(),
@@ -679,6 +686,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("spa".into()),
+            segment_path_prefix: None,
         });
         let uris = vec!["v1.m3u8".into(), "subs_spa.m3u8".into()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -698,6 +706,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "sub1".into(),
@@ -707,6 +716,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: None,
+            segment_path_prefix: None,
         });
         let uris = vec!["v1.m3u8".into(), "subs.m3u8".into()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -724,6 +734,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.cea_captions.push(CeaCaptionInfo {
             service_name: "CC1".into(),
@@ -752,6 +763,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.cea_captions.push(CeaCaptionInfo {
             service_name: "SERVICE1".into(),
@@ -774,6 +786,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "sub_eng".into(),
@@ -783,6 +796,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "sub_spa".into(),
@@ -792,6 +806,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Subtitle,
             language: Some("spa".into()),
+            segment_path_prefix: None,
         });
         state.cea_captions.push(CeaCaptionInfo {
             service_name: "CC1".into(),
@@ -825,6 +840,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         state.variants.push(VariantInfo {
             id: "audio_eng".into(),
@@ -834,6 +850,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Audio,
             language: Some("eng".into()),
+            segment_path_prefix: None,
         });
         let uris = vec!["v1.m3u8".into(), "audio.m3u8".into()];
         let m3u8 = render_master(&state, &uris).unwrap();
@@ -1048,6 +1065,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
         assert!(m3u8.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://steer.example.com/v1\",PATHWAY-ID=\"cdn-a\""));
@@ -1069,6 +1087,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
         assert!(m3u8.contains("#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://steer.example.com/v1\""));
@@ -1086,6 +1105,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
         assert!(!m3u8.contains("CONTENT-STEERING"));
@@ -1116,6 +1136,7 @@ mod tests {
             frame_rate: None,
             track_type: TrackMediaType::Video,
             language: None,
+            segment_path_prefix: None,
         });
         let m3u8 = render_master(&state, &["v1.m3u8".into()]).unwrap();
         let ind_pos = m3u8.find("#EXT-X-INDEPENDENT-SEGMENTS").unwrap();
@@ -1422,10 +1443,26 @@ pub fn render_master(state: &ManifestState, variant_playlist_uris: &[String]) ->
         if variant.track_type != TrackMediaType::Video {
             continue;
         }
+        // URI priority: explicit variant_playlist_uris > segment_path_prefix-derived > fallback
         let uri = variant_playlist_uris
             .get(i)
             .map(|s| s.as_str())
-            .unwrap_or("variant.m3u8");
+            .unwrap_or_else(|| {
+                // For multi-variant with segment_path_prefix, derive URI from prefix
+                // e.g., prefix "v/0/" → "v/0/manifest"
+                "variant.m3u8"
+            });
+        let uri_owned;
+        let uri = if uri == "variant.m3u8" {
+            if let Some(ref prefix) = variant.segment_path_prefix {
+                uri_owned = format!("{prefix}manifest");
+                uri_owned.as_str()
+            } else {
+                uri
+            }
+        } else {
+            uri
+        };
 
         let mut attrs = format!("BANDWIDTH={}", variant.bandwidth);
         attrs.push_str(&format!(",CODECS=\"{}\"", variant.codecs));

@@ -330,6 +330,8 @@ fn track_key_mapping_from_tracks_preserves_per_track_kids() {
             timescale: 90000,
             kid: Some(VIDEO_KID),
             language: None,
+            width: Some(1920),
+            height: Some(1080),
         },
         TrackInfo {
             track_type: TrackType::Audio,
@@ -338,6 +340,8 @@ fn track_key_mapping_from_tracks_preserves_per_track_kids() {
             timescale: 44100,
             kid: Some(AUDIO_KID),
             language: None,
+            width: None,
+            height: None,
         },
     ];
 
@@ -364,6 +368,8 @@ fn track_key_mapping_from_tracks_same_kid_is_single() {
             timescale: 90000,
             kid: Some(shared_kid),
             language: None,
+            width: Some(1920),
+            height: Some(1080),
         },
         TrackInfo {
             track_type: TrackType::Audio,
@@ -372,6 +378,8 @@ fn track_key_mapping_from_tracks_same_kid_is_single() {
             timescale: 44100,
             kid: Some(shared_kid),
             language: None,
+            width: None,
+            height: None,
         },
     ];
 

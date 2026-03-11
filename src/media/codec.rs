@@ -20,6 +20,10 @@ pub struct TrackInfo {
     pub kid: Option<[u8; 16]>,
     /// ISO 639-2/T language code from mdhd box (e.g., "eng", "und").
     pub language: Option<String>,
+    /// Track width from tkhd box (fixed-point 16.16, integer part).
+    pub width: Option<u32>,
+    /// Track height from tkhd box (fixed-point 16.16, integer part).
+    pub height: Option<u32>,
 }
 
 /// Maps track types to key IDs for per-track keying.
@@ -134,11 +138,14 @@ pub fn extract_tracks(init_data: &[u8]) -> Result<Vec<TrackInfo>> {
 
 /// Parse a single trak box and extract track metadata.
 fn parse_trak(trak_payload: &[u8]) -> Result<Option<TrackInfo>> {
-    // Extract track_id from tkhd
-    let track_id = if let Some(tkhd) = find_child_box(trak_payload, &box_type::TKHD) {
-        parse_tkhd_track_id(box_payload(trak_payload, &tkhd))
+    // Extract track_id and dimensions from tkhd
+    let (track_id, width, height) = if let Some(tkhd) = find_child_box(trak_payload, &box_type::TKHD) {
+        let payload = box_payload(trak_payload, &tkhd);
+        let id = parse_tkhd_track_id(payload);
+        let (w, h) = parse_tkhd_dimensions(payload);
+        (id, w, h)
     } else {
-        0
+        (0, None, None)
     };
 
     // Find mdia box
@@ -173,6 +180,8 @@ fn parse_trak(trak_payload: &[u8]) -> Result<Option<TrackInfo>> {
         timescale,
         kid,
         language,
+        width,
+        height,
     }))
 }
 
@@ -195,6 +204,56 @@ fn parse_tkhd_track_id(payload: &[u8]) -> u32 {
         payload[track_id_offset + 2],
         payload[track_id_offset + 3],
     ])
+}
+
+/// Extract width and height from tkhd payload (fixed-point 16.16 values).
+///
+/// tkhd v0 layout (total 84 bytes of payload after version+flags):
+///   version(1) + flags(3) + creation_time(4) + modification_time(4) + track_id(4) +
+///   reserved(4) + duration(4) + reserved(8) + layer(2) + alt_group(2) + volume(2) +
+///   reserved(2) + matrix(36) + width(4) + height(4)
+///   Width at offset 76, height at offset 80
+///
+/// tkhd v1 layout (total 96 bytes):
+///   version(1) + flags(3) + creation_time(8) + modification_time(8) + track_id(4) +
+///   reserved(4) + duration(8) + reserved(8) + layer(2) + alt_group(2) + volume(2) +
+///   reserved(2) + matrix(36) + width(4) + height(4)
+///   Width at offset 88, height at offset 92
+fn parse_tkhd_dimensions(payload: &[u8]) -> (Option<u32>, Option<u32>) {
+    if payload.len() < 4 {
+        return (None, None);
+    }
+    let version = payload[0];
+    let width_offset = if version == 0 { 76 } else { 88 };
+    let height_offset = width_offset + 4;
+
+    if payload.len() < height_offset + 4 {
+        return (None, None);
+    }
+
+    // Width and height are stored as fixed-point 16.16 — take integer part (upper 16 bits)
+    let width_fp = u32::from_be_bytes([
+        payload[width_offset],
+        payload[width_offset + 1],
+        payload[width_offset + 2],
+        payload[width_offset + 3],
+    ]);
+    let height_fp = u32::from_be_bytes([
+        payload[height_offset],
+        payload[height_offset + 1],
+        payload[height_offset + 2],
+        payload[height_offset + 3],
+    ]);
+
+    let width = width_fp >> 16;
+    let height = height_fp >> 16;
+
+    // Return None for zero dimensions (e.g., audio tracks)
+    if width == 0 && height == 0 {
+        (None, None)
+    } else {
+        (Some(width), Some(height))
+    }
 }
 
 /// Extract track type from hdlr payload (after box header).
@@ -865,6 +924,8 @@ mod tests {
                 timescale: 90000,
                 kid: Some([0xAA; 16]),
                 language: None,
+                width: Some(1920),
+                height: Some(1080),
             },
             TrackInfo {
                 track_type: TrackType::Audio,
@@ -873,6 +934,8 @@ mod tests {
                 timescale: 44100,
                 kid: Some([0xBB; 16]),
                 language: None,
+                width: None,
+                height: None,
             },
         ];
         let mapping = TrackKeyMapping::from_tracks(&tracks);
@@ -890,6 +953,8 @@ mod tests {
             timescale: 90000,
             kid: None,
             language: None,
+            width: Some(1920),
+            height: Some(1080),
         }];
         let mapping = TrackKeyMapping::from_tracks(&tracks);
         assert!(mapping.entries.is_empty());

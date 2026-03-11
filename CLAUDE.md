@@ -12,7 +12,7 @@ These two priorities govern all development decisions:
 
 ## Project Summary
 
-**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~628 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, config override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), and **codec/scheme compatibility validation** (pre-flight checks, HDR detection), and **DASH SegmentBase input** (on-demand profile with sidx-based byte-range indexing, HTTP Range fetching). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
+**edgepack** is a Rust library compiled to WASM (`wasm32-wasip2`) that runs on CDN edge nodes. The ~628 KB binary instantiates in under 1 ms, enabling **just-in-time (JIT) packaging** — content is repackaged on the first viewer request rather than pre-processed at origin, eliminating storage of pre-packaged variants and packaging queues. It repackages DASH/HLS CMAF/fMP4 media between encryption schemes (CBCS ↔ CENC ↔ None) and container formats (CMAF ↔ fMP4), producing progressive HLS or DASH output. Supports **dual-format output** (simultaneous HLS and DASH from a single request, sharing format-agnostic segments), **dual-scheme output** (multiple target encryption schemes simultaneously), **multi-key DRM** (per-track keying with separate video/audio KIDs and multi-KID PSSH boxes), **advanced DRM** (ClearKey, raw key mode, key rotation, clear lead), **LL-HLS & LL-DASH** (partial segments, server control, chunk detection), **trick play & I-frame playlists** (HLS `#EXT-X-I-FRAMES-ONLY` with BYTERANGE, DASH trick play AdaptationSets), **DVR sliding window** (configurable time-shift buffer, windowed manifests for live streams, automatic live-to-VOD transitions), **content steering** (HLS `#EXT-X-CONTENT-STEERING` and DASH `<ContentSteering>` injection, DASH source pass-through, config override priority), **MPEG-TS input** (TS demux + CMAF transmux, feature-gated), **MPEG-TS output** (CMAF-to-TS muxer with AES-128-CBC encryption, HLS-TS manifests, feature-gated), **SCTE-35 ad marker pass-through** (emsg extraction, HLS `#EXT-X-DATERANGE`, DASH `<EventStream>`), **codec string extraction** (RFC 6381 codec strings for manifest signaling), **subtitle/text track pass-through** (WebVTT/TTML in fMP4 with HLS subtitle rendition groups, DASH subtitle AdaptationSets, and CEA-608/708 closed caption manifest signaling), **codec/scheme compatibility validation** (pre-flight checks, HDR detection), **DASH SegmentBase input** (on-demand profile with sidx-based byte-range indexing, HTTP Range fetching), and **lossless multi-variant ABR** (preserves all video variants from source DASH/HLS manifests, per-variant routing with CDN fan-out, parallel variant processing). The target encryption scheme(s) and container format are configurable per request, supporting all encryption combinations (CBCS→CENC, CENC→CBCS, CENC→CENC, CBCS→CBCS) and clear content paths (clear→CENC, clear→CBCS, encrypted→clear, clear→clear) with automatic source scheme detection, and output as either CMAF or fragmented MP4. It communicates with DRM license servers via SPEKE 2.0 / CPIX for multi-key content encryption keys (skipped when both source and target are unencrypted, or bypassed via raw key mode).
 
 ## Build Commands
 
@@ -29,7 +29,7 @@ cargo test --target $(rustc -vV | grep host | awk '{print $2}')
 # Check without building
 cargo check
 
-# Build and run the local sandbox (native binary with web UI)
+# Build and run the local sandbox (native binary with web UI, includes TS I/O)
 cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | awk '{print $2}')
 ```
 
@@ -50,7 +50,7 @@ src/
 ├── bin/
 │   └── sandbox.rs      Local sandbox binary (Axum web UI + API, sandbox feature only)
 ├── cache/              In-process cache layer
-│   ├── mod.rs          CacheBackend trait + CacheKeys builder + global_cache() singleton
+│   ├── mod.rs          CacheBackend trait + CacheKeys builder + global_cache() singleton + variant-qualified cache keys for per-variant CDN fan-out
 │   ├── encrypted.rs    AES-128-CTR encryption decorator for sensitive cache entries (DRM keys, SPEKE responses)
 │   └── memory.rs       In-memory HashMap backend (Arc<RwLock<HashMap>>)
 ├── drm/                DRM key acquisition and encryption
@@ -76,10 +76,10 @@ src/
 │   └── transmux.rs     TS-to-CMAF transmuxer — Annex B→AVCC, init synthesis (ts feature)
 ├── manifest/           Manifest parsing (input) and rendering (output)
 │   ├── mod.rs          render_manifest() + render_iframe_manifest() dispatchers
-│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, IFrameSegmentInfo, DrmInfo, CeaCaptionInfo, AdBreakInfo, SourceManifest
+│   ├── types.rs        ManifestState, ManifestPhase, SegmentInfo, IFrameSegmentInfo, DrmInfo, CeaCaptionInfo, AdBreakInfo, SourceManifest, SourceVariantInfo, HlsRenditionInfo
 │   ├── hls.rs          HLS M3U8 renderer (media + master playlists)
 │   ├── dash.rs         DASH MPD renderer (SegmentTemplate + SegmentTimeline)
-│   ├── hls_input.rs    HLS M3U8 input parser (source manifest extraction)
+│   ├── hls_input.rs    HLS M3U8 input parser (source manifest extraction, parse_hls_master_playlist() for variant/rendition metadata extraction)
 │   └── dash_input.rs   DASH MPD input parser (SegmentTemplate + SegmentBase, source manifest extraction)
 ├── repackager/         Orchestration layer
 │   ├── mod.rs          RepackageRequest, SourceConfig types
@@ -171,6 +171,7 @@ The `ProgressiveOutput` state machine transitions:
 **Codec string extraction:** `extract_tracks()` in `media/codec.rs` parses the moov box to extract per-track metadata (`TrackInfo`):
 - Track type from `hdlr` handler type
 - Track ID from `tkhd`
+- Width and height from `tkhd` (fixed-point 16.16 format, integer pixels)
 - Timescale from `mdhd`
 - KID from `sinf → tenc` (if encrypted)
 - Language from `mdhd` (ISO 639-2/T packed 3×5-bit chars, `None` for "und")
@@ -305,11 +306,30 @@ The `drm/speke.rs` client POSTs a CPIX XML document to the license server reques
 
 **`RepackageRequest.output_formats: Vec<OutputFormat>`:** Replaces the old `output_format` (singular). Accepts `output_formats: ["hls", "dash"]` for dual-format output. `primary_format()` returns the first format (fallback: `Hls`).
 
-**Format-agnostic segment caching:** Init and media segments are cached with scheme-only keys (`ep:{id}:{scheme}:init`, `ep:{id}:{scheme}:seg:{n}`) — no format prefix. Manifest state remains per-(format, scheme) since HLS M3U8 and DASH MPD have entirely different structures.
+**Format-agnostic segment caching:** Init and media segments are cached with scheme-only keys (`ep:{id}:{scheme}:init`, `ep:{id}:{scheme}:seg:{n}`) — no format prefix. For multi-variant content, variant-qualified keys are used (`ep:{id}:v{vid}:{scheme}:init`, `ep:{id}:v{vid}:{scheme}:seg:{n}`). Manifest state remains per-(format, scheme) since HLS M3U8 and DASH MPD have entirely different structures. Source variant metadata is cached under `ep:{id}:variants` (shared across formats/schemes), and master manifests under `ep:{id}:master:{fmt}_{scheme}`.
 
 **Pipeline execution:** `execute()` returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — one output per (format, scheme) pair. Re-encryption runs once per scheme, then results are distributed to all format outputs.
 
 **Combinatorial output:** `output_formats: [Hls, Dash]` × `target_schemes: [Cenc, Cbcs]` = 4 outputs (HLS+CENC, HLS+CBCS, DASH+CENC, DASH+CBCS).
+
+### Multi-Variant Architecture (CDN Fan-Out)
+
+**Source variant metadata extraction:** The pipeline extracts all video variant metadata from source manifests. For DASH, all `<Representation>` elements within video `<AdaptationSet>`s are parsed, extracting bandwidth, width, height, codecs, and frame rate. For HLS, `parse_hls_master_playlist()` in `hls_input.rs` parses master playlists to extract `#EXT-X-STREAM-INF` variant metadata (bandwidth, resolution, codecs, frame rate) and `#EXT-X-MEDIA` rendition metadata (audio/subtitle groups). Variant metadata is stored as `Vec<SourceVariantInfo>` on `SourceManifest` and cached under `ep:{id}:variants`.
+
+**Per-variant routing:** Each video variant is independently addressable via dedicated URL paths: `/repackage/{id}/{format}/v/{vid}/manifest`, `/repackage/{id}/{format}/v/{vid}/init.mp4`, `/repackage/{id}/{format}/v/{vid}/segment_{n}.{ext}`, and `/repackage/{id}/{format}/v/{vid}/iframes`. The `{vid}` parameter is a variant index (0-based). The master manifest references these per-variant URLs, enabling CDN edge caches to independently cache each variant's segments and manifests.
+
+**CDN fan-out model:** The master manifest (served at `/repackage/{id}/{format}/manifest`) contains references to per-variant media playlists/sub-manifests. Each variant's init segment, media segments, and manifests are cached independently in both the CDN cache (via distinct URLs) and the in-process cache (via variant-qualified cache keys). This allows CDN edge nodes to fetch and cache only the variants that viewers actually request, rather than pre-processing all variants on every cache miss.
+
+**SourceVariantInfo type:** Carries per-variant metadata — `bandwidth: u64`, `resolution: Option<(u32, u32)>` (width, height), `codecs: Option<String>`, `frame_rate: Option<f64>`. Used for HLS `#EXT-X-STREAM-INF` attributes and DASH `<Representation>` attributes in the master manifest.
+
+**tkhd width/height extraction:** `extract_tracks()` in `media/codec.rs` extracts `width` and `height` from the `tkhd` box (fixed-point 16.16 format, shifted right by 16 bits to get integer pixels). These dimensions are populated into `TrackInfo` and used to build `SourceVariantInfo` resolution metadata when source manifests lack explicit resolution attributes.
+
+**Variant-qualified cache keys:** Per-variant data uses variant-scoped cache keys to avoid collisions between variants:
+- `ep:{id}:v{vid}:{scheme}:init` — per-variant init segment
+- `ep:{id}:v{vid}:{scheme}:seg:{n}` — per-variant media segment
+- `ep:{id}:v{vid}:{fmt}_{scheme}:manifest_state` — per-variant manifest state
+- `ep:{id}:variants` — source variant metadata (shared across all formats/schemes)
+- `ep:{id}:master:{fmt}_{scheme}` — master manifest
 
 ## Error Handling
 
@@ -329,11 +349,11 @@ All HTTP transport and request handling is fully implemented:
 
 ## Local Sandbox
 
-The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The sandbox calls `pipeline.execute()` which processes all segments synchronously and returns `Vec<(OutputFormat, EncryptionScheme, ProgressiveOutput)>` — per-(format, scheme) output is written to disk directly from each `ProgressiveOutput` object to `sandbox/output/{content_id}/{format}_{scheme}/`, not round-tripped through cache.
+The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses the production `RepackagePipeline` with native HTTP transport and an in-memory cache. The `sandbox` feature automatically enables the `ts` feature for full MPEG-TS I/O support. The sandbox uses `pipeline.execute_progressive()` to process all tracks (video, audio, text) progressively — segments and manifests are written to disk as they are produced, enabling playback before the pipeline completes. Per-(format, scheme) output is written to `sandbox/output/{content_id}/{format}_{scheme}/`, not round-tripped through cache.
 
 ### Architecture
 
-- **`http_client.rs`** has a three-way `#[cfg]` dispatch: `wasm32` → WASI HTTP, `sandbox` feature → `reqwest::blocking`, neither → stub error
+- **`http_client.rs`** has a three-way `#[cfg]` dispatch: `wasm32` → WASI HTTP, `sandbox` feature → `reqwest::blocking` (shared singleton via `OnceLock` with `pool_max_idle_per_host(32)` and `timeout(120s)` to support 20+ concurrent threads), neither → stub error
 - **`cache/memory.rs`** implements `CacheBackend` using `Arc<RwLock<HashMap>>` — the same global singleton used in production (shared between pipeline thread and API server)
 - **`src/bin/sandbox.rs`** is a single-file Axum server with embedded HTML/CSS/JS UI
 
@@ -342,10 +362,10 @@ The `sandbox` feature enables a native binary (`src/bin/sandbox.rs`) that reuses
 ```toml
 [features]
 ts = []                   # Phases 10+22: MPEG-TS input (demux + transmux) and output (CMAF→TS mux)
-sandbox = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
+sandbox = ["ts", "dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing-subscriber"]
 ```
 
-All sandbox dependencies are gated behind `cfg(not(target_arch = "wasm32"))` — they never appear in the WASM build. The `[[bin]]` entry uses `required-features = ["sandbox"]` so `cargo build` (WASM target) never compiles the sandbox.
+All sandbox dependencies are gated behind `cfg(not(target_arch = "wasm32"))` — they never appear in the WASM build. The `[[bin]]` entry uses `required-features = ["sandbox"]` so `cargo build` (WASM target) never compiles the sandbox. The `sandbox` feature includes `ts`, so `--features sandbox` automatically enables MPEG-TS I/O without needing a separate `--features ts` flag.
 
 ### Build & Run
 
@@ -356,7 +376,15 @@ cargo run --bin sandbox --features sandbox --target $(rustc -vV | grep host | aw
 
 ### Output
 
-Pipeline output is written to `sandbox/output/{content_id}/{format}_{scheme}/` (e.g., `sandbox/output/sb-abc123/hls_cenc/`) and served via the API at `/api/output/{id}/{format_scheme}/{file}` (reads directly from disk, not from cache). Dual-scheme requests create separate output directories per scheme.
+Pipeline output is written to `sandbox/output/{content_id}/{format}_{scheme}/` (e.g., `sandbox/output/sb-abc123/hls_cenc/`) and served via the API at `/api/output/{id}/{format_scheme}/{file}` (reads directly from disk, not from cache). Dual-scheme requests create separate output directories per scheme. The sandbox progressively processes all tracks in 4 phases: (1) video segments (all variants in parallel), (2) demuxed audio (if separate), (3) text/subtitle tracks (if present), (4) finalize combined manifests. Audio segments are prefixed `audio_`, text segments `text_N_`. Multi-variant sources produce per-variant output files (`v{vid}_init.mp4`, `v{vid}_segment_{n}.cmfv`, `v{vid}_video.m3u8`). DASH text tracks with raw WebVTT content are passed through directly without fMP4 wrapping.
+
+**Progressive manifest updates:** A shared `ProgressiveManifestContext` (behind `Arc<Mutex>`) is signaled by each thread as it produces manifest-ready output. The combined master manifest is rebuilt on disk after each signal, enabling playback before all tracks finish. The first manifest write is deferred until all expected variants + audio have produced at least one playable segment — minimizing time-to-first-playback while ensuring the manifest is immediately usable. When a variant fails (e.g., network error), `signal_video_failed()` decrements the expected count to prevent indefinite blocking.
+
+**Progress tracking:** Shared `AtomicU32` counters are updated from segment callbacks across all processing threads. A background thread flushes progress to the cache every 500ms, providing real-time `segments_completed`, `playback_ready`, and `schemes` fields in the status API during Processing state. The UI shows a pulsing progress bar with "{N} segments processed" until the total is known (on completion).
+
+**WebM/non-ISOBMFF filtering:** During source resolution in `resolve_dash_tracks()`, the `mimeType` of each DASH `<Representation>` is checked (with AdaptationSet-level inheritance). Non-ISOBMFF containers (e.g., `video/webm` for VP9) are filtered out at detection time rather than allowed to enter the pipeline and fail. Skipped variants are recorded as `SkippedVariant` structs (reason, bandwidth, resolution, codecs, mime_type) and reported in the status API response.
+
+**Status API skipped variants:** The `/api/status/{id}/{format}` endpoint includes `skipped_variants` in both the "Processing" and "Complete" states, providing full transparency about which source variants were detected but could not be processed and why.
 
 ## Dependencies
 
@@ -385,7 +413,7 @@ URL parsing uses a lightweight built-in module (`src/url.rs`) instead of the `ur
 
 ## Tests
 
-The project has **1,358 tests** without optional features. With `--features ts`: **1,520 tests**. All run on the native host target.
+The project has **1,413 tests** without optional features. With `--features ts`: **1,575 tests**. All run on the native host target.
 
 #### WASM Binary Size Guards
 
@@ -453,6 +481,7 @@ tests/
 ├── ts_output.rs              43 tests: ContainerFormat::Ts (serde, extension, validation), HLS-TS manifest (no EXT-X-MAP, VERSION:3, AES-128 KEY, .ts URIs), TS muxer (PAT/PMT/PES roundtrip, AVCC↔AnnexB, ADTS, encryption), TS validation, key endpoint routing, handler routing (ts feature)
 ├── output_integrity.rs       21 tests: segment structure validation, encrypt-decrypt roundtrip, I-frame BYTERANGE, init rewrite roundtrip, multi-KID PSSH, manifest roundtrips (HLS/DASH, live, DVR, I-frame), cache-control body invariants, TS manifest integrity (no EXT-X-MAP, .ts extensions, VERSION:3), TS encrypt-decrypt roundtrip
 ├── policy.rs                 27 tests: runtime policy controls — format denial (manifest/init/segment/iframes/key, all extensions), scheme denial (cenc/cbcs/none, qualified/unqualified URLs), combined policies, full lockdown, backward compat, health unaffected, serde roundtrips
+├── multi_variant.rs          40 tests: tkhd dimensions, SourceVariantInfo serde, DASH multi-representation parsing, HLS master playlist parsing, per-variant route handling, CacheKeys variant builders, DASH per-Representation SegmentTemplate, HLS multi-variant master
 └── wasm_binary_size.rs        1 test: WASM binary size guard (base ≤750 KB)
 ```
 
@@ -530,6 +559,10 @@ Benchmarks use synthetic fixtures from the bench file (not from `tests/common/mo
 | GET | `/repackage/{id}/{format}/iframes` | `request::handle_iframe_manifest_request` | Serve HLS I-frame playlist (DASH returns 404 — trick play embedded in MPD) |
 | GET | `/repackage/{id}/{format}/key` | `request::handle_key_request` | Serve raw AES-128 key for HLS-TS `#EXT-X-KEY` (TS container only) |
 | GET | `/repackage/{id}/{format}/segment_{n}.{ext}` | `request::handle_media_segment_request` | Serve repackaged media segment (accepts all 8 extensions incl. `.ts`) |
+| GET | `/repackage/{id}/{format}/v/{vid}/manifest` | `request::handle_variant_manifest_request` | Serve per-variant media playlist |
+| GET | `/repackage/{id}/{format}/v/{vid}/init.mp4` | `request::handle_variant_init_request` | Serve per-variant init segment |
+| GET | `/repackage/{id}/{format}/v/{vid}/iframes` | `request::handle_variant_iframe_request` | Serve per-variant HLS I-frame playlist |
+| GET | `/repackage/{id}/{format}/v/{vid}/segment_{n}.{ext}` | `request::handle_variant_segment_request` | Serve per-variant media segment |
 
 `{format}` is a plain format (`hls`, `dash`) or a scheme-qualified format (`hls_cenc`, `hls_cbcs`, `dash_cenc`, `dash_cbcs`, `hls_none`, `dash_none`). Scheme-qualified routes are produced by dual-scheme requests; plain routes still work for backward compatibility (single-scheme requests).
 
