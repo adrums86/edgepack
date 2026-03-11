@@ -342,10 +342,11 @@ impl ProgressiveManifestContext {
                     self.container_format,
                     &text_manifest_infos,
                     &ready_variants,
+                    false, // not complete — progressive processing
                 );
 
                 let final_manifest = if *out_format == OutputFormat::Dash {
-                    fixup_dash_for_sandbox(&combined)
+                    fixup_dash_progressive(&combined)
                 } else {
                     combined
                 };
@@ -1500,6 +1501,7 @@ async fn handle_repackage(
                             &cid, scheme, container_fmt,
                             &text_manifest_infos,
                             &successful_variants,
+                            true, // complete — final manifest
                         )
                     } else if !text_manifest_infos.is_empty() || is_multi_variant {
                         build_progressive_combined_manifest(
@@ -1507,6 +1509,7 @@ async fn handle_repackage(
                             &cid, scheme, container_fmt,
                             &text_manifest_infos,
                             &successful_variants,
+                            true, // complete — final manifest
                         )
                     } else {
                         video_rendered.clone()
@@ -3078,6 +3081,7 @@ fn build_progressive_combined_manifest(
     container_format: edgepack::media::container::ContainerFormat,
     text_tracks: &[TextManifestInfo],
     video_variants: &[VideoVariantInfo],
+    is_complete: bool,
 ) -> String {
     match format {
         OutputFormat::Hls => {
@@ -3088,6 +3092,14 @@ fn build_progressive_combined_manifest(
             master.push_str("#EXTM3U\n");
             master.push_str("#EXT-X-VERSION:7\n");
             master.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+            // For progressive (not yet complete) content, tell the player to start
+            // from the beginning rather than seeking to the live edge.
+            // Per RFC 8216 §4.4.2.1.3, #EXT-X-START in the master playlist
+            // indicates the preferred start point. VOD playlists already start
+            // from the beginning so this is only needed during progressive processing.
+            if !is_complete {
+                master.push_str("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n");
+            }
 
             // Audio rendition group
             if has_audio {
@@ -3112,7 +3124,12 @@ fn build_progressive_combined_manifest(
                 for (vid, variant) in video_variants.iter().enumerate() {
                     // Use original_index for filenames if set (preserves v{N}_ names after filtering)
                     let file_vid = variant.original_index.unwrap_or(vid);
-                    let video_codec = variant.codecs.as_deref().unwrap_or("avc1.64001f");
+                    // Strip audio codecs from variant codecs — source HLS may include
+                    // combined video+audio (e.g. "avc1.4d401f,mp4a.40.2"). We add the
+                    // audio codec explicitly below when has_audio is true.
+                    let video_codec = strip_audio_codecs(
+                        variant.codecs.as_deref().unwrap_or("avc1.64001f")
+                    );
                     let mut stream_inf = format!("#EXT-X-STREAM-INF:BANDWIDTH={}", variant.bandwidth);
 
                     // RESOLUTION
@@ -3149,7 +3166,8 @@ fn build_progressive_combined_manifest(
                 let (bandwidth, video_codec, resolution, frame_rate) = if let Some(v) = video_variants.first() {
                     (
                         v.bandwidth,
-                        v.codecs.as_deref().unwrap_or("avc1.64001f"),
+                        // Strip audio codecs — source may include combined video+audio
+                        strip_audio_codecs(v.codecs.as_deref().unwrap_or("avc1.64001f")),
                         if let (Some(w), Some(h)) = (v.width, v.height) {
                             Some(format!("{w}x{h}"))
                         } else {
@@ -3158,7 +3176,7 @@ fn build_progressive_combined_manifest(
                         v.frame_rate.clone(),
                     )
                 } else {
-                    (2_000_000, "avc1.64001f", None, None)
+                    (2_000_000, "avc1.64001f".to_string(), None, None)
                 };
 
                 let mut stream_inf = format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth}");
@@ -3214,6 +3232,28 @@ fn build_progressive_combined_manifest(
     }
 }
 
+/// Strip audio codec strings from a combined codec string.
+/// Source HLS master playlists often include combined video+audio codecs
+/// (e.g. "avc1.4d401f,mp4a.40.2"). This strips audio codecs so the caller
+/// can add the audio codec explicitly and avoid duplicates.
+fn strip_audio_codecs(codecs: &str) -> String {
+    codecs
+        .split(',')
+        .filter(|c| {
+            let c = c.trim();
+            !c.starts_with("mp4a.")
+                && !c.starts_with("ac-3")
+                && !c.starts_with("ec-3")
+                && !c.starts_with("opus")
+                && !c.starts_with("flac")
+                && !c.starts_with("dtsc")
+                && !c.starts_with("dtse")
+                && !c.starts_with("dtsx")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Extract an attribute value from an HLS #EXT-X-MEDIA tag.
 #[allow(dead_code)]
 fn extract_hls_media_attr(tag: &str, attr: &str) -> Option<String> {
@@ -3227,6 +3267,117 @@ fn extract_hls_media_attr(tag: &str, attr: &str) -> Option<String> {
 /// Fix DASH MPD for sandbox playback.
 ///
 /// During progressive output, the pipeline renders `type="dynamic"` (live) manifests.
+/// For sandbox progressive playback, keep `type="dynamic"` so DASH.js refreshes the
+/// MPD and picks up new segments. Adds attributes to make the player start from the
+/// beginning of content rather than seeking to the live edge:
+///
+/// - `suggestedPresentationDelay` set to total content duration (pushes start to beginning)
+/// - `publishTime` with current UTC timestamp (required for dynamic MPDs)
+/// - `minimumUpdatePeriod="PT2S"` (give sandbox time between disk writes)
+/// - Removes `mediaPresentationDuration` (invalid for in-progress dynamic MPDs)
+fn fixup_dash_progressive(mpd: &str) -> String {
+    let mut fixed = mpd.to_string();
+
+    // Ensure type="dynamic" is present (core library sets this during Live phase)
+    if !fixed.contains("type=\"dynamic\"") {
+        // If it's already static (shouldn't happen during progressive), convert to dynamic
+        fixed = fixed.replace("type=\"static\"", "type=\"dynamic\"");
+    }
+
+    // Replace minimumUpdatePeriod with a longer interval for disk-based serving
+    fixed = fixed.replace("minimumUpdatePeriod=\"PT1S\"", "minimumUpdatePeriod=\"PT2S\"");
+
+    // Compute total duration and set suggestedPresentationDelay to push playback to beginning
+    let total_duration = compute_dash_duration_from_timeline(&fixed);
+    if total_duration > 0.0 {
+        // Add a small buffer to ensure we're fully at the beginning
+        let delay_str = format_seconds_as_iso8601(total_duration + 10.0);
+
+        // Remove existing suggestedPresentationDelay if present
+        if let Some(start) = fixed.find(" suggestedPresentationDelay=\"") {
+            let attr_start = start;
+            let after_first_quote = attr_start + " suggestedPresentationDelay=\"".len();
+            if let Some(close_quote) = fixed[after_first_quote..].find('"') {
+                fixed = format!("{}{}", &fixed[..attr_start], &fixed[after_first_quote + close_quote + 1..]);
+            }
+        }
+
+        // Insert suggestedPresentationDelay after minimumUpdatePeriod
+        if let Some(pos) = fixed.find("minimumUpdatePeriod=\"PT2S\"") {
+            let insert_at = pos + "minimumUpdatePeriod=\"PT2S\"".len();
+            fixed.insert_str(insert_at, &format!(" suggestedPresentationDelay=\"{delay_str}\""));
+        }
+    }
+
+    // Add publishTime (required for dynamic MPDs) — current UTC timestamp
+    if !fixed.contains("publishTime=\"") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        // Simple UTC timestamp: compute year/month/day/hour/min/sec from epoch
+        let (year, month, day, hour, min, sec) = epoch_to_utc(secs);
+        let publish_time = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z");
+        // Insert after type="dynamic"
+        if let Some(pos) = fixed.find("type=\"dynamic\"") {
+            let insert_at = pos + "type=\"dynamic\"".len();
+            fixed.insert_str(insert_at, &format!(" publishTime=\"{publish_time}\""));
+        }
+    }
+
+    // Remove mediaPresentationDuration if present (invalid for in-progress dynamic MPDs)
+    if let Some(start) = fixed.find(" mediaPresentationDuration=\"") {
+        let after_first_quote = start + " mediaPresentationDuration=\"".len();
+        if let Some(close_quote) = fixed[after_first_quote..].find('"') {
+            fixed = format!("{}{}", &fixed[..start], &fixed[after_first_quote + close_quote + 1..]);
+        }
+    }
+
+    fixed
+}
+
+/// Convert epoch seconds to UTC (year, month, day, hour, minute, second).
+fn epoch_to_utc(epoch_secs: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let secs_per_day = 86400u64;
+    let mut days = epoch_secs / secs_per_day;
+    let day_secs = epoch_secs % secs_per_day;
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+
+    // Days since 1970-01-01
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days: [u64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1u64;
+    for &md in &month_days {
+        if days < md {
+            break;
+        }
+        days -= md;
+        month += 1;
+    }
+
+    (year, month, days + 1, hour, min, sec)
+}
+
+fn is_leap_year(y: u64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
 /// For sandbox playback where all segments are immediately available on disk, convert
 /// to `type="static"` (VOD) so DASH.js doesn't try to calculate segment availability
 /// windows based on wall clock time.
@@ -4219,7 +4370,7 @@ async function initPlayer(contentId, format, scheme, containerFormat) {
       dashPlayer.initialize(video, manifestUrl, true);
       dashPlayer.updateSettings({
         streaming: {
-          delay: { liveDelay: 2 },
+          delay: { liveDelay: 0, useSuggestedPresentationDelay: true },
           retryAttempts: { MPD: 60, MediaSegment: 10 },
           retryIntervals: { MPD: 500, MediaSegment: 500 },
         }
